@@ -11,6 +11,26 @@ const TUN_CAPABILITIES: &str = "cap_net_admin,cap_net_bind_service+ep";
 const POLKIT_RULE_PATH: &str = "/etc/polkit-1/rules.d/49-clashtui-mihomo-resolved.rules";
 
 #[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+pub struct TunPermissionStatus {
+    pub target: PathBuf,
+    pub capabilities: String,
+    pub has_tun_capabilities: bool,
+    pub polkit_rule_path: &'static str,
+    pub polkit_rule_exists: bool,
+    pub polkit_rule_matches_user: bool,
+    pub tun_device_exists: bool,
+    pub is_root: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl TunPermissionStatus {
+    pub const fn can_start_tun(&self) -> bool {
+        self.is_root || self.has_tun_capabilities
+    }
+}
+
+#[cfg(target_os = "linux")]
 pub fn tun_install(path: Option<PathBuf>) -> Result<()> {
     let target = target_binary(path)?;
     let user = invoking_user()?;
@@ -25,6 +45,31 @@ pub fn tun_install(path: Option<PathBuf>) -> Result<()> {
         return run_sudo_install(&target, &user);
     }
     tun_install_privileged(target, user)
+}
+
+#[cfg(target_os = "linux")]
+pub fn current_tun_permission_status() -> Result<TunPermissionStatus> {
+    let target = target_binary(None)?;
+    tun_permission_status(&target)
+}
+
+#[cfg(target_os = "linux")]
+pub fn tun_permission_status(target: &Path) -> Result<TunPermissionStatus> {
+    let user = invoking_user()?;
+    let capabilities = getcap_output(target)?;
+    let polkit_rule_matches_user = polkit_rule_matches(&user).unwrap_or(false);
+    Ok(TunPermissionStatus {
+        target: target.to_path_buf(),
+        has_tun_capabilities: capabilities.contains("cap_net_admin")
+            && capabilities.contains("cap_net_bind_service")
+            && capabilities.contains("=ep"),
+        capabilities,
+        polkit_rule_path: POLKIT_RULE_PATH,
+        polkit_rule_exists: polkit_rule_exists(),
+        polkit_rule_matches_user,
+        tun_device_exists: Path::new("/dev/net/tun").exists(),
+        is_root: is_root(),
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -260,6 +305,41 @@ fn print_tun_device_status() {
 #[cfg(target_os = "linux")]
 fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
+}
+
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug, Clone)]
+pub struct TunPermissionStatus {
+    pub target: PathBuf,
+    pub capabilities: String,
+    pub has_tun_capabilities: bool,
+    pub polkit_rule_path: &'static str,
+    pub polkit_rule_exists: bool,
+    pub polkit_rule_matches_user: bool,
+    pub tun_device_exists: bool,
+    pub is_root: bool,
+}
+
+#[cfg(not(target_os = "linux"))]
+impl TunPermissionStatus {
+    pub const fn can_start_tun(&self) -> bool {
+        true
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn current_tun_permission_status() -> Result<TunPermissionStatus> {
+    let target = std::env::current_exe().context("failed to locate current clashtui executable")?;
+    Ok(TunPermissionStatus {
+        target,
+        capabilities: "not applicable".into(),
+        has_tun_capabilities: true,
+        polkit_rule_path: "not applicable",
+        polkit_rule_exists: true,
+        polkit_rule_matches_user: true,
+        tun_device_exists: true,
+        is_root: false,
+    })
 }
 
 fn path_to_str(path: &Path) -> Result<&str> {
