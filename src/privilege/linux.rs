@@ -5,12 +5,9 @@ use std::process::Command;
 
 use anyhow::{Context as _, Result};
 
-#[cfg(target_os = "linux")]
 const TUN_CAPABILITIES: &str = "cap_net_admin,cap_net_bind_service+ep";
-#[cfg(target_os = "linux")]
 const POLKIT_RULE_PATH: &str = "/etc/polkit-1/rules.d/49-clashtui-mihomo-resolved.rules";
 
-#[cfg(target_os = "linux")]
 pub fn tun_install(path: Option<PathBuf>) -> Result<()> {
     let target = target_binary(path)?;
     let user = invoking_user()?;
@@ -27,7 +24,6 @@ pub fn tun_install(path: Option<PathBuf>) -> Result<()> {
     tun_install_privileged(target, user)
 }
 
-#[cfg(target_os = "linux")]
 pub fn tun_install_privileged(target: PathBuf, user: String) -> Result<()> {
     run_setcap([TUN_CAPABILITIES, path_to_str(&target)?])?;
     install_polkit_rule(&user)?;
@@ -38,12 +34,6 @@ pub fn tun_install_privileged(target: PathBuf, user: String) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
-pub fn tun_install(_path: Option<PathBuf>) -> Result<()> {
-    anyhow::bail!("tun-install is only supported on Linux")
-}
-
-#[cfg(target_os = "linux")]
 pub fn tun_uninstall(path: Option<PathBuf>) -> Result<()> {
     let target = target_binary(path)?;
     if !has_any_capabilities(&target)? && !polkit_rule_exists() {
@@ -57,7 +47,6 @@ pub fn tun_uninstall(path: Option<PathBuf>) -> Result<()> {
     tun_uninstall_privileged(target)
 }
 
-#[cfg(target_os = "linux")]
 pub fn tun_uninstall_privileged(target: PathBuf) -> Result<()> {
     if has_any_capabilities(&target)? {
         run_setcap(["-r", path_to_str(&target)?])?;
@@ -66,11 +55,6 @@ pub fn tun_uninstall_privileged(target: PathBuf) -> Result<()> {
     println!("TUN permissions removed: {}", target.display());
     print_getcap(&target)?;
     Ok(())
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn tun_uninstall(_path: Option<PathBuf>) -> Result<()> {
-    anyhow::bail!("tun-uninstall is only supported on Linux")
 }
 
 fn target_binary(path: Option<PathBuf>) -> Result<PathBuf> {
@@ -82,7 +66,6 @@ fn target_binary(path: Option<PathBuf>) -> Result<PathBuf> {
         .with_context(|| format!("failed to resolve {}", path.display()))
 }
 
-#[cfg(target_os = "linux")]
 fn run_sudo_install(target: &Path, user: &str) -> Result<()> {
     let exe = std::env::current_exe().context("failed to locate current clashtui executable")?;
     let status = Command::new("sudo")
@@ -100,7 +83,6 @@ fn run_sudo_install(target: &Path, user: &str) -> Result<()> {
     anyhow::bail!("sudo command failed with status {status}");
 }
 
-#[cfg(target_os = "linux")]
 fn run_sudo_privileged(command: &str, target: &Path) -> Result<()> {
     let exe = std::env::current_exe().context("failed to locate current clashtui executable")?;
     let status = Command::new("sudo")
@@ -116,7 +98,6 @@ fn run_sudo_privileged(command: &str, target: &Path) -> Result<()> {
     anyhow::bail!("sudo command failed with status {status}");
 }
 
-#[cfg(target_os = "linux")]
 fn run_setcap<const N: usize>(args: [&str; N]) -> Result<()> {
     let output = Command::new("setcap")
         .args(args)
@@ -130,16 +111,16 @@ fn run_setcap<const N: usize>(args: [&str; N]) -> Result<()> {
     anyhow::bail!("setcap failed: {}", stderr.trim());
 }
 
-#[cfg(target_os = "linux")]
 fn install_polkit_rule(user: &str) -> Result<()> {
     let path = Path::new(POLKIT_RULE_PATH);
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    fs::write(path, polkit_rule(user)).with_context(|| format!("failed to write {}", path.display()))
+    fs::write(path, polkit_rule(user))
+        .with_context(|| format!("failed to write {}", path.display()))
 }
 
-#[cfg(target_os = "linux")]
 fn remove_polkit_rule() -> Result<()> {
     match fs::remove_file(POLKIT_RULE_PATH) {
         Ok(()) => Ok(()),
@@ -148,12 +129,10 @@ fn remove_polkit_rule() -> Result<()> {
     }
 }
 
-#[cfg(target_os = "linux")]
 fn polkit_rule_exists() -> bool {
     Path::new(POLKIT_RULE_PATH).exists()
 }
 
-#[cfg(target_os = "linux")]
 fn polkit_rule_matches(user: &str) -> Result<bool> {
     match fs::read_to_string(POLKIT_RULE_PATH) {
         Ok(content) => Ok(content == polkit_rule(user)),
@@ -162,7 +141,6 @@ fn polkit_rule_matches(user: &str) -> Result<bool> {
     }
 }
 
-#[cfg(target_os = "linux")]
 fn polkit_rule(user: &str) -> String {
     format!(
         r#"// Installed by clashtui tun-install.
@@ -185,7 +163,6 @@ polkit.addRule(function(action, subject) {{
     )
 }
 
-#[cfg(target_os = "linux")]
 fn js_string(value: &str) -> String {
     value
         .chars()
@@ -200,7 +177,6 @@ fn js_string(value: &str) -> String {
         .collect()
 }
 
-#[cfg(target_os = "linux")]
 fn invoking_user() -> Result<String> {
     env::var("SUDO_USER")
         .or_else(|_| env::var("USER"))
@@ -208,18 +184,17 @@ fn invoking_user() -> Result<String> {
         .context("failed to determine invoking user")
 }
 
-#[cfg(target_os = "linux")]
 fn has_tun_capabilities(path: &Path) -> Result<bool> {
     let output = getcap_output(path)?;
-    Ok(output.contains("cap_net_admin") && output.contains("cap_net_bind_service") && output.contains("=ep"))
+    Ok(output.contains("cap_net_admin")
+        && output.contains("cap_net_bind_service")
+        && output.contains("=ep"))
 }
 
-#[cfg(target_os = "linux")]
 fn has_any_capabilities(path: &Path) -> Result<bool> {
     Ok(!getcap_output(path)?.trim().is_empty())
 }
 
-#[cfg(target_os = "linux")]
 fn print_getcap(path: &Path) -> Result<()> {
     let stdout = getcap_output(path)?;
     if stdout.trim().is_empty() {
@@ -230,7 +205,6 @@ fn print_getcap(path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
 fn getcap_output(path: &Path) -> Result<String> {
     let output = Command::new("getcap")
         .arg(path)
@@ -244,7 +218,6 @@ fn getcap_output(path: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-#[cfg(target_os = "linux")]
 fn print_tun_device_status() {
     let tun = Path::new("/dev/net/tun");
     if tun.exists() {
@@ -257,7 +230,6 @@ fn print_tun_device_status() {
     }
 }
 
-#[cfg(target_os = "linux")]
 fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }

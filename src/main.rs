@@ -4,6 +4,7 @@ mod core;
 mod daemon;
 mod dns;
 mod mihomo;
+mod platform;
 mod privilege;
 mod runtime_profile;
 mod subscription;

@@ -403,11 +403,7 @@ impl Default for Subscription {
 }
 
 fn default_tun_device() -> String {
-    if cfg!(target_os = "macos") {
-        "utun1024".into()
-    } else {
-        "Mihomo".into()
-    }
+    crate::platform::tun::default_device().into()
 }
 
 fn default_bypass() -> String {

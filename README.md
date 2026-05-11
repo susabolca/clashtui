@@ -42,7 +42,9 @@ cargo run -- start
 cargo run -- status
 ```
 
-## Linux TUN Setup
+## TUN Setup
+
+### Linux
 
 TUN needs `CAP_NET_ADMIN`. DNS link updates through systemd-resolved also need a small polkit rule. Run this once after building or replacing the binary:
 
@@ -62,6 +64,12 @@ Remove those permissions with:
 ```bash
 sudo target/release/clashtui tun-uninstall
 ```
+
+### macOS
+
+macOS uses `utun` devices. The default generated TUN device is `utun1024`, and Linux-only `auto-redirect` is omitted from the runtime mihomo patch on macOS.
+
+`tun-install` and `tun-uninstall` manage Linux capabilities only. On macOS, run mihomo with enough privileges for TUN/route changes, or use a privileged helper/service for the core.
 
 ## TUI
 
