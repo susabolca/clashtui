@@ -47,7 +47,9 @@ impl MihomoClient {
     }
 
     pub async fn patch_configs(&self, patch: &Value) -> Result<()> {
-        let _: Value = self.send(self.client.patch(self.url("/configs")).json(patch)).await?;
+        let _: Value = self
+            .send(self.client.patch(self.url("/configs")).json(patch))
+            .await?;
         Ok(())
     }
 
@@ -62,6 +64,10 @@ impl MihomoClient {
     pub async fn proxy_groups(&self) -> Result<Vec<ProxyGroup>> {
         let value: Value = self.send(self.client.get(self.url("/proxies"))).await?;
         proxy_groups_from_value(&value)
+    }
+
+    pub async fn connections(&self) -> Result<Value> {
+        self.send(self.client.get(self.url("/connections"))).await
     }
 
     pub async fn select_proxy(&self, group: &str, proxy: &str) -> Result<()> {
@@ -138,8 +144,16 @@ fn proxy_groups_from_value(value: &Value) -> Result<Vec<ProxyGroup>> {
                     .and_then(Value::as_str)
                     .unwrap_or("unknown")
                     .to_string(),
-                now: value.get("now").and_then(Value::as_str).unwrap_or("-").to_string(),
-                all: all.iter().filter_map(Value::as_str).map(str::to_string).collect(),
+                now: value
+                    .get("now")
+                    .and_then(Value::as_str)
+                    .unwrap_or("-")
+                    .to_string(),
+                all: all
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect(),
             })
         })
         .collect::<Vec<_>>();

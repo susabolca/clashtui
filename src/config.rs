@@ -61,12 +61,19 @@ fn config_dir() -> Result<PathBuf> {
     if cfg!(target_os = "windows") {
         env::var_os("APPDATA")
             .map(PathBuf::from)
-            .or_else(|| env::var_os("USERPROFILE").map(|home| PathBuf::from(home).join("AppData").join("Roaming")))
+            .or_else(|| {
+                env::var_os("USERPROFILE")
+                    .map(|home| PathBuf::from(home).join("AppData").join("Roaming"))
+            })
             .map(|base| base.join("clashtui"))
             .context("APPDATA or USERPROFILE is not set")
     } else if cfg!(target_os = "macos") {
         home_dir()
-            .map(|home| home.join("Library").join("Application Support").join("clashtui"))
+            .map(|home| {
+                home.join("Library")
+                    .join("Application Support")
+                    .join("clashtui")
+            })
             .context("HOME is not set")
     } else {
         env::var_os("XDG_CONFIG_HOME")
@@ -148,7 +155,8 @@ impl AppConfig {
     }
 
     pub fn system_proxy_target(&self) -> SystemProxyTarget {
-        let bypass = if self.system_proxy.use_default_bypass && self.system_proxy.bypass.is_empty() {
+        let bypass = if self.system_proxy.use_default_bypass && self.system_proxy.bypass.is_empty()
+        {
             default_bypass()
         } else if self.system_proxy.use_default_bypass {
             format!("{},{}", default_bypass(), self.system_proxy.bypass)
@@ -171,7 +179,12 @@ impl AppConfig {
         if let Some(port) = self.proxy_ports.socks {
             parts.push(format!("socks={}:{}", self.proxy_host, port));
         }
-        for service in self.proxy_ports.services.iter().filter(|service| service.enabled) {
+        for service in self
+            .proxy_ports
+            .services
+            .iter()
+            .filter(|service| service.enabled)
+        {
             let listen = if service.listen.trim().is_empty() {
                 "127.0.0.1"
             } else {
@@ -389,6 +402,7 @@ impl Default for DnsConfig {
 pub struct Subscription {
     pub name: String,
     pub url: String,
+    pub refresh: SubscriptionRefresh,
     pub updated_at: Option<String>,
 }
 
@@ -397,9 +411,19 @@ impl Default for Subscription {
         Self {
             name: "default".into(),
             url: String::new(),
+            refresh: SubscriptionRefresh::default(),
             updated_at: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SubscriptionRefresh {
+    Disabled,
+    Daily,
+    #[default]
+    Weekly,
 }
 
 fn default_tun_device() -> String {
