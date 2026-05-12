@@ -15,14 +15,18 @@ pub async fn write_bootstrap_config(paths: &Paths, config: &AppConfig) -> Result
         .with_context(|| format!("failed to write {}", paths.core_config_file.display()))
 }
 
-pub async fn write_active_config(paths: &Paths, config: &AppConfig, sub: &Subscription) -> Result<std::path::PathBuf> {
+pub async fn write_active_config(
+    paths: &Paths,
+    config: &AppConfig,
+    sub: &Subscription,
+) -> Result<std::path::PathBuf> {
     paths.ensure().await?;
     let profile = subscription::profile_path(paths, sub);
     let content = fs::read_to_string(&profile)
         .await
         .with_context(|| format!("failed to read {}", profile.display()))?;
-    let mut value: Value =
-        serde_yaml_ng::from_str(&content).with_context(|| format!("failed to parse {}", profile.display()))?;
+    let mut value: Value = serde_yaml_ng::from_str(&content)
+        .with_context(|| format!("failed to parse {}", profile.display()))?;
     apply_overrides(&mut value, config)?;
     let content = serde_yaml_ng::to_string(&value)?;
     fs::write(&paths.active_config_file, content)
@@ -77,7 +81,12 @@ fn apply_overrides(value: &mut Value, config: &AppConfig) -> Result<()> {
     mapping.insert("ipv6".into(), true.into());
     mapping.insert("unified-delay".into(), true.into());
 
-    if let Some(secret) = config.controller.secret.as_deref().filter(|value| !value.is_empty()) {
+    if let Some(secret) = config
+        .controller
+        .secret
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
         mapping.insert("secret".into(), secret.into());
     } else {
         mapping.remove("secret");
@@ -146,7 +155,12 @@ fn listener_from_service(service: &PortProxyService) -> Result<Option<Value>> {
     {
         listener.insert("proxy".into(), proxy.into());
     }
-    if let Some(rule) = service.rule.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+    if let Some(rule) = service
+        .rule
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         listener.insert("rule".into(), rule.into());
     }
 
@@ -168,7 +182,8 @@ fn remove_unmanaged_inbounds(mapping: &mut Mapping) {
 }
 
 fn insert_json_patch(mapping: &mut Mapping, patch: serde_json::Value) -> Result<()> {
-    let patch = serde_yaml_ng::to_value(patch).context("failed to convert runtime patch to YAML")?;
+    let patch =
+        serde_yaml_ng::to_value(patch).context("failed to convert runtime patch to YAML")?;
     let Value::Mapping(patch) = patch else {
         anyhow::bail!("runtime patch must be a YAML mapping");
     };
@@ -239,24 +254,43 @@ listeners:
         config.controller.secret = None;
 
         apply_overrides(&mut profile, &config)?;
-        let mapping = profile.as_mapping().context("profile root is not a mapping")?;
+        let mapping = profile
+            .as_mapping()
+            .context("profile root is not a mapping")?;
 
-        assert_eq!(mapping.get("mixed-port").and_then(Value::as_i64), Some(7070));
+        assert_eq!(
+            mapping.get("mixed-port").and_then(Value::as_i64),
+            Some(7070)
+        );
         assert_eq!(mapping.get("port").and_then(Value::as_i64), Some(18080));
-        assert_eq!(mapping.get("socks-port").and_then(Value::as_i64), Some(18081));
+        assert_eq!(
+            mapping.get("socks-port").and_then(Value::as_i64),
+            Some(18081)
+        );
         assert_eq!(mapping.get("mode").and_then(Value::as_str), Some("global"));
         assert!(mapping.get("redir-port").is_none());
-        assert_eq!(mapping.get("allow-lan").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            mapping.get("allow-lan").and_then(Value::as_bool),
+            Some(true)
+        );
         let listeners = mapping
             .get("listeners")
             .and_then(Value::as_sequence)
             .context("listeners missing")?;
         assert_eq!(listeners.len(), 1);
-        let listener = listeners[0].as_mapping().context("listener is not a mapping")?;
-        assert_eq!(listener.get("name").and_then(Value::as_str), Some("hk-mixed"));
+        let listener = listeners[0]
+            .as_mapping()
+            .context("listener is not a mapping")?;
+        assert_eq!(
+            listener.get("name").and_then(Value::as_str),
+            Some("hk-mixed")
+        );
         assert_eq!(listener.get("type").and_then(Value::as_str), Some("mixed"));
         assert_eq!(listener.get("port").and_then(Value::as_i64), Some(18082));
-        assert_eq!(listener.get("proxy").and_then(Value::as_str), Some("GLOBAL"));
+        assert_eq!(
+            listener.get("proxy").and_then(Value::as_str),
+            Some("GLOBAL")
+        );
         assert!(mapping.get("proxies").is_some());
         assert!(mapping.get("secret").is_none());
         assert_eq!(

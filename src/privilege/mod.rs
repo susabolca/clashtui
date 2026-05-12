@@ -24,6 +24,8 @@ mod macos;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 mod unsupported;
 
+pub use imp::TunPermissionStatus;
+
 pub fn tun_install(path: Option<PathBuf>) -> Result<()> {
     imp::tun_install(path)
 }
@@ -38,4 +40,8 @@ pub fn tun_install_privileged(path: PathBuf, user: String) -> Result<()> {
 
 pub fn tun_uninstall_privileged(path: PathBuf) -> Result<()> {
     imp::tun_uninstall_privileged(path)
+}
+
+pub fn current_tun_permission_status() -> Result<TunPermissionStatus> {
+    imp::current_tun_permission_status()
 }

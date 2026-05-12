@@ -42,7 +42,9 @@ pub async fn update(paths: &Paths, config: &mut AppConfig, index: usize) -> Resu
 }
 
 pub fn profile_path(paths: &Paths, sub: &Subscription) -> PathBuf {
-    paths.profiles_dir.join(format!("{}.yaml", sanitize(&sub.name)))
+    paths
+        .profiles_dir
+        .join(format!("{}.yaml", sanitize(&sub.name)))
 }
 
 fn sanitize(value: &str) -> String {
@@ -54,7 +56,11 @@ fn sanitize(value: &str) -> String {
             output.push('_');
         }
     }
-    if output.is_empty() { "profile".into() } else { output }
+    if output.is_empty() {
+        "profile".into()
+    } else {
+        output
+    }
 }
 
 fn now_unix() -> u64 {

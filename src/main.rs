@@ -83,7 +83,9 @@ async fn main() -> Result<()> {
         Some(Command::PrivilegedTunInstall { path, user }) => {
             return privilege::tun_install_privileged(path.clone(), user.clone());
         }
-        Some(Command::PrivilegedTunUninstall { path }) => return privilege::tun_uninstall_privileged(path.clone()),
+        Some(Command::PrivilegedTunUninstall { path }) => {
+            return privilege::tun_uninstall_privileged(path.clone());
+        }
         _ => {}
     }
 
@@ -103,7 +105,15 @@ async fn main() -> Result<()> {
 
     let client = MihomoClient::new(&config.controller);
     match cli.command {
-        Some(Command::Start) => daemon::start(&paths, cli.controller.as_deref(), cli.secret.as_deref()).await,
+        Some(Command::Start) => {
+            daemon::start(
+                &paths,
+                &config,
+                cli.controller.as_deref(),
+                cli.secret.as_deref(),
+            )
+            .await
+        }
         Some(Command::Stop) => daemon::stop(&paths, &config, &client).await,
         Some(Command::Status) => daemon::status(&paths, &config, &client).await,
         Some(Command::Config) => config_menu::run(&paths, &mut config).await,

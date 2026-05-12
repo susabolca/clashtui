@@ -8,6 +8,24 @@ use anyhow::{Context as _, Result};
 const TUN_CAPABILITIES: &str = "cap_net_admin,cap_net_bind_service+ep";
 const POLKIT_RULE_PATH: &str = "/etc/polkit-1/rules.d/49-clashtui-mihomo-resolved.rules";
 
+#[derive(Debug, Clone)]
+pub struct TunPermissionStatus {
+    pub target: PathBuf,
+    pub capabilities: String,
+    pub has_tun_capabilities: bool,
+    pub polkit_rule_path: &'static str,
+    pub polkit_rule_exists: bool,
+    pub polkit_rule_matches_user: bool,
+    pub tun_device_exists: bool,
+    pub is_root: bool,
+}
+
+impl TunPermissionStatus {
+    pub const fn can_start_tun(&self) -> bool {
+        self.is_root || self.has_tun_capabilities
+    }
+}
+
 pub fn tun_install(path: Option<PathBuf>) -> Result<()> {
     let target = target_binary(path)?;
     let user = invoking_user()?;
@@ -22,6 +40,29 @@ pub fn tun_install(path: Option<PathBuf>) -> Result<()> {
         return run_sudo_install(&target, &user);
     }
     tun_install_privileged(target, user)
+}
+
+pub fn current_tun_permission_status() -> Result<TunPermissionStatus> {
+    let target = target_binary(None)?;
+    tun_permission_status(&target)
+}
+
+pub fn tun_permission_status(target: &Path) -> Result<TunPermissionStatus> {
+    let user = invoking_user()?;
+    let capabilities = getcap_output(target)?;
+    let polkit_rule_matches_user = polkit_rule_matches(&user).unwrap_or(false);
+    Ok(TunPermissionStatus {
+        target: target.to_path_buf(),
+        has_tun_capabilities: capabilities.contains("cap_net_admin")
+            && capabilities.contains("cap_net_bind_service")
+            && capabilities.contains("=ep"),
+        capabilities,
+        polkit_rule_path: POLKIT_RULE_PATH,
+        polkit_rule_exists: polkit_rule_exists(),
+        polkit_rule_matches_user,
+        tun_device_exists: Path::new("/dev/net/tun").exists(),
+        is_root: is_root(),
+    })
 }
 
 pub fn tun_install_privileged(target: PathBuf, user: String) -> Result<()> {

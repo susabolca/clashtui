@@ -15,8 +15,22 @@ The daemon owns the long-running workflow:
 5. Reload mihomo through its external controller.
 6. Reapply mode and proxy group selections.
 7. Watch the user config and retry on changes.
+8. Check mihomo health through the external controller and reapply when the controller becomes unavailable.
 
 `clashtui` does not proxy traffic itself. HTTP, SOCKS5, TUN, and DNS are delegated to mihomo.
+
+## Process Tracking
+
+`clashtui start` launches a small supervisor process and returns. The supervisor writes `clashtui.pid`, starts mihomo when needed, and writes `mihomo.pid` for the core process it owns.
+
+Tracking uses two signals:
+
+- Process liveness from the PID files.
+- Runtime health from mihomo's external controller, primarily `/version` and `/configs`.
+
+When mihomo is offline or the controller becomes unhealthy, the supervisor marks runtime apply as needed. The next loop starts mihomo again if no owned core process is alive, reloads the generated YAML, reapplies proxy selections, and verifies key runtime state such as TUN.
+
+`clashtui status` reports both PID files, controller health, mihomo runtime config, TUN network state, and recent log tails. `clashtui stop` stops the supervisor, clears runtime hooks, and stops the owned mihomo process.
 
 ## Runtime Ownership
 

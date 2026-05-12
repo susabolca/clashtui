@@ -114,7 +114,11 @@ async fn start_core(paths: &Paths, core_path: &Path) -> Result<()> {
             paths.core_log_file.display()
         );
     }
-    eprintln!("mihomo core started pid={} path={}", pid, core_path.display());
+    eprintln!(
+        "mihomo core started pid={} path={}",
+        pid,
+        core_path.display()
+    );
     Ok(())
 }
 
@@ -128,9 +132,13 @@ async fn ensure_geodata(paths: &Paths) -> Result<()> {
         let Some(source) = find_geodata_source(file_name).await? else {
             continue;
         };
-        fs::copy(&source, &target)
-            .await
-            .with_context(|| format!("failed to copy geodata {} to {}", source.display(), target.display()))?;
+        fs::copy(&source, &target).await.with_context(|| {
+            format!(
+                "failed to copy geodata {} to {}",
+                source.display(),
+                target.display()
+            )
+        })?;
     }
     Ok(())
 }
@@ -357,7 +365,15 @@ fn raise_ambient_capabilities_for_core() -> std::io::Result<()> {
         if data[index].permitted & bit == 0 {
             continue;
         }
-        let prctl_status = unsafe { libc::prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, libc::c_ulong::from(cap), 0, 0) };
+        let prctl_status = unsafe {
+            libc::prctl(
+                PR_CAP_AMBIENT,
+                PR_CAP_AMBIENT_RAISE,
+                libc::c_ulong::from(cap),
+                0,
+                0,
+            )
+        };
         if prctl_status != 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -382,7 +398,8 @@ fn is_process_running(pid: u32) -> bool {
         .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
         .output()
         .is_ok_and(|output| {
-            output.status.success() && String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\""))
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\""))
         })
 }
 
