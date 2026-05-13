@@ -46,6 +46,10 @@ const DEFAULT_DELAY_TEST_URL: &str = "https://www.gstatic.com/generate_204";
 const DEFAULT_DELAY_TEST_TIMEOUT_MS: u64 = 5_000;
 const RUNTIME_START_RETRIES: usize = 20;
 const RUNTIME_START_WAIT: Duration = Duration::from_millis(250);
+const DEFAULT_INPUT_WIDTH: u16 = 58;
+const DEFAULT_INPUT_ROWS: usize = 1;
+const URL_INPUT_WIDTH: u16 = 96;
+const URL_INPUT_ROWS: usize = 4;
 const PAGE_JUMP_FALLBACK: usize = 8;
 const PAGE_JUMP_MAX: usize = 24;
 const H_LINE: char = '─';
@@ -5448,7 +5452,8 @@ fn draw_footer(frame: &mut Frame, app: &ConfigApp, area: Rect, separator_column:
 }
 
 fn draw_input(frame: &mut Frame, app: &ConfigApp) {
-    let area = fixed_rect(58, 10, frame.area());
+    let (width, rows) = input_dialog_spec(app.input_mode);
+    let area = fixed_rect(width, input_dialog_height(rows), frame.area());
     frame.render_widget(Clear, area);
     let mut body = vec![
         popup_title_line(app.input_mode.title(), area.width.saturating_sub(2)),
@@ -5457,12 +5462,15 @@ fn draw_input(frame: &mut Frame, app: &ConfigApp) {
     body.extend(input_box_lines(
         &app.input,
         area.width.saturating_sub(6) as usize,
+        rows,
     ));
     body.extend([
         Line::from(""),
         Line::from(Span::styled(
             if is_number_input(app.input_mode) {
                 "Up/Down change | Enter OK | Esc cancel"
+            } else if app.input_mode == InputMode::SubscriptionUrl {
+                "Paste URL | Enter OK | Esc cancel"
             } else {
                 "Type value | Enter OK | Esc cancel"
             },
@@ -5471,6 +5479,17 @@ fn draw_input(frame: &mut Frame, app: &ConfigApp) {
     ]);
 
     frame.render_widget(dialog_panel(body), area);
+}
+
+const fn input_dialog_spec(input_mode: InputMode) -> (u16, usize) {
+    match input_mode {
+        InputMode::SubscriptionUrl => (URL_INPUT_WIDTH, URL_INPUT_ROWS),
+        _ => (DEFAULT_INPUT_WIDTH, DEFAULT_INPUT_ROWS),
+    }
+}
+
+fn input_dialog_height(rows: usize) -> u16 {
+    rows.saturating_add(8).try_into().unwrap_or(12)
 }
 
 fn draw_subscription_form(frame: &mut Frame, app: &ConfigApp) {
@@ -5848,14 +5867,52 @@ fn popup_title_line(title: &str, width: u16) -> Line<'static> {
     ))
 }
 
-fn input_box_lines(value: &str, width: usize) -> Vec<Line<'_>> {
+fn input_box_lines(value: &str, width: usize, rows: usize) -> Vec<Line<'_>> {
+    let rows = rows.max(1);
     let inner_width = width.saturating_sub(4).max(8);
-    let value = fit_width(value, inner_width);
-    vec![
-        Line::from(format!("  ┌{}┐", "─".repeat(inner_width))),
-        Line::from(format!("  │{value:<inner_width$}│")),
-        Line::from(format!("  └{}┘", "─".repeat(inner_width))),
-    ]
+    let wrapped = wrapped_input_lines(value, inner_width, rows);
+    let mut lines = vec![Line::from(format!("  ┌{}┐", "─".repeat(inner_width)))];
+    for line in wrapped {
+        lines.push(Line::from(format!("  │{line:<inner_width$}│")));
+    }
+    lines.push(Line::from(format!("  └{}┘", "─".repeat(inner_width))));
+    lines
+}
+
+fn wrapped_input_lines(value: &str, width: usize, rows: usize) -> Vec<String> {
+    let rows = rows.max(1);
+    if value.is_empty() {
+        return std::iter::repeat_n(String::new(), rows).collect();
+    }
+
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for ch in value.chars() {
+        if current.chars().count() >= width {
+            lines.push(current);
+            current = String::new();
+        }
+        current.push(ch);
+    }
+    lines.push(current);
+
+    if lines.len() > rows {
+        lines = lines[lines.len() - rows..].to_vec();
+        if let Some(first) = lines.first_mut()
+            && width > 1
+        {
+            let suffix = first
+                .chars()
+                .take(width.saturating_sub(1))
+                .collect::<String>();
+            *first = format!("…{suffix}");
+        }
+    }
+
+    while lines.len() < rows {
+        lines.push(String::new());
+    }
+    lines
 }
 
 fn dialog_panel<'a>(lines: Vec<Line<'a>>) -> Paragraph<'a> {
@@ -8325,6 +8382,31 @@ mod tests {
         );
         assert_eq!(format_optional_timestamp(Some("manual"), "-"), "manual");
         assert_eq!(format_optional_timestamp(None, "never"), "never");
+    }
+
+    #[test]
+    fn subscription_url_input_uses_multiline_box() {
+        assert_eq!(
+            input_dialog_spec(InputMode::SubscriptionUrl),
+            (URL_INPUT_WIDTH, URL_INPUT_ROWS)
+        );
+        assert_eq!(
+            input_dialog_spec(InputMode::SubscriptionName),
+            (DEFAULT_INPUT_WIDTH, DEFAULT_INPUT_ROWS)
+        );
+
+        let lines = wrapped_input_lines("https://example.invalid/abcdef", 10, 3);
+        assert_eq!(
+            lines,
+            vec![
+                "https://ex".to_string(),
+                "ample.inva".to_string(),
+                "lid/abcdef".to_string()
+            ]
+        );
+
+        let truncated = wrapped_input_lines("abcdefghijklmnopqrstuvwxyz", 8, 2);
+        assert_eq!(truncated, vec!["…qrstuvw".to_string(), "yz".to_string()]);
     }
 
     #[test]
