@@ -72,6 +72,8 @@ enum Command {
         #[arg(long)]
         path: PathBuf,
     },
+    #[command(name = "__tun-helper-run", hide = true)]
+    TunHelperRun,
 }
 
 #[tokio::main]
@@ -87,6 +89,7 @@ async fn main() -> Result<()> {
         Some(Command::PrivilegedTunUninstall { path }) => {
             return privilege::tun_uninstall_privileged(path.clone());
         }
+        Some(Command::TunHelperRun) => return privilege::tun_helper_run(),
         _ => {}
     }
 
@@ -127,7 +130,8 @@ async fn main() -> Result<()> {
             Command::TunInstall { .. }
             | Command::TunUninstall { .. }
             | Command::PrivilegedTunInstall { .. }
-            | Command::PrivilegedTunUninstall { .. },
+            | Command::PrivilegedTunUninstall { .. }
+            | Command::TunHelperRun,
         ) => Ok(()),
         None => Ok(()),
     }

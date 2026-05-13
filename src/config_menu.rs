@@ -2566,14 +2566,14 @@ async fn ensure_selected_subscription_loaded_for_check(
     Ok(true)
 }
 
-async fn load_selected_profile(paths: &Paths, config: &AppConfig, app: &mut ConfigApp) {
-    let Some(sub) = config.subscriptions.get(app.selected_subscription) else {
+async fn load_selected_profile(paths: &Paths, config: &mut AppConfig, app: &mut ConfigApp) {
+    let Some(sub) = config.subscriptions.get(app.selected_subscription).cloned() else {
         return;
     };
     let Some(client) = runtime_mihomo_client(paths, config, app).await else {
         return;
     };
-    let path = match runtime_profile::write_active_config(paths, config, sub).await {
+    let path = match runtime_profile::write_active_config(paths, config, &sub).await {
         Ok(path) => path,
         Err(err) => {
             app.status = format!("Saved active profile; runtime config failed: {err}");
@@ -2594,7 +2594,7 @@ async fn load_selected_profile(paths: &Paths, config: &AppConfig, app: &mut Conf
 
 async fn reload_current_runtime(
     paths: &Paths,
-    config: &AppConfig,
+    config: &mut AppConfig,
     app: &mut ConfigApp,
     success: String,
 ) -> bool {
@@ -2643,7 +2643,7 @@ async fn writable_mihomo_client(
 
 async fn runtime_mihomo_client(
     paths: &Paths,
-    config: &AppConfig,
+    config: &mut AppConfig,
     app: &mut ConfigApp,
 ) -> Option<MihomoClient> {
     let client = writable_mihomo_client(paths, config, app).await?;

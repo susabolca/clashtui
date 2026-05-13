@@ -210,6 +210,7 @@ pub async fn run(
                     controller_override.as_deref(),
                     secret_override.as_deref(),
                 );
+                preserve_runtime_state(&config, &mut next_config);
                 match serialize_config(&next_config) {
                     Ok(serialized) if serialized != last_config => {
                         eprintln!("config changed: reloading desired runtime");
@@ -238,6 +239,52 @@ fn apply_controller_overrides(
     if let Some(secret) = secret {
         config.controller.secret = Some(secret.to_string());
     }
+}
+
+fn preserve_runtime_state(current: &AppConfig, next: &mut AppConfig) {
+    #[cfg(target_os = "macos")]
+    if current.tun.enable && next.tun.enable {
+        next.tun.file_descriptor = current.tun.file_descriptor;
+        next.runtime_interface_name = current.runtime_interface_name.clone();
+        if current.tun.file_descriptor.is_some() && matches!(next.tun.device.trim(), "" | "utun") {
+            next.tun.device.clone_from(&current.tun.device);
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    let _ = (current, next);
+}
+
+#[cfg(target_os = "macos")]
+fn macos_tun_needs_core_restart(config: &AppConfig) -> bool {
+    config.tun.enable && config.tun.file_descriptor.is_none()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_tun_needs_core_restart(_config: &AppConfig) -> bool {
+    false
+}
+
+fn teardown_inactive_macos_tun(config: &mut AppConfig) {
+    #[cfg(target_os = "macos")]
+    {
+        if config.tun.enable {
+            return;
+        }
+        config.tun.file_descriptor = None;
+        config.runtime_interface_name = None;
+        let Ok(status) = privilege::current_tun_permission_status() else {
+            return;
+        };
+        if status.polkit_rule_matches_user
+            && let Err(err) = privilege::teardown_tun()
+        {
+            eprintln!("failed to teardown inactive macOS TUN helper state: {err:#}");
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    let _ = config;
 }
 
 pub async fn stop(paths: &Paths, config: &AppConfig, client: &MihomoClient) -> Result<()> {
@@ -302,7 +349,14 @@ async fn cleanup_owned_runtimes(
         );
     }
     println!("mihomo core: stopping all instances owned by clashtui");
-    core::stop_all(paths, config).await
+    let stop_result = core::stop_all(paths, config).await;
+    #[cfg(target_os = "macos")]
+    if config.tun.enable
+        && let Err(err) = privilege::teardown_tun()
+    {
+        eprintln!("failed to teardown macOS TUN helper state: {err:#}");
+    }
+    stop_result
 }
 
 pub async fn status(paths: &Paths, config: &AppConfig, client: &MihomoClient) -> Result<()> {
@@ -388,8 +442,11 @@ fn print_tun_permission_summary(config: &AppConfig) {
                 normalize_inline(status.capabilities.trim())
             );
             println!(
-                "tun-permission: polkit_rule={} exists={} matches_user={}",
-                status.polkit_rule_path, status.polkit_rule_exists, status.polkit_rule_matches_user
+                "tun-permission: {}={} exists={} matches_user={}",
+                tun_permission_rule_label(),
+                status.polkit_rule_path,
+                status.polkit_rule_exists,
+                status.polkit_rule_matches_user
             );
             if !status.can_start_tun() {
                 print_tun_permission_hint(&status);
@@ -402,10 +459,14 @@ fn print_tun_permission_summary(config: &AppConfig) {
 #[cfg(target_os = "macos")]
 fn print_tun_permission_hint(status: &privilege::TunPermissionStatus) {
     println!(
-        "tun-permission: macOS TUN needs a privileged mihomo process; current process is_root={}",
+        "tun-permission: macOS TUN needs the clashtui root helper; current process is_root={}",
         status.is_root
     );
-    println!("tun-permission: Port Proxy/system proxy can still work without TUN.");
+    println!(
+        "tun-permission: run {} tun-install to install or repair the helper",
+        status.target.display()
+    );
+    println!("tun-permission: mihomo remains user-mode; the helper owns utun/routes only.");
 }
 
 #[cfg(target_os = "linux")]
@@ -437,8 +498,10 @@ fn validate_start_permissions(config: &AppConfig) -> Result<()> {
         #[cfg(target_os = "macos")]
         {
             println!(
-                "warning: TUN is enabled but this process is not privileged enough for macOS utun; Port Proxy can still run"
+                "warning: TUN is enabled but the macOS TUN helper is missing or unreachable; run sudo {} tun-install",
+                status.target.display()
             );
+            println!("warning: Port Proxy/system proxy can still run without TUN.");
             return Ok(());
         }
 
@@ -556,7 +619,12 @@ async fn apply_global_runtime(paths: &Paths, config: &mut AppConfig) -> Result<(
     let mut errors = Vec::new();
 
     if core::owned_core_running(paths).await? {
-        if client.version().await.is_err() {
+        if macos_tun_needs_core_restart(config) {
+            eprintln!("runtime apply: macOS TUN needs inherited helper fd; restarting core");
+            core::stop(paths).await?;
+            core::ensure_running(paths, config).await?;
+            wait_for_mihomo(&client).await?;
+        } else if client.version().await.is_err() {
             eprintln!("runtime apply: owned global mihomo controller unhealthy; restarting core");
             core::stop(paths).await?;
             core::ensure_running(paths, config).await?;
@@ -625,6 +693,7 @@ async fn apply_global_runtime(paths: &Paths, config: &mut AppConfig) -> Result<(
     } else {
         eprintln!("runtime apply: tun requested={}", config.tun.enable);
     }
+    teardown_inactive_macos_tun(config);
 
     if let Err(err) = dns::apply(&client, &config.dns).await {
         errors.push(format!("dns: {err:#}"));
@@ -1082,6 +1151,16 @@ fn normalize_inline(value: &str) -> String {
     } else {
         value.replace('\n', " | ")
     }
+}
+
+#[cfg(target_os = "macos")]
+fn tun_permission_rule_label() -> &'static str {
+    "launchdaemon"
+}
+
+#[cfg(not(target_os = "macos"))]
+fn tun_permission_rule_label() -> &'static str {
+    "polkit_rule"
 }
 
 async fn read_pid(paths: &Paths) -> Result<Option<u32>> {

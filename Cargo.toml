@@ -20,7 +20,7 @@ serde_yaml_ng = "0.10.0"
 sysproxy = { git = "https://github.com/clash-verge-rev/sysproxy-rs", branch = "0.5.4" }
 tokio = { version = "1.50.0", features = ["fs", "macros", "rt-multi-thread", "time"] }
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 libc = "0.2"
 
 [profile.release]

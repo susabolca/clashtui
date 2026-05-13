@@ -1,17 +1,27 @@
+#[cfg(target_os = "macos")]
+use std::collections::BTreeSet;
 use std::env;
 use std::fs::OpenOptions;
+#[cfg(target_os = "macos")]
+use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
+#[cfg(target_os = "macos")]
+use serde_yaml_ng::Value;
 use tokio::fs;
 use tokio::time::sleep;
 
 use crate::config::{AppConfig, Paths, PortProxyService, RuntimePaths};
 use crate::mihomo::MihomoClient;
 use crate::port_allocator;
+#[cfg(target_os = "macos")]
+use crate::privilege;
 use crate::runtime_profile;
+#[cfg(target_os = "macos")]
+use crate::subscription;
 
 const CORE_NAMES: [&str; 4] = ["mihomo", "verge-mihomo", "verge-mihomo-alpha", "clash-meta"];
 const GEODATA_FILES: [&str; 4] = ["Country.mmdb", "geoip.metadb", "geoip.dat", "geosite.dat"];
@@ -25,7 +35,7 @@ const GEODATA_APP_DIRS: [&str; 5] = [
 const START_WAIT: Duration = Duration::from_millis(250);
 const START_RETRIES: usize = 20;
 
-pub async fn ensure_running(paths: &Paths, config: &AppConfig) -> Result<()> {
+pub async fn ensure_running(paths: &Paths, config: &mut AppConfig) -> Result<()> {
     let instance = global_instance(paths, config);
     if let Some(pid) = read_pid(&instance.pid_file).await?
         && is_process_running(pid)
@@ -43,8 +53,13 @@ pub async fn ensure_running(paths: &Paths, config: &AppConfig) -> Result<()> {
 
     ensure_geodata(&instance.work_dir).await?;
     port_allocator::validate_required_ports_available(config)?;
+
+    #[cfg(target_os = "macos")]
+    let tun_device = prepare_macos_tun(paths, config).await?;
+
     let mut bootstrap_config = config.clone();
-    if bootstrap_config.active_profile.is_some() {
+    let helper_tun = bootstrap_config.tun.file_descriptor.is_some() && cfg!(target_os = "macos");
+    if bootstrap_config.active_profile.is_some() && !helper_tun {
         bootstrap_config.tun.enable = false;
         bootstrap_config.dns.enable = false;
     }
@@ -62,7 +77,15 @@ pub async fn ensure_running(paths: &Paths, config: &AppConfig) -> Result<()> {
     } else {
         runtime_profile::write_bootstrap_config(paths, &bootstrap_config).await?;
     }
-    start_instance(&instance, &core_path).await
+    let result = start_instance(&instance, &core_path, config.tun.file_descriptor).await;
+    #[cfg(target_os = "macos")]
+    if result.is_err() && tun_device.is_some() {
+        let _ = privilege::teardown_tun();
+        config.tun.file_descriptor = None;
+    }
+    #[cfg(target_os = "macos")]
+    drop(tun_device);
+    result
 }
 
 pub async fn ensure_service_running(
@@ -89,7 +112,7 @@ pub async fn ensure_service_running(
 
     ensure_geodata(&instance.work_dir).await?;
     runtime_profile::write_service_config(paths, &instance, config, service).await?;
-    start_instance(&instance, &core_path).await?;
+    start_instance(&instance, &core_path, None).await?;
     Ok(instance)
 }
 
@@ -198,7 +221,11 @@ pub fn resolve_core_path(config: &AppConfig) -> Option<PathBuf> {
         .or_else(resolve_path_core)
 }
 
-async fn start_instance(instance: &RuntimePaths, core_path: &Path) -> Result<()> {
+async fn start_instance(
+    instance: &RuntimePaths,
+    core_path: &Path,
+    inherited_fd: Option<i32>,
+) -> Result<()> {
     fs::create_dir_all(&instance.work_dir)
         .await
         .with_context(|| format!("failed to create {}", instance.work_dir.display()))?;
@@ -210,6 +237,10 @@ async fn start_instance(instance: &RuntimePaths, core_path: &Path) -> Result<()>
     let err = log
         .try_clone()
         .with_context(|| format!("failed to clone {}", instance.log_file.display()))?;
+
+    if let Some(fd) = inherited_fd {
+        clear_close_on_exec(fd)?;
+    }
 
     let mut command = Command::new(core_path);
     command
@@ -253,6 +284,186 @@ async fn start_instance(instance: &RuntimePaths, core_path: &Path) -> Result<()>
         instance.log_file.display()
     );
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+async fn prepare_macos_tun(
+    paths: &Paths,
+    config: &mut AppConfig,
+) -> Result<Option<privilege::TunDevice>> {
+    if !config.tun.enable {
+        config.tun.file_descriptor = None;
+        config.runtime_interface_name = None;
+        return Ok(None);
+    }
+
+    let fallback_interface = macos_default_interface().ok();
+    let mut tun_config = config.tun.clone();
+    match macos_auto_route_excludes(paths, config).await {
+        Ok(excludes) => {
+            for exclude in excludes {
+                if !tun_config.route_exclude_address.contains(&exclude) {
+                    tun_config.route_exclude_address.push(exclude);
+                }
+            }
+        }
+        Err(err) => eprintln!("failed to collect macOS TUN route excludes: {err:#}"),
+    }
+    let tun_device =
+        privilege::prepare_tun(&tun_config).context("failed to prepare macOS TUN helper")?;
+    config.tun.device.clone_from(&tun_device.interface);
+    config.tun.file_descriptor = Some(tun_device.file_descriptor());
+    config.runtime_interface_name = tun_device.outbound_interface.clone().or(fallback_interface);
+    Ok(Some(tun_device))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_default_interface() -> Result<String> {
+    let output = Command::new("/sbin/route")
+        .arg("-n")
+        .arg("get")
+        .arg("default")
+        .output()
+        .context("failed to run route get default")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("route get default failed: {}", stderr.trim());
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let line = line.trim();
+        if let Some(interface) = line.strip_prefix("interface:") {
+            let interface = interface.trim();
+            if valid_interface_name(interface) {
+                return Ok(interface.into());
+            }
+            anyhow::bail!("route get default returned invalid interface: {interface}");
+        }
+    }
+    anyhow::bail!("route get default did not report an interface")
+}
+
+#[cfg(target_os = "macos")]
+fn valid_interface_name(interface: &str) -> bool {
+    !interface.is_empty()
+        && interface.len() < libc::IFNAMSIZ
+        && interface
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
+#[cfg(target_os = "macos")]
+async fn macos_auto_route_excludes(paths: &Paths, config: &AppConfig) -> Result<Vec<String>> {
+    let mut hosts = BTreeSet::new();
+    collect_dns_hosts(config, &mut hosts);
+    collect_active_profile_proxy_hosts(paths, config, &mut hosts).await?;
+    Ok(resolve_ipv4_cidrs(&hosts))
+}
+
+#[cfg(target_os = "macos")]
+fn collect_dns_hosts(config: &AppConfig, hosts: &mut BTreeSet<String>) {
+    for endpoint in config
+        .dns
+        .default_nameserver
+        .iter()
+        .chain(config.dns.nameserver.iter())
+        .chain(config.dns.fallback.iter())
+        .chain(config.dns.proxy_server_nameserver.iter())
+        .chain(config.dns.direct_nameserver.iter())
+        .chain(config.dns.lan_nameserver.iter())
+    {
+        insert_endpoint_host(hosts, endpoint);
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn collect_active_profile_proxy_hosts(
+    paths: &Paths,
+    config: &AppConfig,
+    hosts: &mut BTreeSet<String>,
+) -> Result<()> {
+    let Some(active_profile) = config.active_profile.as_deref() else {
+        return Ok(());
+    };
+    let Some(sub) = config
+        .subscriptions
+        .iter()
+        .find(|sub| sub.name == active_profile)
+    else {
+        return Ok(());
+    };
+    let path = subscription::profile_path(paths, sub);
+    let content = fs::read_to_string(&path)
+        .await
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let profile: Value = serde_yaml_ng::from_str(&content)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    let Some(proxies) = profile
+        .as_mapping()
+        .and_then(|mapping| mapping.get("proxies"))
+        .and_then(Value::as_sequence)
+    else {
+        return Ok(());
+    };
+
+    for proxy in proxies {
+        if let Some(server) = proxy
+            .as_mapping()
+            .and_then(|mapping| mapping.get("server"))
+            .and_then(Value::as_str)
+        {
+            insert_endpoint_host(hosts, server);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn insert_endpoint_host(hosts: &mut BTreeSet<String>, endpoint: &str) {
+    if let Some(host) = endpoint_host(endpoint) {
+        hosts.insert(host);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn endpoint_host(endpoint: &str) -> Option<String> {
+    let mut value = endpoint.trim();
+    if value.is_empty() || matches!(value, "system" | "dhcp") {
+        return None;
+    }
+    if let Some((_, rest)) = value.split_once("://") {
+        value = rest;
+    }
+    value = value.split('/').next().unwrap_or(value);
+    value = value.rsplit('@').next().unwrap_or(value);
+    if value.starts_with('[') {
+        return None;
+    }
+    let host = value.split(':').next().unwrap_or(value).trim();
+    if host.is_empty() {
+        return None;
+    }
+    Some(host.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_ipv4_cidrs(hosts: &BTreeSet<String>) -> Vec<String> {
+    let mut cidrs = BTreeSet::new();
+    for host in hosts {
+        if let Ok(addr) = host.parse::<Ipv4Addr>() {
+            cidrs.insert(format!("{addr}/32"));
+            continue;
+        }
+        let Ok(addrs) = (host.as_str(), 0).to_socket_addrs() else {
+            continue;
+        };
+        for addr in addrs {
+            if let IpAddr::V4(ip) = addr.ip() {
+                cidrs.insert(format!("{ip}/32"));
+            }
+        }
+    }
+    cidrs.into_iter().collect()
 }
 
 async fn ensure_geodata(target_dir: &Path) -> Result<()> {
@@ -430,6 +641,26 @@ fn binary_name(name: &str) -> String {
 fn path_to_str(path: &Path) -> Result<&str> {
     path.to_str()
         .with_context(|| format!("path is not valid UTF-8: {}", path.display()))
+}
+
+#[cfg(target_os = "macos")]
+fn clear_close_on_exec(fd: i32) -> Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("failed to read fd flags for inherited fd {fd}"));
+    }
+    let status = unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) };
+    if status != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("failed to clear FD_CLOEXEC for inherited fd {fd}"));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn clear_close_on_exec(_fd: i32) -> Result<()> {
+    Ok(())
 }
 
 async fn read_pid(path: &Path) -> Result<Option<u32>> {

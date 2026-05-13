@@ -98,6 +98,10 @@ pub fn tun_uninstall_privileged(target: PathBuf) -> Result<()> {
     Ok(())
 }
 
+pub fn tun_helper_run() -> Result<()> {
+    anyhow::bail!("macOS TUN helper is not supported on Linux")
+}
+
 fn target_binary(path: Option<PathBuf>) -> Result<PathBuf> {
     let path = match path {
         Some(path) => path,

@@ -57,6 +57,7 @@ pub async fn write_service_config(
     runtime_config.runtime_mode.clone_from(&service.mode);
     runtime_config.system_proxy.enabled = false;
     runtime_config.tun.enable = false;
+    runtime_config.runtime_interface_name = None;
     runtime_config.dns.enable = false;
     runtime_config.mixed_port = 0;
     runtime_config.proxy_ports.http = None;
@@ -146,6 +147,13 @@ fn apply_overrides(value: &mut Value, config: &AppConfig) -> Result<()> {
     mapping.insert("allow-lan".into(), config.proxy_ports.allow_lan.into());
     mapping.insert("ipv6".into(), true.into());
     mapping.insert("unified-delay".into(), true.into());
+    if let Some(interface_name) = config
+        .runtime_interface_name
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        mapping.insert("interface-name".into(), interface_name.into());
+    }
 
     if let Some(secret) = config
         .controller
@@ -379,6 +387,26 @@ rules: []
         assert_eq!(listener.get("type").and_then(Value::as_str), Some("mixed"));
         assert_eq!(listener.get("port").and_then(Value::as_i64), Some(7071));
         assert!(listener.get("proxy").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn apply_overrides_adds_runtime_interface_name() -> Result<()> {
+        let mut profile = Value::Mapping(empty_profile());
+        let config = AppConfig {
+            runtime_interface_name: Some("en0".into()),
+            ..AppConfig::default()
+        };
+
+        apply_overrides(&mut profile, &config)?;
+
+        let mapping = profile
+            .as_mapping()
+            .context("profile root is not a mapping")?;
+        assert_eq!(
+            mapping.get("interface-name").and_then(Value::as_str),
+            Some("en0")
+        );
         Ok(())
     }
 }

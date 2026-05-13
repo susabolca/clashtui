@@ -45,3 +45,20 @@ pub fn tun_uninstall_privileged(path: PathBuf) -> Result<()> {
 pub fn current_tun_permission_status() -> Result<TunPermissionStatus> {
     imp::current_tun_permission_status()
 }
+
+pub fn tun_helper_run() -> Result<()> {
+    imp::tun_helper_run()
+}
+
+#[cfg(target_os = "macos")]
+pub use imp::TunDevice;
+
+#[cfg(target_os = "macos")]
+pub fn prepare_tun(config: &crate::config::TunConfig) -> Result<TunDevice> {
+    imp::prepare_tun(config)
+}
+
+#[cfg(target_os = "macos")]
+pub fn teardown_tun() -> Result<()> {
+    imp::teardown_tun()
+}

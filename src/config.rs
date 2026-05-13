@@ -153,6 +153,8 @@ pub struct AppConfig {
     pub proxy_selections: BTreeMap<String, String>,
     pub subscriptions: Vec<Subscription>,
     pub active_profile: Option<String>,
+    #[serde(skip)]
+    pub runtime_interface_name: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -171,6 +173,7 @@ impl Default for AppConfig {
             proxy_selections: BTreeMap::new(),
             subscriptions: Vec::new(),
             active_profile: None,
+            runtime_interface_name: None,
         }
     }
 }
@@ -428,6 +431,8 @@ pub struct TunConfig {
     pub strict_route: bool,
     pub mtu: u16,
     pub route_exclude_address: Vec<String>,
+    #[serde(skip)]
+    pub file_descriptor: Option<i32>,
 }
 
 impl Default for TunConfig {
@@ -443,6 +448,7 @@ impl Default for TunConfig {
             strict_route: false,
             mtu: 1500,
             route_exclude_address: Vec::new(),
+            file_descriptor: None,
         }
     }
 }
@@ -610,5 +616,29 @@ mod tests {
         assert!(config.port_allocation.auto_controller);
         assert!(!config.port_allocation.auto_mixed);
         assert!(config.port_allocation.auto_dns);
+    }
+
+    #[test]
+    fn tun_file_descriptor_is_runtime_only() -> Result<()> {
+        let config = AppConfig {
+            runtime_interface_name: Some("en0".into()),
+            tun: TunConfig {
+                file_descriptor: Some(3),
+                ..TunConfig::default()
+            },
+            ..AppConfig::default()
+        };
+
+        let serialized = serde_yaml_ng::to_string(&config)?;
+        assert!(!serialized.contains("file_descriptor"));
+        assert!(!serialized.contains("file-descriptor"));
+        assert!(!serialized.contains("runtime_interface_name"));
+        assert!(!serialized.contains("interface-name"));
+
+        let decoded: AppConfig =
+            serde_yaml_ng::from_str("runtime_interface_name: en0\ntun:\n  file_descriptor: 9\n")?;
+        assert_eq!(decoded.runtime_interface_name, None);
+        assert_eq!(decoded.tun.file_descriptor, None);
+        Ok(())
     }
 }

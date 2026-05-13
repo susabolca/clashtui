@@ -69,7 +69,26 @@ sudo target/release/clashtui tun-uninstall
 
 macOS uses `utun` devices. The default generated TUN device is `utun1024`, and Linux-only `auto-redirect` is omitted from the runtime mihomo patch on macOS.
 
-`tun-install` and `tun-uninstall` manage Linux capabilities only. On macOS, TUN requires a privileged mihomo process because creating `utun` devices and changing routes are privileged operations. If `clashtui status` reports `tun.enable=false` while `tun=true` is configured, or `ifconfig utun1024` says the interface does not exist, the current process is not privileged enough.
+macOS does not have Linux-style `setcap` permissions. `clashtui tun-install` installs a root-owned `clashtui` TUN helper as a LaunchDaemon:
+
+```bash
+target/release/clashtui tun-install
+```
+
+The helper is installed under:
+
+```text
+/Library/PrivilegedHelperTools/com.clashtui.tun-helper
+/Library/LaunchDaemons/com.clashtui.tun-helper.plist
+```
+
+The helper is intentionally narrow: it creates/configures `utun`, installs split default routes when `auto-route=true`, passes the TUN fd to user-mode `mihomo`, and cleans up helper-owned routes. `mihomo` continues to run as the normal user. Remove the helper with:
+
+```bash
+target/release/clashtui tun-uninstall
+```
+
+If `clashtui status` reports `tun.enable=false` while `tun=true` is configured, or `ifconfig utun1024` says the interface does not exist, the helper is missing, unreachable, or the TUN FD path is not active.
 
 Port Proxy and system proxy can still work without TUN:
 
@@ -77,7 +96,7 @@ Port Proxy and system proxy can still work without TUN:
 curl -x http://127.0.0.1:7070 -I https://google.com
 ```
 
-Transparent TUN traffic requires running the Global Proxy mihomo through a privileged service/helper on macOS. Until that service path exists, a plain user-mode `clashtui start` should be treated as port/system-proxy mode even when TUN is configured.
+Transparent TUN traffic requires the macOS helper. After `tun-install`, later `clashtui start` runs without another sudo prompt.
 
 ## TUI
 

@@ -49,3 +49,7 @@ pub fn tun_install_privileged(_path: PathBuf, _user: String) -> Result<()> {
 pub fn tun_uninstall_privileged(_path: PathBuf) -> Result<()> {
     anyhow::bail!("privileged tun-uninstall is not supported on this platform")
 }
+
+pub fn tun_helper_run() -> Result<()> {
+    anyhow::bail!("macOS TUN helper is not supported on this platform")
+}
