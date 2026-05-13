@@ -46,10 +46,11 @@ cargo run -- status
 
 ### Linux
 
-TUN needs `CAP_NET_ADMIN`. DNS link updates through systemd-resolved also need a small polkit rule. Run this once after building or replacing the binary:
+Linux helper mode installs a root-owned `clashtui-tun-helper` systemd service. The helper opens `/dev/net/tun`, passes the TUN fd to user-mode `mihomo`, and owns route cleanup. Release builds should ship `clashtui-tun-helper` next to `clashtui`; during development, build both binaries first.
 
 ```bash
-sudo target/release/clashtui tun-install
+cargo build --release --bins
+target/release/clashtui tun-install
 ```
 
 After that, normal commands do not need sudo:
@@ -59,17 +60,20 @@ target/release/clashtui start
 target/release/clashtui stop
 ```
 
-Remove those permissions with:
+Remove the helper with:
 
 ```bash
-sudo target/release/clashtui tun-uninstall
+target/release/clashtui tun-uninstall
 ```
+
+Linux TUN requires the helper path. `clashtui` does not grant capabilities to `mihomo`; the helper owns privileged TUN and route operations while `mihomo` remains user-mode.
+Linux helper route activation is currently guarded until the cgroup/fwmark loop-prevention policy is implemented. Use `scripts/tun_guarded_test.sh` for Linux validation; it opts into the guarded route activation and stops `clashtui` on exit.
 
 ### macOS
 
 macOS uses `utun` devices. The default generated TUN device is `utun1024`, and Linux-only `auto-redirect` is omitted from the runtime mihomo patch on macOS.
 
-macOS does not have Linux-style `setcap` permissions. `clashtui tun-install` installs a root-owned `clashtui` TUN helper as a LaunchDaemon:
+macOS does not have Linux-style `setcap` permissions. `clashtui tun-install` installs a root-owned TUN helper as a LaunchDaemon. Release builds should ship `clashtui-tun-helper` next to `clashtui`; development builds fall back to the current `clashtui` helper entrypoint if the separate helper artifact is missing.
 
 ```bash
 target/release/clashtui tun-install
@@ -82,7 +86,7 @@ The helper is installed under:
 /Library/LaunchDaemons/com.clashtui.tun-helper.plist
 ```
 
-The helper is intentionally narrow: it creates/configures `utun`, installs split default routes when `auto-route=true`, passes the TUN fd to user-mode `mihomo`, and cleans up helper-owned routes. `mihomo` continues to run as the normal user. Remove the helper with:
+The helper is intentionally narrow: it creates/configures `utun`, passes the TUN fd to user-mode `mihomo`, activates split default routes after the mihomo controller is healthy, keeps scoped upstream routes for mihomo's own outbound sockets, and cleans up helper-owned routes. `mihomo` continues to run as the normal user. Remove the helper with:
 
 ```bash
 target/release/clashtui tun-uninstall
@@ -97,6 +101,17 @@ curl -x http://127.0.0.1:7070 -I https://google.com
 ```
 
 Transparent TUN traffic requires the macOS helper. After `tun-install`, later `clashtui start` runs without another sudo prompt.
+
+For a bounded local TUN smoke test on macOS or Linux, build both binaries, run
+`tun-install` once if the helper changed, then run:
+
+```bash
+cargo build --bins
+scripts/tun_guarded_test.sh
+```
+
+The script exits through `clashtui stop` and also has a 60-second watchdog so a
+route loop does not leave TUN active indefinitely.
 
 ## TUI
 

@@ -15,10 +15,14 @@ pub fn patch(config: &TunConfig) -> Value {
     tun.insert("enable".into(), json!(config.enable));
     tun.insert("stack".into(), json!(config.stack));
     tun.insert("device".into(), json!(config.device));
-    let helper_fd = config.file_descriptor.is_some() && cfg!(target_os = "macos");
+    let helper_fd =
+        config.file_descriptor.is_some() && cfg!(any(target_os = "linux", target_os = "macos"));
     tun.insert("auto-route".into(), json!(config.auto_route && !helper_fd));
     if platform::tun::supports_auto_redirect() {
-        tun.insert("auto-redirect".into(), json!(config.auto_redirect));
+        tun.insert(
+            "auto-redirect".into(),
+            json!(config.auto_redirect && !helper_fd),
+        );
     }
     tun.insert(
         "auto-detect-interface".into(),
@@ -46,7 +50,7 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "macos")]
-    fn macos_file_descriptor_disables_mihomo_route_setup() {
+    fn helper_file_descriptor_disables_mihomo_route_setup() {
         let config = TunConfig {
             enable: true,
             file_descriptor: Some(7),

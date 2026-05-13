@@ -48,13 +48,13 @@ enum Command {
     Status,
     /// Open the interactive config menu.
     Config,
-    /// Install Linux capabilities needed for TUN/DNS.
+    /// Install TUN helper or platform permissions.
     TunInstall {
         /// Override the clashtui binary path to update.
         #[arg(long)]
         path: Option<PathBuf>,
     },
-    /// Remove Linux capabilities installed for TUN/DNS.
+    /// Remove TUN helper or platform permissions.
     TunUninstall {
         /// Override the clashtui binary path to update.
         #[arg(long)]

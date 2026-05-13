@@ -30,8 +30,8 @@ not `clashtui`'s default `127.0.0.1:7070`.
 
 ## Root Cause
 
-Linux uses `setcap` in `tun-install` to grant the `clashtui` binary the
-specific capabilities needed for TUN and DNS setup:
+Earlier Linux builds used `setcap` in `tun-install` to grant the `clashtui`
+binary the specific capabilities needed for TUN and DNS setup:
 
 - `CAP_NET_ADMIN`
 - `CAP_NET_BIND_SERVICE`
@@ -101,15 +101,15 @@ clashtui status
 
 ## Proposed Architecture
 
-Use an audited `clashtui` TUN helper installed as a root-owned LaunchDaemon on
-macOS. The helper protocol should stay platform-neutral so Linux can use the
-same security model later instead of granting capabilities to `clashtui` and
-passing them to `mihomo`.
+Use an audited `clashtui` TUN helper installed as a root-owned platform service:
+LaunchDaemon on macOS and systemd on Linux. The helper protocol should stay
+platform-neutral so both platforms use the same security model instead of
+granting capabilities to `clashtui` or passing them to `mihomo`.
 
 ```text
 user shell
   -> clashtui start
-       -> user-mode clashtui supervisor
+       -> user-mode clashtui supervisor (`clashtui --daemon-run`)
             -> IPC prepare_tun to root tun-helper
                  -> create/configure utun
                  -> pass TUN fd back to clashtui
@@ -121,6 +121,13 @@ user shell
 ```
 
 Only the helper runs as root. `mihomo` continues to run as the invoking user.
+
+Current implementation note: `clashtui start` already launches the same
+`clashtui` binary with the hidden `--daemon-run` flag. That daemon is the
+current user-mode supervisor/shim. It already owns the mihomo child process,
+TUN preparation, route activation, health checks, config reloads, and stop-time
+cleanup. The remaining work is to harden this daemon into a full supervisor,
+not to add a second overlapping user-mode process.
 
 Suggested installed files:
 
@@ -142,8 +149,9 @@ clashtui __tun-helper-run
 ```
 
 During `tun-install`, copy the selected helper artifact to the privileged helper
-location, make it root-owned, and load it through `launchctl`. This avoids
-trusting a user-writable binary path after installation.
+location, make it root-owned, and load it through the platform service manager
+(`launchd` on macOS, systemd for the initial Linux helper). This avoids trusting
+a user-writable binary path after installation.
 
 ## Linux Helper Feasibility
 
@@ -162,17 +170,18 @@ user clashtui
        -> configure helper-owned routes, policy rules, and optional DNS state
 ```
 
-Current Linux behavior is less isolated:
+Removed legacy Linux behavior was less isolated:
 
-- `tun-install` sets `cap_net_admin,cap_net_bind_service+ep` on `clashtui`.
-- `clashtui` raises ambient capabilities before spawning `mihomo`.
-- As a result, the external `mihomo` process receives network-admin capability.
+- `tun-install` set `cap_net_admin,cap_net_bind_service+ep` on `clashtui`.
+- `clashtui` raised ambient capabilities before spawning `mihomo`.
+- As a result, the external `mihomo` process received network-admin capability.
 
-A Linux helper would let us remove that capability path for the normal runtime.
-The helper can be installed by `tun-install` as a root-owned systemd service or
-socket unit under `/run`, accepting only the installing UID via `SO_PEERCRED`.
-The existing `setcap` path can remain as a compatibility fallback until the
-helper mode is implemented and tested.
+A Linux helper lets us remove that capability path for the normal runtime. The
+initial implementation installs a root-owned systemd service under
+`/etc/systemd/system`, listens on `/run/com.clashtui.tun-helper.sock`, and
+accepts only the installing UID via `SO_PEERCRED`. The `setcap`/ambient
+capability path is no longer a runtime fallback; Linux TUN should use the helper
+path like macOS.
 
 Linux-specific helper work:
 
@@ -213,8 +222,10 @@ root:wheel 0644 /Library/LaunchDaemons/com.clashtui.tun-helper.plist
 7. Verify the helper IPC endpoint is reachable.
 8. Print status and next steps.
 
-On Linux, keep the existing `setcap` and polkit behavior unchanged for the
-current patch. Treat it as a compatibility path, not the target architecture.
+On Linux, `tun-install` should install or repair the root-owned systemd helper.
+The older `setcap`/ambient capability path should not be used as a runtime
+fallback; `tun-uninstall` may still remove stale file capabilities from older
+installs.
 
 ## tun-uninstall
 
@@ -312,8 +323,9 @@ runtimes do not own TUN and should remain fully user-mode.
 Runtime ownership should be split:
 
 - the root helper owns only privileged kernel state;
-- a user-mode supervisor/shim owns the active session, the mihomo child process,
-  the helper lease, heartbeats, status, and cleanup ordering;
+- the existing `clashtui --daemon-run` user daemon should be treated as the
+  supervisor/shim and own the active session, the mihomo child process, the
+  helper lease, heartbeats, status, and cleanup ordering;
 - mihomo remains an ordinary user process and does not speak the helper IPC
   protocol.
 
@@ -353,10 +365,10 @@ The stable invariant is:
 > mihomo's own outbound proxy and DNS sockets must never be selected into the
 > same TUN capture path that mihomo is serving.
 
-Static `/32` excludes for currently resolved proxy or DNS IPs are useful as a
-diagnostic or compatibility fallback, but they are not a complete safety model.
-They break when DNS answers rotate, proxy providers update, the default gateway
-changes, or the active physical interface changes.
+Static `/32` excludes for currently resolved proxy or DNS IPs are not a complete
+safety model. They break when DNS answers rotate, proxy providers update, the
+default gateway changes, or the active physical interface changes. After the
+macOS scoped-route fix, they should not be part of the normal path.
 
 The helper should own TUN and routes, but route activation should be staged:
 
@@ -374,11 +386,17 @@ The helper should own TUN and routes, but route activation should be staged:
 6. If activation or health verification fails, `clashtui` stops mihomo and calls
    `teardown_tun`.
 
-The current one-step macOS implementation combines TUN creation and route
-activation. It works after adding `/32` excludes, but those excludes are a
-fallback and diagnostic aid, not the correctness boundary. The two-step flow
-with identity/interface based loop prevention is the target for both macOS and
-Linux.
+The current implementation uses the two-step flow on macOS. The correctness
+boundary is identity/interface based loop prevention, not destination host
+excludes. Linux should use helper-owned process identity policy, such as cgroup
+or dedicated-UID routing, instead of destination `/32` excludes.
+
+For local helper authorization, UID plus PID is a reliable and auditable owner
+anchor: the helper can verify that the supervisor pid and mihomo pid are alive,
+and cleanup can be tied to those local processes. For Linux routing, however,
+PID by itself is not a stable RPDB selector. The helper should translate the
+subject pid into a kernel-visible routing identity, such as a cgroup mark or a
+dedicated mihomo UID, before installing capture routes.
 
 ### External helper feasibility
 
@@ -513,7 +531,7 @@ Linux installed form:
 ```text
 /usr/local/libexec/clashtui-tun-helper
 /etc/systemd/system/clashtui-tun-helper.service
-/run/clashtui/tun-helper.sock
+/run/com.clashtui.tun-helper.sock
 ExecStart=/usr/local/libexec/clashtui-tun-helper
 ```
 
@@ -562,10 +580,11 @@ Session lifetime:
 
 ### User-Mode Supervisor
 
-`clashtui start` should hand the runtime to a user-mode shim/supervisor process.
-This supervisor can be integrated in the `clashtui` binary as a hidden command,
-but it should run without root privileges and should be distributed as part of
-the normal binary.
+`clashtui start` already hands runtime ownership to a user-mode supervisor by
+spawning the same binary as `clashtui --daemon-run`. No separate user-mode shim
+binary is required for the current design. The daemon should be formalized as
+the session supervisor, while the root helper remains a separate privileged
+binary with a narrow IPC surface.
 
 Responsibilities:
 
@@ -699,8 +718,8 @@ Primary macOS design:
 - Treat default route interface/gateway changes as a restart boundary:
   deactivate helper routes first, restart mihomo with the new `interface-name`,
   then reactivate routes.
-- Use resolved `/32` proxy/DNS excludes only as compatibility fallback and
-  diagnostics, not as the correctness boundary.
+- Do not use resolved `/32` proxy/DNS excludes in the normal path; scoped routes
+  are the current correctness boundary.
 
 macOS hardening option:
 
@@ -789,14 +808,18 @@ After activation:
 
 ### Rollout Plan
 
-1. Refactor macOS helper protocol into platform-neutral commands with leases.
-2. Split current `prepare_tun` into `prepare_tun` and `activate_routes`.
-3. Add route-change detection and automatic deactivate/restart/reactivate.
-4. Keep current `/32` excludes as fallback only.
-5. Implement Linux helper with fd passing and dedicated route table.
-6. Add Linux dedicated UID or cgroup policy routing.
-7. Remove ambient capability passing to mihomo once Linux helper mode is stable.
-8. Evaluate macOS PF-anchor hardening separately.
+1. Split current `prepare_tun` into `prepare_tun` and `activate_routes`. Done.
+2. Add a separate `clashtui-tun-helper` binary artifact. Done.
+3. Refactor macOS helper protocol into platform-neutral commands with leases.
+4. Add route-change detection and automatic deactivate/restart/reactivate.
+5. Remove automatic `/32` proxy/DNS route excludes from the normal path. Done.
+6. Implement Linux helper with fd passing and a dedicated route table. Initial
+   implementation done behind guarded activation; needs Linux host validation.
+7. Add Linux dedicated UID or cgroup policy routing before making helper routes
+   the default Linux path.
+8. Remove ambient capability passing to mihomo when helper fd mode is active.
+   Done for the runtime path; remaining references are legacy cleanup/status.
+9. Evaluate macOS PF-anchor hardening separately.
 
 ### Research References
 
@@ -857,7 +880,8 @@ tun: disabled at runtime because macOS requires the helper for utun/routes
 
 ## Implementation Plan
 
-Current v0 is an intentionally narrow macOS proof point:
+Current v0 started as a narrow macOS proof point and now includes the initial
+Linux helper skeleton:
 
 1. Add a macOS hidden helper entrypoint in the `clashtui` binary, for example
    `__tun-helper-run`. Done.
@@ -870,62 +894,103 @@ Current v0 is an intentionally narrow macOS proof point:
 7. Add runtime-only `tun.file-descriptor` patching. Done.
 8. Spawn user-mode mihomo with inherited fd. Done.
 9. Set top-level `interface-name` from the original default route. Done.
-10. Add temporary `/32` proxy/DNS host-route fallback. Done.
-11. Add status diagnostics and stale cleanup. Partially done.
-12. Add tests for config generation, installer path validation, and helper
+10. Remove temporary `/32` proxy/DNS host-route fallback from the normal path.
+    Done.
+11. Split helper route setup so `prepare_tun` returns the fd first and
+    `activate_routes` runs only after mihomo controller health. Done.
+12. Add `deactivate_routes` and call it before stopping/restarting the global
+    mihomo process. Done.
+13. Add a separate `clashtui-tun-helper` binary target and make `tun-install`
+    prefer that artifact when it exists next to `clashtui`. Done.
+14. Add status diagnostics and stale owner cleanup. Partially done.
+15. Add tests for config generation, installer path validation, and helper
     request validation. Partially done.
 
 Target implementation work:
 
-1. Split the helper into a separate `clashtui-tun-helper` binary artifact.
-2. Move the current helper IPC to explicit lease ids and heartbeats.
-3. Split the current one-step route setup into `prepare_tun` and
-   `activate_routes`.
-4. Add `deactivate_routes` for restart and failure recovery.
-5. Add the user-mode supervisor/shim that owns the mihomo process and session
-   lifecycle.
-6. Add default-route and DNS-change detection with deactivate/restart/reactivate.
-7. Promote `/32` host routes to fallback-only behavior.
-8. Add Linux helper mode with fd passing and helper-owned RPDB/nftables policy.
-9. Remove Linux ambient capability requirements from mihomo after helper mode is
-   stable.
+1. Move the current helper IPC to explicit lease ids and heartbeats.
+2. Remove the same-binary helper fallback after release packaging reliably ships
+   `clashtui-tun-helper`.
+3. Harden the existing `clashtui --daemon-run` daemon into the full user-mode
+   supervisor for mihomo, helper lease, status, and cleanup lifecycle.
+4. Add default-route and DNS-change detection with deactivate/restart/reactivate.
+5. Add Linux helper-owned cgroup or dedicated-UID loop-avoidance policy.
+6. Add default-route and DNS-change policy updates.
+7. Keep legacy Linux file-capability handling limited to stale install detection
+   and uninstall cleanup.
 
 Current implementation status:
 
-- `clashtui tun-install` on macOS copies the current binary to
+- `clashtui tun-install` on macOS copies the selected helper artifact to
   `/Library/PrivilegedHelperTools/com.clashtui.tun-helper`.
+- If a sibling `clashtui-tun-helper` artifact exists, `tun-install` installs it
+  instead of the user-facing `clashtui` binary. If it is missing, development
+  builds still fall back to `clashtui __tun-helper-run`.
 - It writes and loads
   `/Library/LaunchDaemons/com.clashtui.tun-helper.plist`.
-- The LaunchDaemon runs `clashtui __tun-helper-run` as root.
-- This same-binary helper shape is current v0 only; target packaging is a
-  separate `clashtui-tun-helper` executable installed at the same privileged
-  helper path.
-- The helper listens on `/var/run/com.clashtui.tun-helper.sock`.
+- If the separate helper artifact is installed, the LaunchDaemon runs the helper
+  executable directly. If development fallback is used, the LaunchDaemon runs
+  `clashtui __tun-helper-run` as root.
+- On Linux, `tun-install` now targets a root-owned systemd helper at
+  `/usr/local/libexec/clashtui-tun-helper` with service unit
+  `/etc/systemd/system/clashtui-tun-helper.service` and socket
+  `/run/com.clashtui.tun-helper.sock`. This still needs native Linux build and
+  live validation.
+- `clashtui start` launches the same `clashtui` binary as `clashtui
+  --daemon-run`. This daemon is the current supervisor/shim process and is not
+  root.
+- The helper listens on `/var/run/com.clashtui.tun-helper.sock` on macOS and
+  `/run/com.clashtui.tun-helper.sock` on Linux.
 - The helper accepts the installed user's UID and root only.
-- `status`, `prepare_tun`, and `teardown_tun` are implemented.
+- `status`, `prepare_tun`, `activate_routes`, `deactivate_routes`, and
+  `teardown_tun` are implemented.
+- On Linux, `prepare_tun` opens `/dev/net/tun`, performs `TUNSETIFF`,
+  configures the link, and returns the fd over `SCM_RIGHTS`. `activate_routes`
+  requires the daemon to pass the mihomo `subject_pid`, verifies that pid is
+  alive and owned by the invoking UID, and records it for stale cleanup.
+- Linux route activation is currently guarded behind
+  `CLASHTUI_LINUX_TUN_EXPERIMENTAL_ROUTES=1` because the current dedicated route
+  table does not yet include the cgroup/fwmark policy needed to make mihomo's
+  own sockets bypass TUN. The guarded test script opts in for bounded live
+  validation and always calls `clashtui stop`.
 - `prepare_tun` creates the requested `utunN` through the utun kernel control,
-  configures the interface, adds helper-owned split default routes in the
-  current v0, and returns the fd to user-mode `clashtui` over `SCM_RIGHTS`.
+  configures the interface, records the original default route snapshot, and
+  returns the fd to user-mode `clashtui` over `SCM_RIGHTS` without installing
+  traffic-capturing routes.
+- `clashtui` starts mihomo with the inherited fd, waits for the controller to
+  become healthy, then asks the helper to `activate_routes`.
+- `deactivate_routes` removes helper-owned capture routes while leaving the TUN
+  interface alive for a restart path.
+- Same-UID cleanup is allowed after the recorded owner PID exits, so
+  `clashtui stop` can recover routes even though the daemon that created the
+  lease has already been terminated.
+- The helper listener is nonblocking and checks the recorded owner PID once per
+  second. If the owner disappears, it tears down helper-owned routes and brings
+  the TUN interface down.
 - `clashtui` clears `FD_CLOEXEC`, writes `tun.file-descriptor` into the runtime
   mihomo config/patch, and starts mihomo as the normal user with the inherited
   fd.
 - Helper fd mode disables mihomo `auto-route` and `tun.auto-detect-interface`.
   clashtui records the default route before asking the helper to add split TUN
   routes, and newer helpers also return the same interface. clashtui writes
-  that original interface as top-level `interface-name` so mihomo's own
-  outbound sockets do not loop back into the helper-installed TUN routes.
-- clashtui also resolves the active profile's proxy server hosts plus DNS
-  upstream hosts before enabling TUN, then asks the helper to add `/32` host
-  routes for those resolved IPv4 addresses through the original gateway. This is
-  the current fallback behavior, not the target correctness boundary.
+  that original interface as top-level `interface-name`. This is the macOS
+  stable loop-prevention primitive and a secondary Linux hint, not the final
+  Linux route policy.
+- On macOS, helper route activation installs scoped split routes through the
+  original outbound interface before installing unscoped split routes to the
+  TUN interface. This lets normal captured traffic enter TUN while sockets bound
+  by mihomo to the original interface still have a valid upstream route.
+- Automatic proxy/DNS `/32` host-route generation has been removed from the
+  normal macOS path after scoped routes proved sufficient in the guarded live
+  test.
 - `tun.file_descriptor` is runtime-only and is not persisted to
   `config.yaml`.
-- When TUN is disabled or clashtui stops, the helper tears down helper-owned
-  routes and brings the helper interface down.
-- Still pending: active lease expiry if the owner process dies without a clean
-  stop, explicit route deactivation before mihomo restarts, the user-mode
-  supervisor, network-change recovery, richer status output for active helper
-  state, and Linux helper mode.
+- When TUN is disabled or clashtui stops, clashtui deactivates helper-owned
+  routes before stopping mihomo, then tears down helper-owned TUN state.
+- Still pending: explicit lease ids/heartbeats, full supervisor semantics in
+  the existing daemon, network-change recovery, richer status output for active
+  helper state, Linux native validation, and Linux cgroup/fwmark or dedicated
+  UID loop-avoidance policy.
 
 Live test note:
 
@@ -939,12 +1004,73 @@ Live test note:
 - Fix: record the original default interface before `prepare_tun`, write it as
   top-level `interface-name`, and keep mihomo route management disabled in
   helper fd mode.
-- Follow-up fix: auto-add `/32` route excludes for resolved proxy and DNS
-  upstream IPv4 addresses as a fallback. A guarded 60-second test then passed:
-  `curl -x http://127.0.0.1:7070 -I https://google.com` and
-  `curl --noproxy '*' -I https://google.com` both returned HTTP/2 301. The
-  test trap stopped clashtui, called helper `teardown_tun`, and verified the
-  default route was back on `en0` with `utun1024` removed.
+- The two-phase path and scoped-route fix passed a guarded 60-second macOS live
+  test on 2026-05-13. During the active window, the route table contained
+  unscoped `0/1` and `128.0/1` routes to `utun1024` plus scoped `0/1` and
+  `128.0/1` routes through the original `en0` gateway. `route -n get
+  182.140.194.244` selected `utun1024`, while `route -n get -ifscope en0
+  182.140.194.244` selected `192.168.0.1` on `en0`.
+- The same live test returned HTTP/2 301 for both explicit proxy curl and
+  `curl --noproxy '*' https://google.com`. New mihomo logs showed Domestic
+  DIRECT connections as successful info entries rather than the previous
+  `network is unreachable` warnings.
+- After the guarded test stopped clashtui, status showed daemon/mihomo stopped,
+  system proxy disabled, `utun1024` removed, split routes removed, and the
+  default route restored through `192.168.0.1` on `en0`.
+- Added `scripts/tun_guarded_test.sh` for macOS and Linux live testing. It
+  refuses to run if the installed helper differs from the freshly built helper
+  artifact, and it always exits through `clashtui stop` with a 60-second
+  watchdog.
+
+## Remaining Implementation Review
+
+The current helper v0 has the right process shape on macOS and an initial Linux
+implementation behind guarded route activation. macOS has passed a guarded live
+test, but the issue is not complete. Remaining work:
+
+1. Lease protocol hardening.
+   Keep uid/pid as the local ownership anchor and add a `lease_id` for
+   idempotency, stale-state correlation, and status. Require the matching
+   owner pid plus lease for `activate_routes`, `deactivate_routes`,
+   `teardown_tun`, and future `update_policy`, add heartbeat/expiry, and make
+   stale cleanup independent of a best-effort stop path.
+2. Supervisor hardening in `clashtui --daemon-run`.
+   Treat the daemon as the official user-mode supervisor. Add deterministic
+   signal handling, child-exit handling, session status, last-error state,
+   idempotent cleanup, and clearer restart ordering when config or health
+   changes occur.
+3. Network-change recovery.
+   Watch default route, outbound interface, gateway, and DNS/upstream changes.
+   On relevant changes, deactivate helper routes first, stop/restart mihomo with
+   the new `interface-name` and fd, then reactivate routes. This is the main
+   remaining loop-stability work.
+4. Linux loop policy.
+   Replace the guarded initial dedicated-route-table activation with cgroup or
+   dedicated-UID policy so mihomo's own sockets bypass TUN without granting
+   mihomo `CAP_NET_ADMIN`. PID remains an ownership/cleanup anchor; it is not
+   the final Linux routing selector.
+5. Status and diagnostics.
+   First pass done: healthy `start`, `stop`, and stopped `status` paths no
+   longer dump log tails by default. Continue redesigning output around phases
+   and failures. In healthy cases, show concise process, helper, TUN, proxy, and
+   route state. On failure, put the failing phase, command, last error, and
+   suggested repair first. Extend helper `status` with active session/lease id,
+   supervisor pid, mihomo pid, interface, route count/details, route active
+   state, last activation error, and helper/version mismatch signals.
+6. Packaging cleanup.
+   Ensure release packaging always ships `clashtui-tun-helper` next to
+   `clashtui`, then remove or gate the same-binary `__tun-helper-run` fallback.
+7. Linux helper mode.
+   Native-validate the Linux root helper with `/dev/net/tun` fd passing,
+   systemd install/uninstall, `SO_PEERCRED`, guarded route
+   activation/deactivation, subject-pid validation, and cleanup. Then add
+   netlink and cgroup/dedicated-UID loop avoidance. The runtime path no longer
+   depends on ambient `cap_net_admin` for mihomo; keep only stale capability
+   detection/removal for older installs.
+8. Broader tests.
+   Add unit tests around lease validation and route command generation, helper
+   IPC failure/rollback tests, supervisor restart/cleanup tests, and guarded
+   live smoke tests for network-change scenarios.
 
 ## Acceptance Criteria
 

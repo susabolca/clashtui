@@ -50,15 +50,25 @@ pub fn tun_helper_run() -> Result<()> {
     imp::tun_helper_run()
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use imp::TunDevice;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn prepare_tun(config: &crate::config::TunConfig) -> Result<TunDevice> {
     imp::prepare_tun(config)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn activate_tun(subject_pid: Option<u32>) -> Result<()> {
+    imp::activate_tun(subject_pid)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn deactivate_tun() -> Result<()> {
+    imp::deactivate_tun()
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn teardown_tun() -> Result<()> {
     imp::teardown_tun()
 }

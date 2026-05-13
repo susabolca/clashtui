@@ -70,6 +70,11 @@ impl MihomoClient {
         self.send(self.client.get(self.url("/connections"))).await
     }
 
+    pub async fn traffic(&self) -> Result<Value> {
+        self.send_stream_sample(self.client.get(self.url("/traffic")))
+            .await
+    }
+
     pub async fn select_proxy(&self, group: &str, proxy: &str) -> Result<()> {
         let body = json!({ "name": proxy });
         let _: Value = self
@@ -135,6 +140,81 @@ impl MihomoClient {
         }
         serde_json::from_str(&text).context("failed to decode mihomo response")
     }
+
+    async fn send_stream_sample<T>(&self, request: RequestBuilder) -> Result<T>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        let request = if let Some(secret) = &self.secret {
+            request.bearer_auth(secret)
+        } else {
+            request
+        };
+        let mut response = timeout(MIHOMO_REQUEST_TIMEOUT, request.send())
+            .await
+            .context("mihomo request timed out")?
+            .context("mihomo request failed")?;
+        let status = response.status();
+        if !status.is_success() {
+            let text = timeout(MIHOMO_REQUEST_TIMEOUT, response.text())
+                .await
+                .context("mihomo response body timed out")?
+                .unwrap_or_default();
+            anyhow::bail!("mihomo returned {status}: {text}");
+        }
+
+        let mut buffer = Vec::new();
+        loop {
+            let chunk = timeout(MIHOMO_REQUEST_TIMEOUT, response.chunk())
+                .await
+                .context("mihomo stream sample timed out")?
+                .context("mihomo stream sample failed")?
+                .context("mihomo stream ended before a sample")?;
+            buffer.extend_from_slice(&chunk);
+
+            if let Some(sample) = first_complete_stream_line(&buffer) {
+                return serde_json::from_slice(sample)
+                    .context("failed to decode mihomo stream sample");
+            }
+
+            let sample = trim_ascii_bytes(&buffer);
+            if !sample.is_empty()
+                && let Ok(value) = serde_json::from_slice(sample)
+            {
+                return Ok(value);
+            }
+
+            if buffer.len() > 64 * 1024 {
+                anyhow::bail!("mihomo stream sample exceeded 64KiB before JSON");
+            }
+        }
+    }
+}
+
+fn first_complete_stream_line(buffer: &[u8]) -> Option<&[u8]> {
+    let mut start = 0;
+    for (index, byte) in buffer.iter().enumerate() {
+        if *byte == b'\n' {
+            let line = trim_ascii_bytes(&buffer[start..index]);
+            if !line.is_empty() {
+                return Some(line);
+            }
+            start = index + 1;
+        }
+    }
+    None
+}
+
+fn trim_ascii_bytes(value: &[u8]) -> &[u8] {
+    let start = value
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(value.len());
+    let end = value
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map_or(start, |index| index + 1);
+    &value[start..end]
 }
 
 fn proxy_groups_from_value(value: &Value) -> Result<Vec<ProxyGroup>> {
@@ -262,5 +342,15 @@ mod tests {
     fn parses_proxy_delay_response() -> Result<()> {
         assert_eq!(delay_from_value(&json!({ "delay": 123 }))?, 123);
         Ok(())
+    }
+
+    #[test]
+    fn reads_first_json_line_from_stream_buffer() {
+        let buffer = b"\n {\"up\":1024,\"down\":2048}\n{\"up\":1,\"down\":2}\n";
+
+        assert_eq!(
+            first_complete_stream_line(buffer),
+            Some(br#"{"up":1024,"down":2048}"#.as_slice())
+        );
     }
 }

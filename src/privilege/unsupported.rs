@@ -6,7 +6,7 @@ use anyhow::{Context as _, Result};
 pub struct TunPermissionStatus {
     pub target: PathBuf,
     pub capabilities: String,
-    pub has_tun_capabilities: bool,
+    pub legacy_file_capabilities_detected: bool,
     pub polkit_rule_path: &'static str,
     pub polkit_rule_exists: bool,
     pub polkit_rule_matches_user: bool,
@@ -25,7 +25,7 @@ pub fn current_tun_permission_status() -> Result<TunPermissionStatus> {
     Ok(TunPermissionStatus {
         target,
         capabilities: "not applicable".into(),
-        has_tun_capabilities: true,
+        legacy_file_capabilities_detected: false,
         polkit_rule_path: "not applicable",
         polkit_rule_exists: true,
         polkit_rule_matches_user: true,

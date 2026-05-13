@@ -45,24 +45,7 @@ pub async fn write_service_config(
         .await
         .with_context(|| format!("failed to create {}", instance.work_dir.display()))?;
 
-    let mut runtime_config = config.clone();
-    runtime_config
-        .controller
-        .url
-        .clone_from(&instance.controller_url);
-    runtime_config.active_profile = service
-        .subscription
-        .clone()
-        .or_else(|| config.active_profile.clone());
-    runtime_config.runtime_mode.clone_from(&service.mode);
-    runtime_config.system_proxy.enabled = false;
-    runtime_config.tun.enable = false;
-    runtime_config.runtime_interface_name = None;
-    runtime_config.dns.enable = false;
-    runtime_config.mixed_port = 0;
-    runtime_config.proxy_ports.http = None;
-    runtime_config.proxy_ports.socks = None;
-    runtime_config.proxy_ports.services.clear();
+    let runtime_config = service_runtime_config(config, &instance.controller_url, service);
 
     let mut value = match runtime_config.active_profile.as_deref() {
         Some(profile_name) => {
@@ -90,6 +73,28 @@ pub async fn write_service_config(
         .await
         .with_context(|| format!("failed to write {}", instance.config_file.display()))?;
     Ok(instance.config_file.clone())
+}
+
+fn service_runtime_config(
+    config: &AppConfig,
+    controller_url: &str,
+    service: &PortProxyService,
+) -> AppConfig {
+    let mut runtime_config = config.clone();
+    runtime_config.controller.url = controller_url.to_string();
+    runtime_config.active_profile = service
+        .subscription
+        .clone()
+        .or_else(|| config.active_profile.clone());
+    runtime_config.runtime_mode.clone_from(&service.mode);
+    runtime_config.system_proxy.enabled = false;
+    runtime_config.tun.enable = false;
+    runtime_config.dns.enable = false;
+    runtime_config.mixed_port = 0;
+    runtime_config.proxy_ports.http = None;
+    runtime_config.proxy_ports.socks = None;
+    runtime_config.proxy_ports.services.clear();
+    runtime_config
 }
 
 pub async fn write_current_config(paths: &Paths, config: &AppConfig) -> Result<std::path::PathBuf> {
@@ -388,6 +393,33 @@ rules: []
         assert_eq!(listener.get("port").and_then(Value::as_i64), Some(7071));
         assert!(listener.get("proxy").is_none());
         Ok(())
+    }
+
+    #[test]
+    fn service_runtime_keeps_interface_name_for_global_tun_bypass() {
+        let config = AppConfig {
+            runtime_interface_name: Some("en0".into()),
+            tun: crate::config::TunConfig {
+                enable: true,
+                ..crate::config::TunConfig::default()
+            },
+            ..AppConfig::default()
+        };
+        let service = PortProxyService {
+            name: "port-1".into(),
+            mode: "global".into(),
+            ..PortProxyService::default()
+        };
+
+        let runtime_config = service_runtime_config(&config, "http://127.0.0.1:20090", &service);
+
+        assert_eq!(
+            runtime_config.runtime_interface_name.as_deref(),
+            Some("en0")
+        );
+        assert!(!runtime_config.tun.enable);
+        assert!(!runtime_config.system_proxy.enabled);
+        assert!(!runtime_config.dns.enable);
     }
 
     #[test]
