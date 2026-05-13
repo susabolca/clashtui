@@ -2,7 +2,7 @@ use anyhow::{Context as _, Result};
 use serde_yaml_ng::{Mapping, Value};
 use tokio::fs;
 
-use crate::config::{AppConfig, Paths, PortProxyService, Subscription};
+use crate::config::{AppConfig, Paths, PortProxyService, RuntimePaths, Subscription};
 use crate::{dns, subscription, tun};
 
 pub async fn write_bootstrap_config(paths: &Paths, config: &AppConfig) -> Result<()> {
@@ -35,6 +35,62 @@ pub async fn write_active_config(
     Ok(paths.active_config_file.clone())
 }
 
+pub async fn write_service_config(
+    paths: &Paths,
+    instance: &RuntimePaths,
+    config: &AppConfig,
+    service: &PortProxyService,
+) -> Result<std::path::PathBuf> {
+    fs::create_dir_all(&instance.work_dir)
+        .await
+        .with_context(|| format!("failed to create {}", instance.work_dir.display()))?;
+
+    let mut runtime_config = config.clone();
+    runtime_config
+        .controller
+        .url
+        .clone_from(&instance.controller_url);
+    runtime_config.active_profile = service
+        .subscription
+        .clone()
+        .or_else(|| config.active_profile.clone());
+    runtime_config.runtime_mode.clone_from(&service.mode);
+    runtime_config.system_proxy.enabled = false;
+    runtime_config.tun.enable = false;
+    runtime_config.dns.enable = false;
+    runtime_config.mixed_port = 0;
+    runtime_config.proxy_ports.http = None;
+    runtime_config.proxy_ports.socks = None;
+    runtime_config.proxy_ports.services.clear();
+
+    let mut value = match runtime_config.active_profile.as_deref() {
+        Some(profile_name) => {
+            let sub = runtime_config
+                .subscriptions
+                .iter()
+                .find(|sub| sub.name == profile_name)
+                .with_context(|| format!("service profile not found: {profile_name}"))?;
+            read_subscription_profile(paths, sub).await?
+        }
+        None => Value::Mapping(empty_profile()),
+    };
+
+    apply_overrides(&mut value, &runtime_config)?;
+    let mapping = value
+        .as_mapping_mut()
+        .context("mihomo profile root must be a YAML mapping")?;
+    insert_service_listener(mapping, service)?;
+
+    let content = serde_yaml_ng::to_string(&value)?;
+    fs::write(&instance.active_config_file, &content)
+        .await
+        .with_context(|| format!("failed to write {}", instance.active_config_file.display()))?;
+    fs::write(&instance.config_file, content)
+        .await
+        .with_context(|| format!("failed to write {}", instance.config_file.display()))?;
+    Ok(instance.config_file.clone())
+}
+
 pub async fn write_current_config(paths: &Paths, config: &AppConfig) -> Result<std::path::PathBuf> {
     let Some(active_profile) = config.active_profile.as_deref() else {
         write_bootstrap_config(paths, config).await?;
@@ -47,6 +103,15 @@ pub async fn write_current_config(paths: &Paths, config: &AppConfig) -> Result<s
         .find(|sub| sub.name == active_profile)
         .with_context(|| format!("active profile not found: {active_profile}"))?;
     write_active_config(paths, config, sub).await
+}
+
+async fn read_subscription_profile(paths: &Paths, sub: &Subscription) -> Result<Value> {
+    let profile = subscription::profile_path(paths, sub);
+    let content = fs::read_to_string(&profile)
+        .await
+        .with_context(|| format!("failed to read {}", profile.display()))?;
+    serde_yaml_ng::from_str(&content)
+        .with_context(|| format!("failed to parse {}", profile.display()))
 }
 
 fn empty_profile() -> Mapping {
@@ -63,14 +128,15 @@ fn apply_overrides(value: &mut Value, config: &AppConfig) -> Result<()> {
         .context("mihomo profile root must be a YAML mapping")?;
 
     remove_unmanaged_inbounds(mapping);
-    mapping.insert("mixed-port".into(), config.mixed_port.into());
+    if config.mixed_port != 0 {
+        mapping.insert("mixed-port".into(), config.mixed_port.into());
+    }
     if let Some(port) = config.proxy_ports.http {
         mapping.insert("port".into(), port.into());
     }
     if let Some(port) = config.proxy_ports.socks {
         mapping.insert("socks-port".into(), port.into());
     }
-    insert_port_proxy_listeners(mapping, config)?;
     mapping.insert(
         "external-controller".into(),
         controller_addr(&config.controller.url).into(),
@@ -98,22 +164,9 @@ fn apply_overrides(value: &mut Value, config: &AppConfig) -> Result<()> {
     Ok(())
 }
 
-fn insert_port_proxy_listeners(mapping: &mut Mapping, config: &AppConfig) -> Result<()> {
-    let mut listeners = Vec::new();
-    for service in &config.proxy_ports.services {
-        if let Some(listener) = listener_from_service(service)? {
-            listeners.push(listener);
-        }
-    }
-    if !listeners.is_empty() {
-        mapping.insert("listeners".into(), listeners.into());
-    }
-    Ok(())
-}
-
-fn listener_from_service(service: &PortProxyService) -> Result<Option<Value>> {
+fn insert_service_listener(mapping: &mut Mapping, service: &PortProxyService) -> Result<()> {
     if !service.enabled {
-        return Ok(None);
+        return Ok(());
     }
     if service.port == 0 {
         anyhow::bail!("port proxy service has invalid port: {}", service.name);
@@ -147,24 +200,9 @@ fn listener_from_service(service: &PortProxyService) -> Result<Option<Value>> {
     if kind != "http" {
         listener.insert("udp".into(), service.udp.into());
     }
-    if let Some(proxy) = service
-        .proxy
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        listener.insert("proxy".into(), proxy.into());
-    }
-    if let Some(rule) = service
-        .rule
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        listener.insert("rule".into(), rule.into());
-    }
 
-    Ok(Some(Value::Mapping(listener)))
+    mapping.insert("listeners".into(), vec![Value::Mapping(listener)].into());
+    Ok(())
 }
 
 fn remove_unmanaged_inbounds(mapping: &mut Mapping) {
@@ -244,8 +282,11 @@ listeners:
             kind: "mixed".into(),
             listen: "127.0.0.1".into(),
             port: 18082,
+            subscription: None,
+            mode: "global".into(),
             proxy: Some("GLOBAL".into()),
             rule: None,
+            rule_selections: Default::default(),
             udp: true,
             enabled: true,
         });
@@ -273,24 +314,7 @@ listeners:
             mapping.get("allow-lan").and_then(Value::as_bool),
             Some(true)
         );
-        let listeners = mapping
-            .get("listeners")
-            .and_then(Value::as_sequence)
-            .context("listeners missing")?;
-        assert_eq!(listeners.len(), 1);
-        let listener = listeners[0]
-            .as_mapping()
-            .context("listener is not a mapping")?;
-        assert_eq!(
-            listener.get("name").and_then(Value::as_str),
-            Some("hk-mixed")
-        );
-        assert_eq!(listener.get("type").and_then(Value::as_str), Some("mixed"));
-        assert_eq!(listener.get("port").and_then(Value::as_i64), Some(18082));
-        assert_eq!(
-            listener.get("proxy").and_then(Value::as_str),
-            Some("GLOBAL")
-        );
+        assert!(mapping.get("listeners").is_none());
         assert!(mapping.get("proxies").is_some());
         assert!(mapping.get("secret").is_none());
         assert_eq!(
@@ -309,6 +333,52 @@ listeners:
                 .and_then(Value::as_bool),
             Some(true)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn service_listener_does_not_pin_proxy_inside_dedicated_runtime() -> Result<()> {
+        let mut profile: Value = serde_yaml_ng::from_str(
+            r"
+proxies:
+  - name: existing
+    type: http
+    server: 127.0.0.1
+    port: 8080
+proxy-groups: []
+rules: []
+",
+        )?;
+        let service = PortProxyService {
+            name: "port-1".into(),
+            kind: "mixed".into(),
+            listen: "127.0.0.1".into(),
+            port: 7071,
+            subscription: None,
+            mode: "global".into(),
+            proxy: Some("missing".into()),
+            rule: None,
+            rule_selections: Default::default(),
+            udp: true,
+            enabled: true,
+        };
+
+        let mapping = profile
+            .as_mapping_mut()
+            .context("profile root is not a mapping")?;
+        insert_service_listener(mapping, &service)?;
+        let listener = profile
+            .as_mapping()
+            .and_then(|mapping| mapping.get("listeners"))
+            .and_then(Value::as_sequence)
+            .and_then(|listeners| listeners.first())
+            .and_then(Value::as_mapping)
+            .context("listener missing")?;
+
+        assert_eq!(listener.get("name").and_then(Value::as_str), Some("port-1"));
+        assert_eq!(listener.get("type").and_then(Value::as_str), Some("mixed"));
+        assert_eq!(listener.get("port").and_then(Value::as_i64), Some(7071));
+        assert!(listener.get("proxy").is_none());
         Ok(())
     }
 }

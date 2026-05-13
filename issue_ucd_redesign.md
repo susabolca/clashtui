@@ -523,7 +523,7 @@ A proxy config exposes or captures traffic:
 
 Each proxy config can bind to a traffic profile. System Proxy/TUN still belongs only to the default System Proxy; user-created Port Proxies only expose local/LAN listeners.
 
-This is a future model. The current implementation has one `active_profile`, one global `runtime_mode`, and one global `proxy_selections` map. Supporting per-proxy subscription/mode requires a config model change.
+The current runtime implementation has started moving to this model: Global Proxy and each enabled Port Proxy run separate mihomo processes, so Port Proxies can use their own subscription, mode, and selected proxy without being forced through the Global Proxy profile. The remaining design gap is the higher-level traffic profile/spec layer for Chat and advanced reuse.
 
 ## Subscription TUI Design
 
@@ -666,13 +666,23 @@ CLASHTUI_CONFIG_DIR
   mihomo.pid
   clashtui.log
   mihomo.log
+  runtimes/
+    port-proxy-N/
+      mihomo-run.yaml
+      mihomo-active.yaml
+      mihomo.pid
+      mihomo.log
 ```
+
+The top-level mihomo files belong to Global Proxy. Each Port Proxy has an isolated runtime directory. Child mihomo stdout/stderr is collected in that runtime's `mihomo.log` and should never be written to the TUI screen.
 
 This should become a first-class concept in UI and service installation. Service files should pin `CLASHTUI_CONFIG_DIR` explicitly so Linux system services and macOS LaunchDaemons do not accidentally use root's config.
 
 ## Capability Model
 
 There are two privileged capabilities:
+
+- macOS TUN requires the Global Proxy mihomo runtime to run through a privileged service/helper. User-mode start can still provide Port Proxy and system proxy behavior, but it cannot create `utun` or install transparent routes.
 
 1. Service registration
    - Used for login/startup auto-run.

@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 use tokio::fs;
 
 pub const DEFAULT_MIXED_PORT: u16 = 7070;
+pub const DEFAULT_CONTROLLER_URL: &str = "http://127.0.0.1:19090";
 const LEGACY_DEFAULT_MIXED_PORT: u16 = 7897;
+const LEGACY_DEFAULT_CONTROLLER_URLS: [&str; 1] = ["http://127.0.0.1:9097"];
 const DEFAULT_DNS_LISTEN: &str = "127.0.0.1:10553";
 const LEGACY_DEFAULT_DNS_LISTENS: [&str; 2] = [":53", "127.0.0.1:1053"];
 
@@ -20,6 +22,18 @@ pub struct Paths {
     pub log_file: PathBuf,
     pub core_log_file: PathBuf,
     pub profiles_dir: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimePaths {
+    pub id: String,
+    pub label: String,
+    pub work_dir: PathBuf,
+    pub pid_file: PathBuf,
+    pub config_file: PathBuf,
+    pub active_config_file: PathBuf,
+    pub log_file: PathBuf,
+    pub controller_url: String,
 }
 
 impl Paths {
@@ -50,6 +64,39 @@ impl Paths {
         fs::create_dir_all(&self.config_dir).await?;
         fs::create_dir_all(&self.profiles_dir).await?;
         Ok(())
+    }
+
+    pub fn global_runtime(&self, controller_url: impl Into<String>) -> RuntimePaths {
+        RuntimePaths {
+            id: "global".into(),
+            label: "Global Proxy".into(),
+            work_dir: self.config_dir.clone(),
+            pid_file: self.core_pid_file.clone(),
+            config_file: self.core_config_file.clone(),
+            active_config_file: self.active_config_file.clone(),
+            log_file: self.core_log_file.clone(),
+            controller_url: controller_url.into(),
+        }
+    }
+
+    pub fn port_proxy_runtime(
+        &self,
+        index: usize,
+        name: impl Into<String>,
+        controller_url: impl Into<String>,
+    ) -> RuntimePaths {
+        let id = format!("port-proxy-{}", index + 1);
+        let work_dir = self.config_dir.join("runtimes").join(&id);
+        RuntimePaths {
+            id,
+            label: name.into(),
+            pid_file: work_dir.join("mihomo.pid"),
+            config_file: work_dir.join("mihomo-run.yaml"),
+            active_config_file: work_dir.join("mihomo-active.yaml"),
+            log_file: work_dir.join("mihomo.log"),
+            work_dir,
+            controller_url: controller_url.into(),
+        }
     }
 }
 
@@ -101,6 +148,7 @@ pub struct AppConfig {
     pub system_proxy: SystemProxyConfig,
     pub tun: TunConfig,
     pub dns: DnsConfig,
+    pub port_allocation: PortAllocationConfig,
     pub runtime_mode: String,
     pub proxy_selections: BTreeMap<String, String>,
     pub subscriptions: Vec<Subscription>,
@@ -118,6 +166,7 @@ impl Default for AppConfig {
             system_proxy: SystemProxyConfig::default(),
             tun: TunConfig::default(),
             dns: DnsConfig::default(),
+            port_allocation: PortAllocationConfig::default(),
             runtime_mode: "rule".into(),
             proxy_selections: BTreeMap::new(),
             subscriptions: Vec::new(),
@@ -140,7 +189,9 @@ impl AppConfig {
             .with_context(|| format!("failed to read {}", paths.config_file.display()))?;
         let mut config: Self = serde_yaml_ng::from_str(&content)
             .with_context(|| format!("failed to parse {}", paths.config_file.display()))?;
-        if config.migrate_legacy_defaults() {
+        let allocation_changed = config.normalize_port_allocation_defaults();
+        let legacy_changed = config.migrate_legacy_defaults();
+        if allocation_changed || legacy_changed {
             config.save(paths).await?;
         }
         Ok(config)
@@ -201,6 +252,13 @@ impl AppConfig {
     }
 
     fn migrate_legacy_defaults(&mut self) -> bool {
+        let controller_changed =
+            if LEGACY_DEFAULT_CONTROLLER_URLS.contains(&self.controller.url.as_str()) {
+                self.controller.url = DEFAULT_CONTROLLER_URL.into();
+                true
+            } else {
+                false
+            };
         let mixed_port_changed = if self.mixed_port == LEGACY_DEFAULT_MIXED_PORT {
             self.mixed_port = DEFAULT_MIXED_PORT;
             true
@@ -213,7 +271,63 @@ impl AppConfig {
         } else {
             false
         };
-        mixed_port_changed || dns_listen_changed
+        controller_changed || mixed_port_changed || dns_listen_changed
+    }
+
+    fn normalize_port_allocation_defaults(&mut self) -> bool {
+        let mut changed = false;
+
+        if self.port_allocation.auto_mixed {
+            self.port_allocation.auto_mixed = false;
+            changed = true;
+            if self.mixed_port != DEFAULT_MIXED_PORT {
+                self.mixed_port = DEFAULT_MIXED_PORT;
+            }
+        }
+
+        if self.port_allocation.seed.is_some() {
+            return changed;
+        }
+
+        let controller_changed = self.controller.url != DEFAULT_CONTROLLER_URL
+            && !LEGACY_DEFAULT_CONTROLLER_URLS.contains(&self.controller.url.as_str())
+            && self.port_allocation.auto_controller;
+        if controller_changed {
+            self.port_allocation.auto_controller = false;
+        }
+        let mixed_changed = self.mixed_port != DEFAULT_MIXED_PORT
+            && self.mixed_port != LEGACY_DEFAULT_MIXED_PORT
+            && self.port_allocation.auto_mixed;
+        if mixed_changed {
+            self.port_allocation.auto_mixed = false;
+        }
+        let dns_changed = self.dns.listen != DEFAULT_DNS_LISTEN
+            && !LEGACY_DEFAULT_DNS_LISTENS.contains(&self.dns.listen.as_str())
+            && self.port_allocation.auto_dns;
+        if dns_changed {
+            self.port_allocation.auto_dns = false;
+        }
+        changed || controller_changed || mixed_changed || dns_changed
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PortAllocationConfig {
+    pub seed: Option<u16>,
+    pub auto_controller: bool,
+    pub auto_mixed: bool,
+    pub auto_dns: bool,
+}
+
+impl Default for PortAllocationConfig {
+    fn default() -> Self {
+        Self {
+            seed: None,
+            auto_controller: true,
+            auto_mixed: false,
+            auto_dns: true,
+        }
     }
 }
 
@@ -227,7 +341,7 @@ pub struct ControllerConfig {
 impl Default for ControllerConfig {
     fn default() -> Self {
         Self {
-            url: "http://127.0.0.1:9097".into(),
+            url: DEFAULT_CONTROLLER_URL.into(),
             secret: None,
         }
     }
@@ -275,8 +389,11 @@ pub struct PortProxyService {
     pub kind: String,
     pub listen: String,
     pub port: u16,
+    pub subscription: Option<String>,
+    pub mode: String,
     pub proxy: Option<String>,
     pub rule: Option<String>,
+    pub rule_selections: BTreeMap<String, String>,
     pub udp: bool,
 }
 
@@ -288,8 +405,11 @@ impl Default for PortProxyService {
             kind: "mixed".into(),
             listen: "127.0.0.1".into(),
             port: 0,
+            subscription: None,
+            mode: "global".into(),
             proxy: None,
             rule: None,
+            rule_selections: BTreeMap::new(),
             udp: true,
         }
     }
@@ -404,6 +524,9 @@ pub struct Subscription {
     pub url: String,
     pub refresh: SubscriptionRefresh,
     pub updated_at: Option<String>,
+    pub last_error: Option<String>,
+    pub user_info: SubscriptionUserInfo,
+    pub rule_selections: BTreeMap<String, String>,
 }
 
 impl Default for Subscription {
@@ -413,7 +536,37 @@ impl Default for Subscription {
             url: String::new(),
             refresh: SubscriptionRefresh::default(),
             updated_at: None,
+            last_error: None,
+            user_info: SubscriptionUserInfo::default(),
+            rule_selections: BTreeMap::new(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SubscriptionUserInfo {
+    pub upload: Option<u64>,
+    pub download: Option<u64>,
+    pub total: Option<u64>,
+    pub expire: Option<u64>,
+}
+
+impl SubscriptionUserInfo {
+    pub fn used(&self) -> Option<u64> {
+        match (self.upload, self.download) {
+            (Some(upload), Some(download)) => Some(upload.saturating_add(download)),
+            (Some(upload), None) => Some(upload),
+            (None, Some(download)) => Some(download),
+            (None, None) => None,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.upload.is_none()
+            && self.download.is_none()
+            && self.total.is_none()
+            && self.expire.is_none()
     }
 }
 
@@ -435,5 +588,27 @@ fn default_bypass() -> String {
         "localhost;127.*;192.168.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;<local>".into()
     } else {
         "localhost,127.0.0.1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,::1".into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migrates_legacy_clash_verge_controller_port() {
+        let mut config = AppConfig::default();
+        config.controller.url = "http://127.0.0.1:9097".into();
+        config.mixed_port = LEGACY_DEFAULT_MIXED_PORT;
+        config.dns.listen = ":53".into();
+
+        assert!(!config.normalize_port_allocation_defaults());
+        assert!(config.migrate_legacy_defaults());
+        assert_eq!(config.controller.url, DEFAULT_CONTROLLER_URL);
+        assert_eq!(config.mixed_port, DEFAULT_MIXED_PORT);
+        assert_eq!(config.dns.listen, DEFAULT_DNS_LISTEN);
+        assert!(config.port_allocation.auto_controller);
+        assert!(!config.port_allocation.auto_mixed);
+        assert!(config.port_allocation.auto_dns);
     }
 }

@@ -99,7 +99,7 @@ Navigation:
 - A section is a top-level root. A page is the reusable UI unit.
 - Left/Right and Tab switch sections only when the current page is the current section root and the location stack is empty.
 - Enter on any submenu row pushes current `Location` and enters that page.
-- Submenu page entry must not be treated as a section switch. For example, `Main > System Proxy` keeps `Main` as the active section while showing the `System Proxy` page.
+- Submenu page entry must not be treated as a section switch. For example, `Main > Global Proxy` keeps `Main` as the active section while showing the `Global Proxy` page.
 - Multiple sections may reuse the same page.
 - Esc closes the active popup first.
 - If no popup is open, Esc pops one `Location`.
@@ -177,15 +177,19 @@ Main page:
 - Runtime status summary.
 - Proxy list as primary objects.
 - Enter opens selected proxy settings.
+- The proxy list always includes `Add Port Proxy` as a visible action row.
+- Each proxy row uses three lines: listener identity, selected mode/subscription/config state, and refreshed traffic/IP information.
+- The right pane shows selected proxy configuration, not runtime status.
+- `O` is a quick on/off shortcut for the selected proxy entry.
 
-System Proxy page:
+Global Proxy page:
 
 - Enabled
 - Subscription
 - Mode
 - Proxy Server
 - Mixed Port
-- OS System Proxy
+- Sys Proxy
 - PAC
 - TUN
 - DNS submenu
@@ -202,7 +206,10 @@ Port Proxy page:
 
 Subscription page:
 
-- Subscription list.
+- Subscription list is a maintenance surface, not a proxy selection surface.
+- Rows show subscription-owned state: used traffic, total traffic, expiry, last update, and last error.
+- Do not show `used by` in the list; proxy usage belongs to proxy configuration.
+- Enter on a subscription opens its detail page.
 - Add Subscription opens a child screen with:
   - Name
   - URL
@@ -210,6 +217,26 @@ Subscription page:
   - OK
 - The child screen uses input popups for name/URL and a choice popup for refresh.
 - Per-subscription actions should be visible rows or choice popups, not hidden shortcuts.
+
+Subscription detail page:
+
+- Overview: URL, profile path, refresh cadence, traffic usage, expiry, update status.
+- Rule Groups: subscription-level selections used when a proxy runs in `rule` mode.
+- Proxies: nodes from the active/runtime subscription view with delay/availability results.
+- Rules: read-only rule/rule-provider overview from the subscription profile.
+- Update Now: refreshes the subscription and preserves last good local data on failure.
+- Edit: changes name, URL, and refresh cadence.
+- Delete: confirms deletion and handles existing proxy references explicitly.
+
+Routing ownership:
+
+- The subscription owns the raw profile, rules, proxy groups, rule providers, traffic metadata, and rule-mode group selections.
+- A proxy owns which subscription it uses, its mode, listener settings, and global/direct routing choices.
+- `rule` mode uses the subscription-level rule group selections.
+- `global` mode uses a proxy-level selected node from the chosen subscription.
+- `direct` mode bypasses proxy selection.
+- Port proxies default to `global`; Global Proxy defaults to `rule`.
+- This avoids forcing users to reconfigure rule groups for every proxy when a subscription changes.
 
 Runtime page:
 
@@ -244,3 +271,47 @@ Run it with:
 ```sh
 cargo run --example settings_menu
 ```
+
+Current subscription implementation:
+
+- `Subscription` stores `last_error`, `user_info`, and `rule_selections`.
+- Subscription refresh parses the `subscription-userinfo` header and preserves the last good profile file on download failure.
+- The Subscription screen is now a maintenance list; Enter opens a subscription detail page instead of activating the subscription.
+- The detail page exposes Overview, Rule Groups, Proxies, Rules, Update Now, Edit, and Delete rows.
+- Delete uses a confirmation dialog and clears/reassigns `active_profile` when deleting the active subscription.
+- The subscription Proxies page reads nodes from the local subscription YAML so users can inspect nodes without starting mihomo.
+- Proxy node delay testing is wired through mihomo `/proxies/{name}/delay` and requires the selected subscription to be loaded in the owned runtime.
+- Subscription Proxies use `Check` wording and include `Check All`; delay results are displayed inline after testing.
+- `Check All` runs in a background task and shows a modal progress popup so large subscriptions do not freeze the TUI event loop. `Esc` cancels the running batch; completed results remain visible in the proxy list.
+- Proxy group selection is saved to the active subscription when runtime mode is `rule`; otherwise it uses the legacy global `proxy_selections`.
+- Daemon apply overlays active subscription `rule_selections` on top of legacy global selections in `rule` mode.
+- Long settings/proxy lists keep the selected row visible by scrolling the rendered window.
+
+Current Main implementation:
+
+- Main now renders Global Proxy, existing optional HTTP/SOCKS port listeners, configured port proxy services, and an `Add Port Proxy` action.
+- `Add Port Proxy` creates an enabled mixed listener with the next fixed port starting at `7071` and immediately opens its proxy settings page.
+- Main proxy rows use `Global`/`Port` wording and show local proxy ports directly rather than controller ports.
+- Proxy rows use three concise lines: `ON/OFF LISTENER=host:port`, important mode/subscription/system settings, then `↑/↓` speed plus IP/country/city.
+- Global Proxy keeps the default `127.0.0.1:7070`; using `0.0.0.0:7070` makes it LAN-accessible.
+- Port Proxy settings now own independent `mode`, `subscription`, `proxy`, and `rule_selections` instead of sharing Global Proxy state.
+- In `global` mode, Proxy Server selects a concrete proxy node; in `rule` mode, it opens group selection.
+- The Main row detail no longer shows workdir, PAC, TUN, or DNS state; those remain explicit settings on the relevant child pages.
+- Action rows such as `Add Port Proxy` are single-line, colored actions without a submenu `>` marker; their help text lives in the right detail pane.
+- Traffic and IP information are refreshed by the existing TUI runtime refresh loop.
+- `O` toggles Global Proxy system proxy state or the selected port proxy service. Legacy HTTP/SOCKS rows can be turned off; new listeners should use port proxy services.
+
+Runtime startup policy:
+
+- Opening Config/TUI should not start mihomo just to display subscription data.
+- `start` starts the Global Proxy mihomo runtime plus one mihomo runtime for each enabled Port Proxy.
+- Global Proxy owns system proxy, TUN, and DNS behavior.
+- Each Port Proxy owns its listener, subscription, mode, selected proxy/rule choices, workdir, controller, pid file, and log file.
+- Port Proxy mihomo stdout/stderr is redirected to its own runtime log and must not pollute the TUI.
+- Config browsing should not imply runtime side effects.
+
+Known follow-up:
+
+- Edit subscription should reuse the Add Subscription form instead of the current placeholder.
+- Rule Groups should get a first-class group/node editor rather than relying on the Proxy Groups page.
+- Subscription delay checks should avoid temporarily loading the selected subscription into the Global Proxy runtime; a dedicated check runtime would match the multi-mihomo model better.

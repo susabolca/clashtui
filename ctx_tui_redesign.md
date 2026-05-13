@@ -11,7 +11,7 @@
 
 ## Product Direction
 
-ClashTUI is mainly a single-process controller/setup tool for mihomo. It still needs a workdir because both clashtui and mihomo require runtime/config files.
+ClashTUI is mainly a single-binary controller/setup tool for mihomo. It still needs a workdir because clashtui and each mihomo runtime require config files, logs, pid files, profile snapshots, and mihomo `-d` state.
 
 User mental model:
 
@@ -27,7 +27,9 @@ Proxy model:
 - `System Proxy` can configure OS proxy, PAC, TUN, mixed port, subscription, mode, and proxy selection.
 - TUN belongs only to `System Proxy`.
 - `start` should bring up all configured proxies, not only the system proxy.
-- mihomo can expose mixed HTTP/SOCKS listeners; system proxy defaults around port `7070`.
+- `System Proxy` maps to the Global Proxy mihomo runtime and defaults to mixed port `7070`.
+- Each user-created Port Proxy maps to its own mihomo process, own workdir, own controller, own pid file, own log file, and one local/LAN listener.
+- Only the Global Proxy mihomo owns TUN/DNS/system proxy. Port Proxy runtimes must not own TUN.
 
 Subscription model:
 
@@ -80,7 +82,11 @@ Important production implementation pieces in `src/config_menu.rs`:
 Runtime/data support added or used:
 
 - `src/config.rs` has `SubscriptionRefresh { Disabled, Daily, Weekly }`, defaulting to `Weekly`.
+- `src/config.rs` has `RuntimePaths` plus per-Port-Proxy runtime directories under `runtimes/port-proxy-N/`.
 - `src/mihomo.rs` has `connections()` support for runtime traffic summaries.
+- `src/core.rs` starts/stops the Global Proxy mihomo and each enabled Port Proxy mihomo separately; child stdout/stderr goes to each runtime `mihomo.log`.
+- `src/daemon.rs` applies Global Proxy and Port Proxy runtimes independently, so stale Global Proxy selections or TUN warnings do not block Port Proxy listeners.
+- macOS user-mode start cannot create `utun`; `status` now reports missing TUN privileges and uses `ifconfig`/`route`/`netstat` instead of Linux `ip` commands.
 - IP info is fetched from `https://ipinfo.io/json` periodically for display.
 
 Current production TUI has old helper functions still present behind `#![allow(dead_code)]` in `src/config_menu.rs`; they are residual from the previous UI and can be removed in a later cleanup.

@@ -8,7 +8,9 @@ use anyhow::{Context as _, Result};
 use tokio::fs;
 use tokio::time::sleep;
 
-use crate::config::{AppConfig, Paths};
+use crate::config::{AppConfig, Paths, PortProxyService, RuntimePaths};
+use crate::mihomo::MihomoClient;
+use crate::port_allocator;
 use crate::runtime_profile;
 
 const CORE_NAMES: [&str; 4] = ["mihomo", "verge-mihomo", "verge-mihomo-alpha", "clash-meta"];
@@ -24,13 +26,14 @@ const START_WAIT: Duration = Duration::from_millis(250);
 const START_RETRIES: usize = 20;
 
 pub async fn ensure_running(paths: &Paths, config: &AppConfig) -> Result<()> {
-    if let Some(pid) = read_pid(&paths.core_pid_file).await?
+    let instance = global_instance(paths, config);
+    if let Some(pid) = read_pid(&instance.pid_file).await?
         && is_process_running(pid)
     {
         return Ok(());
     }
 
-    remove_pid(&paths.core_pid_file).await?;
+    remove_pid(&instance.pid_file).await?;
     let Some(core_path) = resolve_core_path(config) else {
         anyhow::bail!(
             "mihomo core is not running and no core binary was found; set core_path in {} or MIHOMO_CORE",
@@ -38,26 +41,144 @@ pub async fn ensure_running(paths: &Paths, config: &AppConfig) -> Result<()> {
         );
     };
 
-    ensure_geodata(paths).await?;
+    ensure_geodata(&instance.work_dir).await?;
+    port_allocator::validate_required_ports_available(config)?;
     let mut bootstrap_config = config.clone();
     if bootstrap_config.active_profile.is_some() {
         bootstrap_config.tun.enable = false;
         bootstrap_config.dns.enable = false;
     }
-    runtime_profile::write_bootstrap_config(paths, &bootstrap_config).await?;
-    start_core(paths, &core_path).await
+    if bootstrap_config.active_profile.is_some() {
+        let active = runtime_profile::write_current_config(paths, &bootstrap_config).await?;
+        fs::copy(&active, &instance.config_file)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to copy {} to {}",
+                    active.display(),
+                    instance.config_file.display()
+                )
+            })?;
+    } else {
+        runtime_profile::write_bootstrap_config(paths, &bootstrap_config).await?;
+    }
+    start_instance(&instance, &core_path).await
+}
+
+pub async fn ensure_service_running(
+    paths: &Paths,
+    config: &AppConfig,
+    index: usize,
+    service: &PortProxyService,
+) -> Result<RuntimePaths> {
+    let instance = service_instance(paths, config, index, service);
+    if let Some(pid) = read_pid(&instance.pid_file).await?
+        && is_process_running(pid)
+    {
+        return Ok(instance);
+    }
+
+    remove_pid(&instance.pid_file).await?;
+    let Some(core_path) = resolve_core_path(config) else {
+        anyhow::bail!(
+            "{} mihomo core is not running and no core binary was found; set core_path in {} or MIHOMO_CORE",
+            instance.label,
+            paths.config_file.display()
+        );
+    };
+
+    ensure_geodata(&instance.work_dir).await?;
+    runtime_profile::write_service_config(paths, &instance, config, service).await?;
+    start_instance(&instance, &core_path).await?;
+    Ok(instance)
+}
+
+pub async fn owned_core_running(paths: &Paths) -> Result<bool> {
+    Ok(read_pid(&paths.core_pid_file)
+        .await?
+        .is_some_and(is_process_running))
+}
+
+pub async fn ensure_controller_is_owned(
+    paths: &Paths,
+    config: &AppConfig,
+    client: &MihomoClient,
+) -> Result<()> {
+    if owned_core_running(paths).await? {
+        return Ok(());
+    }
+
+    if client.version().await.is_ok() {
+        anyhow::bail!(
+            "mihomo controller {} is online, but clashtui has no owned mihomo pid at {}; refusing to modify an external mihomo instance",
+            config.controller.url,
+            paths.core_pid_file.display()
+        );
+    }
+
+    Ok(())
 }
 
 pub async fn stop(paths: &Paths) -> Result<()> {
-    let Some(pid) = read_pid(&paths.core_pid_file).await? else {
+    let instance = paths.global_runtime(String::new());
+    stop_instance(&instance).await
+}
+
+pub async fn stop_service(
+    paths: &Paths,
+    config: &AppConfig,
+    index: usize,
+    service: &PortProxyService,
+) -> Result<()> {
+    let instance = service_instance(paths, config, index, service);
+    stop_instance(&instance).await
+}
+
+pub async fn stop_all(paths: &Paths, config: &AppConfig) -> Result<()> {
+    stop(paths).await?;
+    for (index, service) in config.proxy_ports.services.iter().enumerate() {
+        stop_service(paths, config, index, service).await?;
+    }
+    stop_removed_services(paths, config.proxy_ports.services.len()).await
+}
+
+pub async fn stop_removed_services(paths: &Paths, current_count: usize) -> Result<()> {
+    stop_stale_service_instances(paths, current_count).await
+}
+
+pub fn global_instance(paths: &Paths, config: &AppConfig) -> RuntimePaths {
+    paths.global_runtime(config.controller.url.clone())
+}
+
+pub fn service_instance(
+    paths: &Paths,
+    config: &AppConfig,
+    index: usize,
+    service: &PortProxyService,
+) -> RuntimePaths {
+    let label = if service.name.trim().is_empty() {
+        format!("Port Proxy {}", index + 1)
+    } else {
+        service.name.clone()
+    };
+    paths.port_proxy_runtime(
+        index,
+        label,
+        port_allocator::service_controller_url(config, index),
+    )
+}
+
+async fn stop_instance(instance: &RuntimePaths) -> Result<()> {
+    let Some(pid) = read_pid(&instance.pid_file).await? else {
         return Ok(());
     };
 
     if is_process_running(pid) {
-        terminate_process(pid).with_context(|| format!("failed to stop mihomo pid {pid}"))?;
+        terminate_process(pid)
+            .with_context(|| format!("failed to stop {} mihomo pid {pid}", instance.label))?;
         wait_for_exit(pid).await;
     }
-    remove_pid(&paths.core_pid_file).await
+    remove_pid(&instance.pid_file).await
 }
 
 pub fn resolve_core_path(config: &AppConfig) -> Option<PathBuf> {
@@ -73,59 +194,71 @@ pub fn resolve_core_path(config: &AppConfig) -> Option<PathBuf> {
                 .filter(|path| path.exists())
         })
         .or_else(resolve_sibling_core)
+        .or_else(resolve_known_app_core)
         .or_else(resolve_path_core)
 }
 
-async fn start_core(paths: &Paths, core_path: &Path) -> Result<()> {
+async fn start_instance(instance: &RuntimePaths, core_path: &Path) -> Result<()> {
+    fs::create_dir_all(&instance.work_dir)
+        .await
+        .with_context(|| format!("failed to create {}", instance.work_dir.display()))?;
     let log = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&paths.core_log_file)
-        .with_context(|| format!("failed to open {}", paths.core_log_file.display()))?;
+        .open(&instance.log_file)
+        .with_context(|| format!("failed to open {}", instance.log_file.display()))?;
     let err = log
         .try_clone()
-        .with_context(|| format!("failed to clone {}", paths.core_log_file.display()))?;
+        .with_context(|| format!("failed to clone {}", instance.log_file.display()))?;
 
     let mut command = Command::new(core_path);
     command
         .args([
             "-d",
-            path_to_str(&paths.config_dir)?,
+            path_to_str(&instance.work_dir)?,
             "-f",
-            path_to_str(&paths.core_config_file)?,
+            path_to_str(&instance.config_file)?,
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(err));
     prepare_background_command(&mut command);
 
-    let child = command
-        .spawn()
-        .with_context(|| format!("failed to start mihomo core {}", core_path.display()))?;
+    let child = command.spawn().with_context(|| {
+        format!(
+            "failed to start {} mihomo core {}",
+            instance.label,
+            core_path.display()
+        )
+    })?;
     let pid = child.id();
-    fs::write(&paths.core_pid_file, pid.to_string())
+    fs::write(&instance.pid_file, pid.to_string())
         .await
-        .with_context(|| format!("failed to write {}", paths.core_pid_file.display()))?;
+        .with_context(|| format!("failed to write {}", instance.pid_file.display()))?;
 
     sleep(START_WAIT).await;
     if !is_process_running(pid) {
         anyhow::bail!(
-            "mihomo core exited during startup; check log={}",
-            paths.core_log_file.display()
+            "{} mihomo core exited during startup; check log={}",
+            instance.label,
+            instance.log_file.display()
         );
     }
     eprintln!(
-        "mihomo core started pid={} path={}",
+        "{} mihomo core started pid={} path={} controller={} log={}",
+        instance.label,
         pid,
-        core_path.display()
+        core_path.display(),
+        instance.controller_url,
+        instance.log_file.display()
     );
     Ok(())
 }
 
-async fn ensure_geodata(paths: &Paths) -> Result<()> {
-    paths.ensure().await?;
+async fn ensure_geodata(target_dir: &Path) -> Result<()> {
+    fs::create_dir_all(target_dir).await?;
     for file_name in GEODATA_FILES {
-        let target = paths.config_dir.join(file_name);
+        let target = target_dir.join(file_name);
         if is_usable_file(&target).await? {
             continue;
         }
@@ -139,6 +272,44 @@ async fn ensure_geodata(paths: &Paths) -> Result<()> {
                 target.display()
             )
         })?;
+    }
+    Ok(())
+}
+
+async fn stop_stale_service_instances(paths: &Paths, current_count: usize) -> Result<()> {
+    let runtimes_dir = paths.config_dir.join("runtimes");
+    let mut entries = match fs::read_dir(&runtimes_dir).await {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to read {}", runtimes_dir.display()));
+        }
+    };
+
+    while let Some(entry) = entries.next_entry().await? {
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        let Some(index) = file_name
+            .strip_prefix("port-proxy-")
+            .and_then(|value| value.parse::<usize>().ok())
+            .and_then(|value| value.checked_sub(1))
+        else {
+            continue;
+        };
+        if index < current_count {
+            continue;
+        }
+        let dir = entry.path();
+        let instance = RuntimePaths {
+            id: file_name.clone(),
+            label: file_name,
+            pid_file: dir.join("mihomo.pid"),
+            config_file: dir.join("mihomo-run.yaml"),
+            active_config_file: dir.join("mihomo-active.yaml"),
+            log_file: dir.join("mihomo.log"),
+            work_dir: dir,
+            controller_url: String::new(),
+        };
+        stop_instance(&instance).await?;
     }
     Ok(())
 }
@@ -213,6 +384,29 @@ fn resolve_sibling_core() -> Option<PathBuf> {
         .iter()
         .map(|name| dir.join(binary_name(name)))
         .find(|path| path.exists())
+}
+
+fn resolve_known_app_core() -> Option<PathBuf> {
+    let mut dirs = Vec::new();
+    if cfg!(target_os = "macos") {
+        dirs.extend([
+            PathBuf::from("/Applications/Clash Verge.app/Contents/MacOS"),
+            PathBuf::from("/Applications/Clash Verge Rev.app/Contents/MacOS"),
+        ]);
+        if let Some(home) = home_dir() {
+            dirs.extend([
+                home.join("Applications/Clash Verge.app/Contents/MacOS"),
+                home.join("Applications/Clash Verge Rev.app/Contents/MacOS"),
+            ]);
+        }
+    }
+
+    dirs.into_iter().find_map(|dir| {
+        CORE_NAMES
+            .iter()
+            .map(|name| dir.join(binary_name(name)))
+            .find(|path| path.exists())
+    })
 }
 
 fn resolve_path_core() -> Option<PathBuf> {

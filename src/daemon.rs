@@ -8,9 +8,11 @@ use serde_json::Value;
 use tokio::fs;
 use tokio::time::sleep;
 
-use crate::config::{AppConfig, Paths};
+use crate::config::{AppConfig, ControllerConfig, Paths, PortProxyService, RuntimePaths};
 use crate::mihomo::MihomoClient;
-use crate::{core, dns, privilege, runtime_profile, subscription, system_proxy, tun};
+use crate::{
+    core, dns, port_allocator, privilege, runtime_profile, subscription, system_proxy, tun,
+};
 
 const CONFIG_RELOAD_INTERVAL: Duration = Duration::from_secs(10);
 const STARTUP_CHECK_WAIT: Duration = Duration::from_millis(1200);
@@ -20,7 +22,7 @@ const LOG_TAIL_LINES: usize = 30;
 
 pub async fn start(
     paths: &Paths,
-    config: &AppConfig,
+    config: &mut AppConfig,
     cli_controller: Option<&str>,
     cli_secret: Option<&str>,
 ) -> Result<()> {
@@ -36,12 +38,23 @@ pub async fn start(
         let client = MihomoClient::new(&config.controller);
         print_runtime_summary(config, &client).await;
         print_log_tail("clashtui log", &paths.log_file, LOG_TAIL_LINES);
-        print_log_tail("mihomo log", &paths.core_log_file, LOG_TAIL_LINES);
+        print_mihomo_log_tails(paths, config);
         return Ok(());
     }
 
     validate_start_permissions(config)?;
     remove_stale_pid(paths).await?;
+    if port_allocator::ensure_allocated_with_controller(
+        paths,
+        config,
+        cli_controller.is_none(),
+        true,
+    )
+    .await?
+    {
+        config.save(paths).await?;
+    }
+    port_allocator::validate_required_ports_available(config)?;
 
     let exe = std::env::current_exe().context("failed to locate current executable")?;
     println!("daemon executable: {}", exe.display());
@@ -76,7 +89,7 @@ pub async fn start(
     sleep(STARTUP_CHECK_WAIT).await;
     if !is_process_running(pid) {
         print_log_tail("clashtui log", &paths.log_file, LOG_TAIL_LINES);
-        print_log_tail("mihomo log", &paths.core_log_file, LOG_TAIL_LINES);
+        print_mihomo_log_tails(paths, config);
         anyhow::bail!(
             "clashtui daemon exited during startup; check log={}",
             paths.log_file.display()
@@ -91,7 +104,7 @@ pub async fn start(
     let client = MihomoClient::new(&config.controller);
     print_runtime_summary(config, &client).await;
     print_log_tail("clashtui log", &paths.log_file, LOG_TAIL_LINES);
-    print_log_tail("mihomo log", &paths.core_log_file, LOG_TAIL_LINES);
+    print_mihomo_log_tails(paths, config);
     Ok(())
 }
 
@@ -109,8 +122,6 @@ pub async fn run(
         controller_override.as_deref(),
         secret_override.as_deref(),
     );
-    let mut client = MihomoClient::new(&config.controller);
-
     eprintln!("clashtui daemon started pid={}", std::process::id());
     eprintln!(
         "daemon config: config={} core_config={} active_config={} log={} core_log={}",
@@ -150,7 +161,7 @@ pub async fn run(
     loop {
         if needs_apply {
             eprintln!("runtime apply: begin");
-            match apply_runtime(&paths, &mut config, &client).await {
+            match apply_runtime(&paths, &mut config).await {
                 Ok(()) => {
                     last_config = serialize_config(&config)?;
                     needs_apply = false;
@@ -162,10 +173,10 @@ pub async fn run(
         }
 
         sleep(CONFIG_RELOAD_INTERVAL).await;
-        match client.version().await {
-            Ok(version) => {
+        match runtime_health(&paths, &config).await {
+            Ok(()) => {
                 if last_health_ok != Some(true) {
-                    eprintln!("runtime health: mihomo online version={version}");
+                    eprintln!("runtime health: all mihomo instances online");
                 }
                 last_health_ok = Some(true);
             }
@@ -178,6 +189,22 @@ pub async fn run(
 
         match AppConfig::load_or_init(&paths).await {
             Ok(mut next_config) => {
+                match port_allocator::ensure_allocated_with_controller(
+                    &paths,
+                    &mut next_config,
+                    controller_override.is_none(),
+                    false,
+                )
+                .await
+                {
+                    Ok(true) => {
+                        if let Err(err) = next_config.save(&paths).await {
+                            eprintln!("failed to save allocated ports: {err:#}");
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(err) => eprintln!("failed to allocate ports: {err:#}"),
+                }
                 apply_controller_overrides(
                     &mut next_config,
                     controller_override.as_deref(),
@@ -186,7 +213,6 @@ pub async fn run(
                 match serialize_config(&next_config) {
                     Ok(serialized) if serialized != last_config => {
                         eprintln!("config changed: reloading desired runtime");
-                        client = MihomoClient::new(&next_config.controller);
                         config = next_config;
                         last_config = serialized;
                         last_health_ok = None;
@@ -219,18 +245,20 @@ pub async fn stop(paths: &Paths, config: &AppConfig, client: &MihomoClient) -> R
     print_static_summary(paths, config);
     let Some(pid) = read_pid(paths).await? else {
         println!("clashtui is not running");
-        print_process_summary(paths).await?;
+        cleanup_owned_runtimes(paths, config, client).await?;
+        print_process_summary(paths, config).await?;
         print_log_tail("clashtui log", &paths.log_file, LOG_TAIL_LINES);
-        print_log_tail("mihomo log", &paths.core_log_file, LOG_TAIL_LINES);
+        print_mihomo_log_tails(paths, config);
         return Ok(());
     };
 
     if !is_process_running(pid) {
         remove_stale_pid(paths).await?;
         println!("clashtui is not running; removed stale pid={pid}");
-        print_process_summary(paths).await?;
+        cleanup_owned_runtimes(paths, config, client).await?;
+        print_process_summary(paths, config).await?;
         print_log_tail("clashtui log", &paths.log_file, LOG_TAIL_LINES);
-        print_log_tail("mihomo log", &paths.core_log_file, LOG_TAIL_LINES);
+        print_mihomo_log_tails(paths, config);
         return Ok(());
     }
 
@@ -247,14 +275,34 @@ pub async fn stop(paths: &Paths, config: &AppConfig, client: &MihomoClient) -> R
         "runtime cleanup: system_proxy={} tun={} dns={}",
         config.system_proxy.enabled, config.tun.enable, config.dns.enable
     );
-    cleanup_runtime(config, client).await;
-    println!("mihomo core: stopping if owned by clashtui");
-    core::stop(paths).await?;
+    cleanup_owned_runtimes(paths, config, client).await?;
     println!("clashtui stopped: pid={pid}");
-    print_process_summary(paths).await?;
+    print_process_summary(paths, config).await?;
     print_log_tail("clashtui log", &paths.log_file, LOG_TAIL_LINES);
-    print_log_tail("mihomo log", &paths.core_log_file, LOG_TAIL_LINES);
+    print_mihomo_log_tails(paths, config);
     Ok(())
+}
+
+async fn cleanup_owned_runtimes(
+    paths: &Paths,
+    config: &AppConfig,
+    client: &MihomoClient,
+) -> Result<()> {
+    if config.system_proxy.enabled
+        && let Err(err) = system_proxy::clear()
+    {
+        eprintln!("failed to clear system proxy: {err:#}");
+    }
+
+    if core::owned_core_running(paths).await? {
+        cleanup_runtime(config, client).await;
+    } else {
+        println!(
+            "runtime cleanup: skipped global mihomo cleanup because no clashtui-owned global core is running"
+        );
+    }
+    println!("mihomo core: stopping all instances owned by clashtui");
+    core::stop_all(paths, config).await
 }
 
 pub async fn status(paths: &Paths, config: &AppConfig, client: &MihomoClient) -> Result<()> {
@@ -271,7 +319,7 @@ pub async fn status(paths: &Paths, config: &AppConfig, client: &MihomoClient) ->
     } else {
         println!("daemon: stopped");
     }
-    print_process_summary(paths).await?;
+    print_process_summary(paths, config).await?;
 
     print_static_summary(paths, config);
     print_tun_permission_summary(config);
@@ -291,7 +339,7 @@ pub async fn status(paths: &Paths, config: &AppConfig, client: &MihomoClient) ->
     }
     print_network_summary(config);
     print_log_tail("clashtui log", &paths.log_file, LOG_TAIL_LINES);
-    print_log_tail("mihomo log", &paths.core_log_file, LOG_TAIL_LINES);
+    print_mihomo_log_tails(paths, config);
 
     Ok(())
 }
@@ -343,9 +391,34 @@ fn print_tun_permission_summary(config: &AppConfig) {
                 "tun-permission: polkit_rule={} exists={} matches_user={}",
                 status.polkit_rule_path, status.polkit_rule_exists, status.polkit_rule_matches_user
             );
+            if !status.can_start_tun() {
+                print_tun_permission_hint(&status);
+            }
         }
         Err(err) => println!("tun-permission: check failed: {err:#}"),
     }
+}
+
+#[cfg(target_os = "macos")]
+fn print_tun_permission_hint(status: &privilege::TunPermissionStatus) {
+    println!(
+        "tun-permission: macOS TUN needs a privileged mihomo process; current process is_root={}",
+        status.is_root
+    );
+    println!("tun-permission: Port Proxy/system proxy can still work without TUN.");
+}
+
+#[cfg(target_os = "linux")]
+fn print_tun_permission_hint(status: &privilege::TunPermissionStatus) {
+    println!(
+        "tun-permission: run sudo {} tun-install before starting TUN",
+        status.target.display()
+    );
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn print_tun_permission_hint(_status: &privilege::TunPermissionStatus) {
+    println!("tun-permission: TUN is not supported on this platform.");
 }
 
 fn validate_start_permissions(config: &AppConfig) -> Result<()> {
@@ -361,6 +434,15 @@ fn validate_start_permissions(config: &AppConfig) -> Result<()> {
         );
     }
     if !status.can_start_tun() {
+        #[cfg(target_os = "macos")]
+        {
+            println!(
+                "warning: TUN is enabled but this process is not privileged enough for macOS utun; Port Proxy can still run"
+            );
+            return Ok(());
+        }
+
+        #[cfg(not(target_os = "macos"))]
         anyhow::bail!(
             "TUN is enabled but current binary lacks CAP_NET_ADMIN: {}\nrun: sudo {} tun-install",
             status.target.display(),
@@ -437,54 +519,94 @@ async fn print_runtime_summary(config: &AppConfig, client: &MihomoClient) {
     }
 }
 
-async fn apply_runtime(paths: &Paths, config: &mut AppConfig, client: &MihomoClient) -> Result<()> {
+async fn apply_runtime(paths: &Paths, config: &mut AppConfig) -> Result<()> {
     let mut errors = Vec::new();
     eprintln!(
-        "runtime apply: desired mode={} proxy={} system_proxy={} tun={} dns={} active_profile={}",
+        "runtime apply: desired mode={} proxy={} system_proxy={} tun={} dns={} active_profile={} port_proxies={}",
         config.runtime_mode,
         config.proxy_port_summary(),
         config.system_proxy.enabled,
         config.tun.enable,
         config.dns.enable,
-        config.active_profile.as_deref().unwrap_or("-")
+        config.active_profile.as_deref().unwrap_or("-"),
+        config
+            .proxy_ports
+            .services
+            .iter()
+            .filter(|service| service.enabled)
+            .count()
     );
 
-    if client.version().await.is_err() {
-        eprintln!("runtime apply: mihomo controller offline; ensuring core is running");
-        core::ensure_running(paths, config).await?;
-        if let Err(err) = wait_for_mihomo(client).await {
-            eprintln!("runtime apply: mihomo controller still unhealthy after wait: {err:#}");
-            eprintln!("runtime apply: restarting owned mihomo core");
+    if let Err(err) = apply_global_runtime(paths, config).await {
+        errors.push(format!("global: {err:#}"));
+    }
+    if let Err(err) = apply_port_proxy_runtimes(paths, config).await {
+        errors.push(format!("port proxies: {err:#}"));
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("{}", errors.join("; "))
+    }
+}
+
+async fn apply_global_runtime(paths: &Paths, config: &mut AppConfig) -> Result<()> {
+    let client = MihomoClient::new(&config.controller);
+    let mut errors = Vec::new();
+
+    if core::owned_core_running(paths).await? {
+        if client.version().await.is_err() {
+            eprintln!("runtime apply: owned global mihomo controller unhealthy; restarting core");
             core::stop(paths).await?;
             core::ensure_running(paths, config).await?;
-            wait_for_mihomo(client).await?;
+            wait_for_mihomo(&client).await?;
+        }
+    } else if client.version().await.is_ok() {
+        anyhow::bail!(
+            "mihomo controller {} is online but is not owned by clashtui; refusing to modify external mihomo",
+            config.controller.url
+        );
+    } else {
+        eprintln!("runtime apply: owned global mihomo is not running; ensuring core is running");
+        core::ensure_running(paths, config).await?;
+        if let Err(err) = wait_for_mihomo(&client).await {
+            eprintln!(
+                "runtime apply: global mihomo controller still unhealthy after wait: {err:#}"
+            );
+            eprintln!("runtime apply: restarting owned global mihomo core");
+            core::stop(paths).await?;
+            core::ensure_running(paths, config).await?;
+            wait_for_mihomo(&client).await?;
         }
     }
 
-    if let Err(err) = load_runtime_profile(paths, config, client).await {
+    if let Err(err) = load_runtime_profile(paths, config, &client).await {
         errors.push(format!("profile: {err:#}"));
     } else {
-        eprintln!("runtime apply: profile loaded");
+        eprintln!("runtime apply: global profile loaded");
     }
 
     if let Err(err) = client.set_mixed_port(config.mixed_port).await {
         errors.push(format!("mixed port: {err:#}"));
     } else {
-        eprintln!("runtime apply: mixed-port={}", config.mixed_port);
+        eprintln!("runtime apply: global mixed-port={}", config.mixed_port);
     }
 
     if let Err(err) = client.set_mode(&config.runtime_mode).await {
         errors.push(format!("mode: {err:#}"));
     } else {
-        eprintln!("runtime apply: mode={}", config.runtime_mode);
+        eprintln!("runtime apply: global mode={}", config.runtime_mode);
     }
 
-    for (group, proxy) in &config.proxy_selections {
-        if let Err(err) = client.select_proxy(group, proxy).await {
-            errors.push(format!("proxy {group}: {err:#}"));
-        } else {
-            eprintln!("runtime apply: proxy selection {group} -> {proxy}");
-        }
+    if let Err(err) = apply_proxy_selections(
+        &client,
+        "Global Proxy",
+        desired_global_proxy_selections(config),
+    )
+    .await
+    {
+        errors.push(format!("proxy selection: {err:#}"));
     }
 
     if config.system_proxy.enabled
@@ -498,13 +620,13 @@ async fn apply_runtime(paths: &Paths, config: &mut AppConfig, client: &MihomoCli
         );
     }
 
-    if let Err(err) = tun::apply(client, &config.tun).await {
+    if let Err(err) = tun::apply(&client, &config.tun).await {
         errors.push(format!("tun: {err:#}"));
     } else {
         eprintln!("runtime apply: tun requested={}", config.tun.enable);
     }
 
-    if let Err(err) = dns::apply(client, &config.dns).await {
+    if let Err(err) = dns::apply(&client, &config.dns).await {
         errors.push(format!("dns: {err:#}"));
     } else {
         eprintln!(
@@ -513,7 +635,7 @@ async fn apply_runtime(paths: &Paths, config: &mut AppConfig, client: &MihomoCli
         );
     }
 
-    if let Err(err) = verify_runtime_state(config, client).await {
+    if let Err(err) = verify_runtime_state(config, &client).await {
         errors.push(format!("runtime verify: {err:#}"));
     }
 
@@ -522,6 +644,160 @@ async fn apply_runtime(paths: &Paths, config: &mut AppConfig, client: &MihomoCli
     } else {
         anyhow::bail!("{}", errors.join("; "))
     }
+}
+
+async fn apply_port_proxy_runtimes(paths: &Paths, config: &mut AppConfig) -> Result<()> {
+    let mut errors = Vec::new();
+    let services = config.proxy_ports.services.clone();
+    for (index, service) in services.iter().enumerate() {
+        if !service.enabled {
+            if let Err(err) = core::stop_service(paths, config, index, service).await {
+                errors.push(format!("{} stop: {err:#}", service_name(index, service)));
+            }
+            continue;
+        }
+        if let Err(err) = apply_port_proxy_runtime(paths, config, index, service).await {
+            errors.push(format!("{}: {err:#}", service_name(index, service)));
+        }
+    }
+    if let Err(err) = core::stop_removed_services(paths, services.len()).await {
+        errors.push(format!("removed services cleanup: {err:#}"));
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("{}", errors.join("; "))
+    }
+}
+
+async fn apply_port_proxy_runtime(
+    paths: &Paths,
+    config: &mut AppConfig,
+    index: usize,
+    service: &PortProxyService,
+) -> Result<()> {
+    let profile_name = service
+        .subscription
+        .as_deref()
+        .or(config.active_profile.as_deref())
+        .map(str::to_string);
+    if let Some(profile_name) = profile_name {
+        ensure_subscription_profile(paths, config, &profile_name).await?;
+    }
+
+    let instance = core::ensure_service_running(paths, config, index, service).await?;
+    let client = mihomo_client_for_instance(config, &instance);
+    if let Err(err) = wait_for_mihomo(&client).await {
+        eprintln!(
+            "runtime apply: {} controller unhealthy after wait: {err:#}; restarting",
+            instance.label
+        );
+        core::stop_service(paths, config, index, service).await?;
+        core::ensure_service_running(paths, config, index, service).await?;
+        wait_for_mihomo(&client).await?;
+    }
+
+    runtime_profile::write_service_config(paths, &instance, config, service).await?;
+    client.reload_config(&instance.config_file).await?;
+    client.set_mode(&service.mode).await?;
+    apply_proxy_selections(
+        &client,
+        &instance.label,
+        desired_service_proxy_selections(service),
+    )
+    .await?;
+    eprintln!(
+        "runtime apply: {} ready controller={} listen={}:{} mode={} log={}",
+        instance.label,
+        instance.controller_url,
+        if service.listen.trim().is_empty() {
+            "127.0.0.1"
+        } else {
+            service.listen.trim()
+        },
+        service.port,
+        service.mode,
+        instance.log_file.display()
+    );
+    Ok(())
+}
+
+fn desired_global_proxy_selections(config: &AppConfig) -> Vec<(&str, &str)> {
+    let mut selections = config
+        .proxy_selections
+        .iter()
+        .map(|(group, proxy)| (group.as_str(), proxy.as_str()))
+        .collect::<Vec<_>>();
+
+    if config.runtime_mode.eq_ignore_ascii_case("rule")
+        && let Some(active_profile) = config.active_profile.as_ref()
+        && let Some(subscription) = config
+            .subscriptions
+            .iter()
+            .find(|subscription| &subscription.name == active_profile)
+    {
+        for (group, proxy) in &subscription.rule_selections {
+            if let Some(existing) = selections
+                .iter_mut()
+                .find(|(existing_group, _)| existing_group == group)
+            {
+                *existing = (group.as_str(), proxy.as_str());
+            } else {
+                selections.push((group.as_str(), proxy.as_str()));
+            }
+        }
+    }
+
+    selections
+}
+
+fn desired_service_proxy_selections(service: &PortProxyService) -> Vec<(&str, &str)> {
+    if service.mode.eq_ignore_ascii_case("global")
+        && let Some(proxy) = service.proxy.as_deref().filter(|value| !value.is_empty())
+    {
+        return vec![("GLOBAL", proxy)];
+    }
+    if service.mode.eq_ignore_ascii_case("rule") {
+        return service
+            .rule_selections
+            .iter()
+            .map(|(group, proxy)| (group.as_str(), proxy.as_str()))
+            .collect();
+    }
+    Vec::new()
+}
+
+async fn apply_proxy_selections(
+    client: &MihomoClient,
+    label: &str,
+    selections: Vec<(&str, &str)>,
+) -> Result<()> {
+    if selections.is_empty() {
+        return Ok(());
+    }
+
+    let groups = client
+        .proxy_groups()
+        .await
+        .with_context(|| format!("{label} proxy groups unavailable"))?;
+    for (group, proxy) in selections {
+        let Some(proxy_group) = groups.iter().find(|candidate| candidate.name == group) else {
+            eprintln!("runtime apply: {label} proxy selection skipped; group not found {group}");
+            continue;
+        };
+        if !proxy_group.all.iter().any(|candidate| candidate == proxy) {
+            eprintln!(
+                "runtime apply: {label} proxy selection skipped; proxy not found {group} -> {proxy}"
+            );
+            continue;
+        }
+        client
+            .select_proxy(group, proxy)
+            .await
+            .with_context(|| format!("{label} proxy selection {group} -> {proxy}"))?;
+        eprintln!("runtime apply: {label} proxy selection {group} -> {proxy}");
+    }
+    Ok(())
 }
 
 async fn load_runtime_profile(
@@ -541,13 +817,72 @@ async fn load_runtime_profile(
         let sub = config.subscriptions[index].clone();
         let profile = subscription::profile_path(paths, &sub);
         if !profile.exists() {
-            subscription::update(paths, config, index).await?;
+            subscription::update_preserving_last_good(paths, config, index).await?;
             config.save(paths).await?;
         }
     }
 
     let runtime_config = runtime_profile::write_current_config(paths, config).await?;
     client.reload_config(&runtime_config).await
+}
+
+async fn ensure_subscription_profile(
+    paths: &Paths,
+    config: &mut AppConfig,
+    profile_name: &str,
+) -> Result<()> {
+    let Some(index) = config
+        .subscriptions
+        .iter()
+        .position(|subscription| subscription.name == profile_name)
+    else {
+        anyhow::bail!("subscription profile not found: {profile_name}");
+    };
+    let sub = config.subscriptions[index].clone();
+    let profile = subscription::profile_path(paths, &sub);
+    if !profile.exists() {
+        subscription::update_preserving_last_good(paths, config, index).await?;
+        config.save(paths).await?;
+    }
+    Ok(())
+}
+
+async fn runtime_health(paths: &Paths, config: &AppConfig) -> Result<()> {
+    let global_client = MihomoClient::new(&config.controller);
+    global_client
+        .version()
+        .await
+        .context("global mihomo offline")?;
+
+    for (index, service) in config
+        .proxy_ports
+        .services
+        .iter()
+        .enumerate()
+        .filter(|(_, service)| service.enabled)
+    {
+        let instance = core::service_instance(paths, config, index, service);
+        mihomo_client_for_instance(config, &instance)
+            .version()
+            .await
+            .with_context(|| format!("{} mihomo offline", instance.label))?;
+    }
+    Ok(())
+}
+
+fn mihomo_client_for_instance(config: &AppConfig, instance: &RuntimePaths) -> MihomoClient {
+    MihomoClient::new(&ControllerConfig {
+        url: instance.controller_url.clone(),
+        secret: config.controller.secret.clone(),
+    })
+}
+
+fn service_name(index: usize, service: &PortProxyService) -> String {
+    if service.name.trim().is_empty() {
+        format!("Port Proxy {}", index + 1)
+    } else {
+        service.name.clone()
+    }
 }
 
 async fn verify_runtime_state(config: &AppConfig, client: &MihomoClient) -> Result<()> {
@@ -559,8 +894,8 @@ async fn verify_runtime_state(config: &AppConfig, client: &MihomoClient) -> Resu
     let dns_enabled = nested_bool(&configs, "dns", "enable");
 
     if Some(config.tun.enable) != tun_enabled {
-        anyhow::bail!(
-            "TUN desired={} but mihomo reports {}; this usually means missing CAP_NET_ADMIN or a TUN setup failure",
+        eprintln!(
+            "runtime warning: TUN desired={} but mihomo reports {}; this usually means missing privileges or a TUN setup failure",
             config.tun.enable,
             bool_value(tun_enabled)
         );
@@ -576,12 +911,6 @@ async fn verify_runtime_state(config: &AppConfig, client: &MihomoClient) -> Resu
 }
 
 async fn cleanup_runtime(config: &AppConfig, client: &MihomoClient) {
-    if config.system_proxy.enabled
-        && let Err(err) = system_proxy::clear()
-    {
-        eprintln!("failed to clear system proxy: {err:#}");
-    }
-
     if config.tun.enable {
         let mut tun_config = config.tun.clone();
         tun_config.enable = false;
@@ -613,9 +942,13 @@ async fn wait_for_mihomo(client: &MihomoClient) -> Result<()> {
     Ok(())
 }
 
-async fn print_process_summary(paths: &Paths) -> Result<()> {
+async fn print_process_summary(paths: &Paths, config: &AppConfig) -> Result<()> {
     print_pid_state("daemon-pid", &paths.pid_file).await?;
-    print_pid_state("mihomo-pid", &paths.core_pid_file).await?;
+    print_pid_state("global-mihomo-pid", &paths.core_pid_file).await?;
+    for (index, service) in config.proxy_ports.services.iter().enumerate() {
+        let instance = core::service_instance(paths, config, index, service);
+        print_pid_state(&format!("{}-pid", instance.id), &instance.pid_file).await?;
+    }
     Ok(())
 }
 
@@ -636,6 +969,11 @@ fn print_network_summary(config: &AppConfig) {
     }
 
     println!("network: expected tun device={}", config.tun.device);
+    print_platform_network_summary(config);
+}
+
+#[cfg(target_os = "linux")]
+fn print_platform_network_summary(config: &AppConfig) {
     print_command_summary(
         "network/ip-addr",
         "ip",
@@ -647,6 +985,22 @@ fn print_network_summary(config: &AppConfig) {
         "ip",
         &["route", "show", "default"],
     );
+}
+
+#[cfg(target_os = "macos")]
+fn print_platform_network_summary(config: &AppConfig) {
+    print_command_summary(
+        "network/ifconfig-tun",
+        "ifconfig",
+        &[config.tun.device.as_str()],
+    );
+    print_command_summary("network/route-default", "route", &["-n", "get", "default"]);
+    print_command_summary("network/netstat-default", "netstat", &["-rn", "-f", "inet"]);
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn print_platform_network_summary(_config: &AppConfig) {
+    println!("network: platform-specific TUN route inspection is not implemented");
 }
 
 fn print_command_summary(label: &str, command: &str, args: &[&str]) {
@@ -689,6 +1043,18 @@ fn print_log_tail(label: &str, path: &Path, lines: usize) {
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => println!("(missing)"),
         Err(err) => println!("(failed to read: {err})"),
+    }
+}
+
+fn print_mihomo_log_tails(paths: &Paths, config: &AppConfig) {
+    print_log_tail("global mihomo log", &paths.core_log_file, LOG_TAIL_LINES);
+    for (index, service) in config.proxy_ports.services.iter().enumerate() {
+        let instance = core::service_instance(paths, config, index, service);
+        print_log_tail(
+            &format!("{} mihomo log", instance.label),
+            &instance.log_file,
+            LOG_TAIL_LINES,
+        );
     }
 }
 

@@ -5,6 +5,7 @@ mod daemon;
 mod dns;
 mod mihomo;
 mod platform;
+mod port_allocator;
 mod privilege;
 mod runtime_profile;
 mod subscription;
@@ -92,6 +93,11 @@ async fn main() -> Result<()> {
     let paths = Paths::new()?;
     let mut config = AppConfig::load_or_init(&paths).await?;
 
+    let should_allocate_ports = cli.daemon_run || matches!(cli.command, Some(Command::Config));
+    if should_allocate_ports && port_allocator::ensure_allocated(&paths, &mut config).await? {
+        config.save(&paths).await?;
+    }
+
     if let Some(controller) = &cli.controller {
         config.controller.url.clone_from(controller);
     }
@@ -108,7 +114,7 @@ async fn main() -> Result<()> {
         Some(Command::Start) => {
             daemon::start(
                 &paths,
-                &config,
+                &mut config,
                 cli.controller.as_deref(),
                 cli.secret.as_deref(),
             )

@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context as _, Result};
 use tokio::fs;
 
-use crate::config::{AppConfig, Paths, Subscription};
+use crate::config::{AppConfig, Paths, Subscription, SubscriptionUserInfo};
 
 pub async fn update(paths: &Paths, config: &mut AppConfig, index: usize) -> Result<PathBuf> {
     let sub = config
@@ -12,14 +12,20 @@ pub async fn update(paths: &Paths, config: &mut AppConfig, index: usize) -> Resu
         .get(index)
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("subscription index out of range"))?;
-    let body = reqwest::Client::new()
+    let response = reqwest::Client::new()
         .get(&sub.url)
         .header("User-Agent", "clashtui/0.1")
         .send()
         .await
         .with_context(|| format!("failed to download subscription {}", sub.name))?
         .error_for_status()
-        .with_context(|| format!("subscription server rejected {}", sub.name))?
+        .with_context(|| format!("subscription server rejected {}", sub.name))?;
+    let user_info = response
+        .headers()
+        .get("subscription-userinfo")
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_user_info);
+    let body = response
         .text()
         .await
         .with_context(|| format!("failed to read subscription {}", sub.name))?;
@@ -36,9 +42,29 @@ pub async fn update(paths: &Paths, config: &mut AppConfig, index: usize) -> Resu
 
     if let Some(current) = config.subscriptions.get_mut(index) {
         current.updated_at = Some(now_unix().to_string());
+        current.last_error = None;
+        if let Some(user_info) = user_info {
+            current.user_info = user_info;
+        }
     }
 
     Ok(profile_path)
+}
+
+pub async fn update_preserving_last_good(
+    paths: &Paths,
+    config: &mut AppConfig,
+    index: usize,
+) -> Result<PathBuf> {
+    match update(paths, config, index).await {
+        Ok(path) => Ok(path),
+        Err(err) => {
+            if let Some(current) = config.subscriptions.get_mut(index) {
+                current.last_error = Some(err.to_string());
+            }
+            Err(err)
+        }
+    }
 }
 
 pub fn profile_path(paths: &Paths, sub: &Subscription) -> PathBuf {
@@ -68,4 +94,42 @@ fn now_unix() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
+}
+
+fn parse_user_info(value: &str) -> Option<SubscriptionUserInfo> {
+    let mut info = SubscriptionUserInfo::default();
+    for item in value.split(';') {
+        let Some((key, value)) = item.trim().split_once('=') else {
+            continue;
+        };
+        let Ok(value) = value.trim().parse::<u64>() else {
+            continue;
+        };
+        match key.trim().to_ascii_lowercase().as_str() {
+            "upload" => info.upload = Some(value),
+            "download" => info.download = Some(value),
+            "total" => info.total = Some(value),
+            "expire" => info.expire = Some(value),
+            _ => {}
+        }
+    }
+    (!info.is_empty()).then_some(info)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_subscription_user_info_header() -> Result<()> {
+        let info = parse_user_info("upload=10; download=20; total=100; expire=200")
+            .ok_or_else(|| anyhow::anyhow!("missing user info"))?;
+
+        assert_eq!(info.upload, Some(10));
+        assert_eq!(info.download, Some(20));
+        assert_eq!(info.used(), Some(30));
+        assert_eq!(info.total, Some(100));
+        assert_eq!(info.expire, Some(200));
+        Ok(())
+    }
 }

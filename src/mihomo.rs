@@ -82,6 +82,18 @@ impl MihomoClient {
         Ok(())
     }
 
+    pub async fn proxy_delay(&self, proxy: &str, test_url: &str, timeout_ms: u64) -> Result<u64> {
+        let value: Value = self
+            .send(self.client.get(self.url(&format!(
+                "/proxies/{}/delay?timeout={}&url={}",
+                encode_path_segment(proxy),
+                timeout_ms,
+                encode_query_component(test_url)
+            ))))
+            .await?;
+        delay_from_value(&value)
+    }
+
     pub async fn reload_config(&self, path: &Path) -> Result<()> {
         let body = json!({
             "path": path.to_string_lossy(),
@@ -161,11 +173,33 @@ fn proxy_groups_from_value(value: &Value) -> Result<Vec<ProxyGroup>> {
     Ok(groups)
 }
 
+fn delay_from_value(value: &Value) -> Result<u64> {
+    value
+        .get("delay")
+        .and_then(Value::as_u64)
+        .context("mihomo delay response has no numeric delay")
+}
+
 fn encode_path_segment(value: &str) -> String {
     let mut output = String::with_capacity(value.len());
     for byte in value.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
             output.push(char::from(byte));
+        } else {
+            output.push('%');
+            output.push_str(&format!("{byte:02X}"));
+        }
+    }
+    output
+}
+
+fn encode_query_component(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            output.push(char::from(byte));
+        } else if byte == b' ' {
+            output.push_str("%20");
         } else {
             output.push('%');
             output.push_str(&format!("{byte:02X}"));
@@ -214,5 +248,19 @@ mod tests {
             encode_path_segment("Proxy Group/香港"),
             "Proxy%20Group%2F%E9%A6%99%E6%B8%AF"
         );
+    }
+
+    #[test]
+    fn encodes_delay_query_url() {
+        assert_eq!(
+            encode_query_component("https://cp.cloudflare.com/generate_204"),
+            "https%3A%2F%2Fcp.cloudflare.com%2Fgenerate_204"
+        );
+    }
+
+    #[test]
+    fn parses_proxy_delay_response() -> Result<()> {
+        assert_eq!(delay_from_value(&json!({ "delay": 123 }))?, 123);
+        Ok(())
     }
 }

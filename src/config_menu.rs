@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
 use std::io::{self, IsTerminal as _, Stdout};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
@@ -15,8 +17,10 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
+use tokio::task::JoinHandle;
+use tokio::time::sleep;
 
-use crate::config::{AppConfig, Paths, Subscription, SubscriptionRefresh};
+use crate::config::{AppConfig, Paths, PortProxyService, Subscription, SubscriptionRefresh};
 use crate::core;
 use crate::dns;
 use crate::mihomo::{MihomoClient, ProxyGroup};
@@ -29,6 +33,10 @@ const IPINFO_REFRESH_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const LABEL_WIDTH: usize = 24;
 const APP_TITLE: &str = "ClashTUI Config";
 const APP_VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
+const DEFAULT_DELAY_TEST_URL: &str = "https://www.gstatic.com/generate_204";
+const DEFAULT_DELAY_TEST_TIMEOUT_MS: u64 = 5_000;
+const RUNTIME_START_RETRIES: usize = 20;
+const RUNTIME_START_WAIT: Duration = Duration::from_millis(250);
 const H_LINE: char = '─';
 const V_LINE: char = '│';
 const TOP_JOINT: char = '┬';
@@ -47,6 +55,7 @@ pub async fn run(paths: &Paths, config: &mut AppConfig) -> Result<()> {
     let mut last_refresh = Instant::now();
 
     while !app.should_quit {
+        app.poll_delay_check();
         terminal
             .terminal
             .draw(|frame| draw(frame, paths, config, &app))?;
@@ -60,6 +69,7 @@ pub async fn run(paths: &Paths, config: &mut AppConfig) -> Result<()> {
             app.refresh_runtime(config).await;
             last_refresh = Instant::now();
         }
+        app.poll_delay_check();
     }
 
     if app.save_on_exit {
@@ -72,6 +82,10 @@ pub async fn run(paths: &Paths, config: &mut AppConfig) -> Result<()> {
 enum Page {
     Main,
     Subscription,
+    SubscriptionDetail,
+    SubscriptionRuleGroups,
+    SubscriptionProxies,
+    SubscriptionRules,
     AddSubscription,
     Runtime,
     Chat,
@@ -109,6 +123,10 @@ impl Page {
         match self {
             Self::Main => "Main",
             Self::Subscription => "Subscription",
+            Self::SubscriptionDetail => "Subscription Detail",
+            Self::SubscriptionRuleGroups => "Rule Groups",
+            Self::SubscriptionProxies => "Proxies",
+            Self::SubscriptionRules => "Rules",
             Self::AddSubscription => "Add Subscription",
             Self::Runtime => "Runtime",
             Self::Chat => "Chat",
@@ -127,7 +145,12 @@ impl Page {
     const fn section_index(self) -> usize {
         match self {
             Self::Main | Self::ProxyConfig | Self::ProxyGroups | Self::Mode | Self::Dns => 0,
-            Self::Subscription | Self::AddSubscription => 1,
+            Self::Subscription
+            | Self::SubscriptionDetail
+            | Self::SubscriptionRuleGroups
+            | Self::SubscriptionProxies
+            | Self::SubscriptionRules
+            | Self::AddSubscription => 1,
             Self::Runtime => 2,
             Self::Chat => 3,
             Self::Help => 4,
@@ -211,7 +234,7 @@ impl ProxyConfigField {
             Self::Mode => "Mode",
             Self::ProxyGroups => "Proxy Server",
             Self::LocalPort => "Local Port",
-            Self::OsProxy => "OS System Proxy",
+            Self::OsProxy => "Sys Proxy",
             Self::Pac => "PAC",
             Self::Tun => "TUN",
             Self::Dns => "DNS",
@@ -312,6 +335,7 @@ enum InputMode {
     MixedPort,
     HttpPort,
     SocksPort,
+    ServicePort,
     DnsListen,
     DnsLanDomains,
     DnsLanNameserver,
@@ -332,6 +356,7 @@ impl InputMode {
             Self::MixedPort => "Mixed Port",
             Self::HttpPort => "HTTP Port",
             Self::SocksPort => "SOCKS Port",
+            Self::ServicePort => "Port Proxy Port",
             Self::DnsListen => "DNS Listen",
             Self::DnsLanDomains => "LAN Domains",
             Self::DnsLanNameserver => "LAN DNS",
@@ -356,6 +381,7 @@ struct RuntimeState {
 
 #[derive(Default)]
 struct TrafficState {
+    upload_total: u64,
     download_total: u64,
     upload_speed: u64,
     download_speed: u64,
@@ -364,6 +390,7 @@ struct TrafficState {
 struct IpInfoState {
     ip: String,
     country: Option<String>,
+    city: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -432,6 +459,7 @@ enum ConfirmAction {
     LoadDefaults,
     SaveRestart,
     SaveRestartExit,
+    DeleteSubscription,
 }
 
 impl ConfirmAction {
@@ -441,6 +469,7 @@ impl ConfirmAction {
             Self::LoadDefaults => "Load Setup Defaults?",
             Self::SaveRestart => "Save And Restart?",
             Self::SaveRestartExit => "Save, Restart, And Exit?",
+            Self::DeleteSubscription => "Delete Subscription?",
         }
     }
 
@@ -456,6 +485,7 @@ impl ConfirmAction {
             ],
             Self::SaveRestart => &["Save config and restart mihomo now?"],
             Self::SaveRestartExit => &["Save config, restart mihomo, then exit?"],
+            Self::DeleteSubscription => &["Delete this subscription?"],
         }
     }
 
@@ -465,6 +495,7 @@ impl ConfirmAction {
             Self::LoadDefaults => "Yes, Load Defaults",
             Self::SaveRestart => "Yes, Save & Restart",
             Self::SaveRestartExit => "Yes, Save & Restart & Exit",
+            Self::DeleteSubscription => "Yes, Delete",
         }
     }
 }
@@ -504,6 +535,7 @@ enum RowKind {
 #[derive(Debug, Clone, Copy)]
 enum ToggleAction {
     SystemProxy,
+    PortProxy,
     Tun,
     Dns,
     DnsDirectFollowPolicy,
@@ -518,7 +550,13 @@ enum ChoiceAction {
 
 #[derive(Debug, Clone, Copy)]
 enum ActionKind {
+    AddPortProxy,
+    AddSubscription,
     SaveSubscription,
+    UpdateSubscription,
+    DeleteSubscription,
+    EditSubscription,
+    TestProxyDelay,
     Service,
     TunPermissions,
     Logs,
@@ -534,6 +572,51 @@ struct Alert {
     message: String,
 }
 
+struct DelayCheckTask {
+    receiver: Receiver<DelayCheckEvent>,
+    handle: JoinHandle<()>,
+    progress: DelayCheckProgress,
+}
+
+#[derive(Debug, Clone)]
+struct DelayCheckProgress {
+    title: String,
+    total: usize,
+    done: usize,
+    ok: usize,
+    failed: usize,
+    current: String,
+    finished: bool,
+}
+
+impl DelayCheckProgress {
+    fn new(title: String, total: usize) -> Self {
+        Self {
+            title,
+            total,
+            done: 0,
+            ok: 0,
+            failed: 0,
+            current: "Starting".into(),
+            finished: false,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum DelayCheckEvent {
+    Checking {
+        index: usize,
+        proxy: String,
+    },
+    ProxyFinished {
+        subscription_name: String,
+        proxy: String,
+        delay: Result<u64, String>,
+    },
+    Finished,
+}
+
 struct ConfigApp {
     page: Page,
     section: Page,
@@ -542,6 +625,10 @@ struct ConfigApp {
     selected_main: usize,
     selected_runtime: usize,
     selected_subscription: usize,
+    selected_subscription_detail: usize,
+    selected_subscription_rule_group: usize,
+    selected_subscription_proxy: usize,
+    selected_subscription_rule: usize,
     selected_dropdown: usize,
     selected_group: usize,
     selected_proxy: usize,
@@ -553,6 +640,8 @@ struct ConfigApp {
     input: String,
     subscription_form: SubscriptionForm,
     runtime: RuntimeState,
+    proxy_delays: BTreeMap<String, String>,
+    delay_check: Option<DelayCheckTask>,
     last_ip_info_refresh: Option<Instant>,
     status: String,
     should_quit: bool,
@@ -572,6 +661,10 @@ impl ConfigApp {
             selected_main: 0,
             selected_runtime: 0,
             selected_subscription: active_subscription_index(config).unwrap_or_default(),
+            selected_subscription_detail: 0,
+            selected_subscription_rule_group: 0,
+            selected_subscription_proxy: 0,
+            selected_subscription_rule: 0,
             selected_dropdown: 0,
             selected_group: 0,
             selected_proxy: 0,
@@ -583,6 +676,8 @@ impl ConfigApp {
             input: String::new(),
             subscription_form: SubscriptionForm::default(),
             runtime: RuntimeState::default(),
+            proxy_delays: BTreeMap::new(),
+            delay_check: None,
             last_ip_info_refresh: None,
             status: String::new(),
             should_quit: false,
@@ -653,6 +748,145 @@ impl ConfigApp {
         }
     }
 
+    fn start_delay_check(
+        &mut self,
+        subscription_name: String,
+        client: MihomoClient,
+        proxies: Vec<String>,
+    ) {
+        if let Some(task) = self.delay_check.take() {
+            task.handle.abort();
+        }
+
+        let total = proxies.len();
+        let title = format!("Checking {}", display_name(&subscription_name));
+        let (sender, receiver) = mpsc::channel();
+        let handle = tokio::spawn(run_delay_check_task(
+            sender,
+            subscription_name,
+            client,
+            proxies,
+        ));
+        self.delay_check = Some(DelayCheckTask {
+            receiver,
+            handle,
+            progress: DelayCheckProgress::new(title, total),
+        });
+        self.status = format!("Checking 0/{total} proxies");
+    }
+
+    fn poll_delay_check(&mut self) {
+        let mut events = Vec::new();
+        let mut disconnected = false;
+        if let Some(task) = self.delay_check.as_mut() {
+            loop {
+                match task.receiver.try_recv() {
+                    Ok(event) => events.push(event),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        for event in events {
+            self.apply_delay_check_event(event);
+        }
+
+        if disconnected
+            && let Some(task) = self.delay_check.as_mut()
+            && !task.progress.finished
+        {
+            task.progress.finished = true;
+            task.progress.current = "Stopped".into();
+            self.status = format!(
+                "Proxy check stopped at {}/{}",
+                task.progress.done, task.progress.total
+            );
+        }
+    }
+
+    fn apply_delay_check_event(&mut self, event: DelayCheckEvent) {
+        match event {
+            DelayCheckEvent::Checking { index, proxy } => {
+                if let Some(task) = self.delay_check.as_mut() {
+                    task.progress.current = format!("{index}. {}", display_name(&proxy));
+                    self.status = format!(
+                        "Checking {}/{} {}",
+                        task.progress.done,
+                        task.progress.total,
+                        display_name(&proxy)
+                    );
+                }
+            }
+            DelayCheckEvent::ProxyFinished {
+                subscription_name,
+                proxy,
+                delay,
+            } => {
+                let (value, success) = match delay {
+                    Ok(delay) => (format!("{delay}ms"), true),
+                    Err(_) => ("fail".into(), false),
+                };
+                self.proxy_delays.insert(
+                    subscription_proxy_delay_key_for_name(&subscription_name, &proxy),
+                    value,
+                );
+                if let Some(task) = self.delay_check.as_mut() {
+                    task.progress.done = (task.progress.done + 1).min(task.progress.total);
+                    if success {
+                        task.progress.ok += 1;
+                    } else {
+                        task.progress.failed += 1;
+                    }
+                    task.progress.current = display_name(&proxy);
+                    self.status = format!(
+                        "Checked {}/{} proxies",
+                        task.progress.done, task.progress.total
+                    );
+                }
+            }
+            DelayCheckEvent::Finished => {
+                if let Some(task) = self.delay_check.as_mut() {
+                    task.progress.done = task.progress.total;
+                    task.progress.finished = true;
+                    task.progress.current = "Complete".into();
+                    self.status = format!(
+                        "Checked {}/{} proxies, {} failed",
+                        task.progress.ok + task.progress.failed,
+                        task.progress.total,
+                        task.progress.failed
+                    );
+                }
+            }
+        }
+    }
+
+    fn delay_check_finished(&self) -> bool {
+        self.delay_check
+            .as_ref()
+            .is_some_and(|task| task.progress.finished)
+    }
+
+    fn close_delay_check(&mut self) {
+        if self.delay_check_finished() {
+            self.delay_check = None;
+        }
+    }
+
+    fn cancel_delay_check(&mut self) {
+        let Some(task) = self.delay_check.take() else {
+            return;
+        };
+        task.handle.abort();
+        self.status = format!(
+            "Proxy check canceled at {}/{}",
+            task.progress.done, task.progress.total
+        );
+    }
+
     fn current_group(&self) -> Option<&ProxyGroup> {
         self.runtime.groups.get(self.selected_group)
     }
@@ -686,7 +920,7 @@ impl ConfigApp {
             .unwrap_or(ProxyConfigField::Enabled)
     }
 
-    fn clamp_selection(&mut self, config: &AppConfig) {
+    fn clamp_selection(&mut self, paths: &Paths, config: &AppConfig) {
         let proxy_count = main_proxy_count(config);
         if proxy_count == 0 {
             self.selected_main = 0;
@@ -712,11 +946,38 @@ impl ConfigApp {
         if self.selected_subscription >= subscription_count {
             self.selected_subscription = subscription_count - 1;
         }
+        if self.selected_subscription_detail >= subscription_detail_count() {
+            self.selected_subscription_detail = subscription_detail_count() - 1;
+        }
+        let rule_group_count = subscription_rule_group_count(config, self);
+        if rule_group_count == 0 {
+            self.selected_subscription_rule_group = 0;
+        } else if self.selected_subscription_rule_group >= rule_group_count {
+            self.selected_subscription_rule_group = rule_group_count - 1;
+        }
+        let proxy_count = subscription_proxy_count(paths, config, self);
+        if proxy_count == 0 {
+            self.selected_subscription_proxy = 0;
+        } else if self.selected_subscription_proxy >= proxy_count {
+            self.selected_subscription_proxy = proxy_count - 1;
+        }
+        if self.selected_subscription_rule >= SUBSCRIPTION_RULE_FALLBACK_COUNT {
+            self.selected_subscription_rule = SUBSCRIPTION_RULE_FALLBACK_COUNT - 1;
+        }
         let dropdown_count = self.dropdown_item_count(config);
         if dropdown_count > 0 && self.selected_dropdown >= dropdown_count {
             self.selected_dropdown = dropdown_count - 1;
         }
-        self.clamp_runtime_selection();
+        if self.page == Page::ProxyGroups && proxy_groups_page_is_global_proxy_list(config, self) {
+            let proxy_count = route_proxy_names(paths, config, self).len();
+            if proxy_count == 0 {
+                self.selected_proxy = 0;
+            } else if self.selected_proxy >= proxy_count {
+                self.selected_proxy = proxy_count - 1;
+            }
+        } else {
+            self.clamp_runtime_selection();
+        }
     }
 
     fn clamp_runtime_selection(&mut self) {
@@ -745,6 +1006,10 @@ impl ConfigApp {
         match self.page {
             Page::Main => self.selected_main,
             Page::Subscription => self.selected_subscription,
+            Page::SubscriptionDetail => self.selected_subscription_detail,
+            Page::SubscriptionRuleGroups => self.selected_subscription_rule_group,
+            Page::SubscriptionProxies => self.selected_subscription_proxy,
+            Page::SubscriptionRules => self.selected_subscription_rule,
             Page::AddSubscription => self.subscription_form.selected,
             Page::Runtime => self.selected_runtime,
             Page::ProxyConfig => self.selected_proxy_field,
@@ -762,6 +1027,10 @@ impl ConfigApp {
         match self.page {
             Page::Main => self.selected_main = selected,
             Page::Subscription => self.selected_subscription = selected,
+            Page::SubscriptionDetail => self.selected_subscription_detail = selected,
+            Page::SubscriptionRuleGroups => self.selected_subscription_rule_group = selected,
+            Page::SubscriptionProxies => self.selected_subscription_proxy = selected,
+            Page::SubscriptionRules => self.selected_subscription_rule = selected,
             Page::AddSubscription => self.subscription_form.selected = selected,
             Page::Runtime => self.selected_runtime = selected,
             Page::ProxyConfig => self.selected_proxy_field = selected,
@@ -865,8 +1134,10 @@ impl ConfigApp {
         self.switch_section(self.section.prev());
     }
 
-    fn move_right(&mut self) {
-        if self.page == Page::ProxyGroups && self.proxy_pane == ProxyPane::Groups {
+    fn move_right(&mut self, config: &AppConfig) {
+        if self.page == Page::ProxyGroups && proxy_groups_page_is_global_proxy_list(config, self) {
+            self.status = "Select a proxy, then press Enter".into();
+        } else if self.page == Page::ProxyGroups && self.proxy_pane == ProxyPane::Groups {
             self.proxy_pane = ProxyPane::Proxies;
             self.selected_proxy = current_proxy_index(self.current_group()).unwrap_or_default();
             self.status = "Proxy pane: Proxies".into();
@@ -875,8 +1146,10 @@ impl ConfigApp {
         }
     }
 
-    fn move_left(&mut self) {
-        if self.page == Page::ProxyGroups && self.proxy_pane == ProxyPane::Proxies {
+    fn move_left(&mut self, config: &AppConfig) {
+        if self.page == Page::ProxyGroups && proxy_groups_page_is_global_proxy_list(config, self) {
+            self.status = "Select a proxy, then press Enter".into();
+        } else if self.page == Page::ProxyGroups && self.proxy_pane == ProxyPane::Proxies {
             self.proxy_pane = ProxyPane::Groups;
             self.status = "Proxy pane: Groups".into();
         } else {
@@ -884,12 +1157,36 @@ impl ConfigApp {
         }
     }
 
-    fn move_next(&mut self, config: &AppConfig) {
+    fn move_next(&mut self, paths: &Paths, config: &AppConfig) {
         match self.page {
             Page::Main => {
                 self.selected_main = next_index(self.selected_main, main_proxy_count(config))
             }
             Page::Subscription => self.select_next_subscription(config),
+            Page::SubscriptionDetail => {
+                self.selected_subscription_detail = next_index(
+                    self.selected_subscription_detail,
+                    subscription_detail_count(),
+                )
+            }
+            Page::SubscriptionRuleGroups => {
+                self.selected_subscription_rule_group = next_index(
+                    self.selected_subscription_rule_group,
+                    subscription_rule_group_count(config, self),
+                )
+            }
+            Page::SubscriptionProxies => {
+                self.selected_subscription_proxy = next_index(
+                    self.selected_subscription_proxy,
+                    subscription_proxy_count(paths, config, self),
+                )
+            }
+            Page::SubscriptionRules => {
+                self.selected_subscription_rule = next_index(
+                    self.selected_subscription_rule,
+                    SUBSCRIPTION_RULE_FALLBACK_COUNT,
+                )
+            }
             Page::AddSubscription => self.subscription_form.next_field(),
             Page::ProxyConfig => {
                 self.selected_proxy_field =
@@ -897,6 +1194,12 @@ impl ConfigApp {
             }
             Page::ProxyGroups => match self.proxy_pane {
                 ProxyPane::Groups => self.select_next_group(),
+                ProxyPane::Proxies if proxy_groups_page_is_global_proxy_list(config, self) => {
+                    self.selected_proxy = next_index(
+                        self.selected_proxy,
+                        route_proxy_names(paths, config, self).len(),
+                    )
+                }
                 ProxyPane::Proxies => self.select_next_proxy(),
             },
             Page::Mode => self.selected_mode = next_index(self.selected_mode, ModeItem::ALL.len()),
@@ -908,12 +1211,36 @@ impl ConfigApp {
         }
     }
 
-    fn move_prev(&mut self, config: &AppConfig) {
+    fn move_prev(&mut self, paths: &Paths, config: &AppConfig) {
         match self.page {
             Page::Main => {
                 self.selected_main = prev_index(self.selected_main, main_proxy_count(config))
             }
             Page::Subscription => self.select_prev_subscription(config),
+            Page::SubscriptionDetail => {
+                self.selected_subscription_detail = prev_index(
+                    self.selected_subscription_detail,
+                    subscription_detail_count(),
+                )
+            }
+            Page::SubscriptionRuleGroups => {
+                self.selected_subscription_rule_group = prev_index(
+                    self.selected_subscription_rule_group,
+                    subscription_rule_group_count(config, self),
+                )
+            }
+            Page::SubscriptionProxies => {
+                self.selected_subscription_proxy = prev_index(
+                    self.selected_subscription_proxy,
+                    subscription_proxy_count(paths, config, self),
+                )
+            }
+            Page::SubscriptionRules => {
+                self.selected_subscription_rule = prev_index(
+                    self.selected_subscription_rule,
+                    SUBSCRIPTION_RULE_FALLBACK_COUNT,
+                )
+            }
             Page::AddSubscription => self.subscription_form.prev_field(),
             Page::ProxyConfig => {
                 self.selected_proxy_field =
@@ -921,6 +1248,12 @@ impl ConfigApp {
             }
             Page::ProxyGroups => match self.proxy_pane {
                 ProxyPane::Groups => self.select_prev_group(),
+                ProxyPane::Proxies if proxy_groups_page_is_global_proxy_list(config, self) => {
+                    self.selected_proxy = prev_index(
+                        self.selected_proxy,
+                        route_proxy_names(paths, config, self).len(),
+                    )
+                }
                 ProxyPane::Proxies => self.select_prev_proxy(),
             },
             Page::Mode => self.selected_mode = prev_index(self.selected_mode, ModeItem::ALL.len()),
@@ -991,22 +1324,13 @@ impl ConfigApp {
 
     fn open_subscription_dropdown(&mut self, config: &AppConfig) {
         self.dropdown = Some(Dropdown::ProxySubscription);
-        self.selected_dropdown = config
-            .active_profile
-            .as_ref()
-            .and_then(|name| {
-                config
-                    .subscriptions
-                    .iter()
-                    .position(|subscription| &subscription.name == name)
-            })
-            .unwrap_or_default();
+        self.selected_dropdown = proxy_subscription_index(config, self).unwrap_or_default();
         self.status = "Choose subscription, then press Enter".into();
     }
 
     fn open_mode_dropdown(&mut self, config: &AppConfig) {
         self.dropdown = Some(Dropdown::Mode);
-        self.selected_dropdown = runtime_mode_index(config);
+        self.selected_dropdown = mode_index(proxy_mode(config, self));
         self.status = "Choose mode, then press Enter".into();
     }
 
@@ -1113,6 +1437,19 @@ async fn handle_key(
         return Ok(());
     }
 
+    if app.delay_check.is_some() {
+        app.poll_delay_check();
+        match key.code {
+            KeyCode::Esc if app.delay_check_finished() => app.close_delay_check(),
+            KeyCode::Enter | KeyCode::Char(' ') if app.delay_check_finished() => {
+                app.close_delay_check()
+            }
+            KeyCode::Esc => app.cancel_delay_check(),
+            _ => {}
+        }
+        return Ok(());
+    }
+
     if app.dropdown.is_some() {
         return handle_dropdown_key(paths, config, app, key).await;
     }
@@ -1131,14 +1468,17 @@ async fn handle_key(
         }
         KeyCode::Tab => app.next_page(),
         KeyCode::BackTab => app.prev_page(),
-        KeyCode::Right => app.move_right(),
-        KeyCode::Left => app.move_left(),
-        KeyCode::Down => app.move_next(config),
-        KeyCode::Up => app.move_prev(config),
+        KeyCode::Right => app.move_right(config),
+        KeyCode::Left => app.move_left(config),
+        KeyCode::Down => app.move_next(paths, config),
+        KeyCode::Up => app.move_prev(paths, config),
+        KeyCode::Char('o') | KeyCode::Char('O') => {
+            toggle_selected_main_proxy(paths, config, app).await?
+        }
         KeyCode::Enter | KeyCode::Char(' ') => submit_selection(paths, config, app).await?,
         _ => {}
     }
-    app.clamp_selection(config);
+    app.clamp_selection(paths, config);
     Ok(())
 }
 
@@ -1155,7 +1495,7 @@ async fn handle_dropdown_key(
         KeyCode::Enter | KeyCode::Char(' ') => submit_dropdown(paths, config, app).await?,
         _ => {}
     }
-    app.clamp_selection(config);
+    app.clamp_selection(paths, config);
     Ok(())
 }
 
@@ -1264,6 +1604,9 @@ async fn submit_confirm(paths: &Paths, config: &mut AppConfig, app: &mut ConfigA
                 app.should_quit = true;
             }
         }
+        ConfirmAction::DeleteSubscription => {
+            delete_selected_subscription(paths, config, app).await?;
+        }
     }
 
     Ok(())
@@ -1276,13 +1619,27 @@ async fn submit_selection(
 ) -> Result<()> {
     match app.page {
         Page::Main => {
-            app.selected_proxy_field = 0;
-            app.enter_page(
-                Page::ProxyConfig,
-                format!("Configuring {}", main_proxy_name(config, app.selected_main)),
-            );
+            if main_proxy_kind(config, app.selected_main) == MainProxyKind::AddPortProxy {
+                add_port_proxy(paths, config, app).await?;
+            } else {
+                app.selected_proxy_field = 0;
+                app.enter_page(
+                    Page::ProxyConfig,
+                    format!("Configuring {}", main_proxy_name(config, app.selected_main)),
+                );
+            }
         }
         Page::Subscription => submit_subscription_selection(paths, config, app).await?,
+        Page::SubscriptionDetail => submit_subscription_detail(paths, config, app).await?,
+        Page::SubscriptionRuleGroups => {
+            app.status = "Rule group editing uses the Proxy Groups page for now".into();
+        }
+        Page::SubscriptionProxies => {
+            test_selected_subscription_proxy(paths, config, app).await?;
+        }
+        Page::SubscriptionRules => {
+            app.status = "Rules are read-only in this view".into();
+        }
         Page::AddSubscription => submit_add_subscription_selection(paths, config, app).await?,
         Page::ProxyConfig => submit_proxy_config_item(paths, config, app).await?,
         Page::ProxyGroups => match app.proxy_pane {
@@ -1314,10 +1671,41 @@ async fn submit_subscription_selection(
     app: &mut ConfigApp,
 ) -> Result<()> {
     match selected_subscription_action(config, app) {
-        SubscriptionAction::Activate(index) => {
-            activate_subscription(paths, config, app, index).await?
+        SubscriptionAction::Open(index) => {
+            app.selected_subscription = index;
+            app.enter_page(
+                Page::SubscriptionDetail,
+                format!(
+                    "Subscription: {}",
+                    display_name(&config.subscriptions[index].name)
+                ),
+            );
         }
         SubscriptionAction::Add => begin_add_subscription(app),
+    }
+    let _ = paths;
+    Ok(())
+}
+
+async fn submit_subscription_detail(
+    paths: &Paths,
+    config: &mut AppConfig,
+    app: &mut ConfigApp,
+) -> Result<()> {
+    match app.selected_subscription_detail {
+        0 => {
+            app.status = "Overview is read-only".into();
+        }
+        1 => app.enter_page(Page::SubscriptionRuleGroups, "Subscription rule groups"),
+        2 => app.enter_page(Page::SubscriptionProxies, "Subscription proxies"),
+        3 => app.enter_page(Page::SubscriptionRules, "Subscription rules"),
+        4 => update_selected_subscription(paths, config, app).await?,
+        5 => {
+            app.status =
+                "Subscription edit is pending; delete and add can replace it for now".into()
+        }
+        6 => app.open_confirm(ConfirmAction::DeleteSubscription),
+        _ => {}
     }
     Ok(())
 }
@@ -1367,7 +1755,7 @@ async fn submit_subscription_dropdown(
         .selected_dropdown
         .min(config.subscriptions.len().saturating_sub(1));
     app.selected_subscription = index;
-    activate_subscription(paths, config, app, index).await
+    set_selected_proxy_subscription(paths, config, app, index).await
 }
 
 async fn submit_mode_dropdown(
@@ -1383,7 +1771,7 @@ async fn submit_mode_dropdown(
         .get(app.selected_mode)
         .copied()
         .unwrap_or(ModeItem::Rule);
-    set_runtime_mode(paths, config, app, mode.value()).await?;
+    set_selected_proxy_mode(paths, config, app, mode.value()).await?;
     app.status = format!("Mode={} saved", mode.label());
     Ok(())
 }
@@ -1403,7 +1791,7 @@ async fn submit_mode_selection(
         .get(app.selected_mode)
         .copied()
         .unwrap_or(ModeItem::Rule);
-    set_runtime_mode(paths, config, app, mode.value()).await?;
+    set_selected_proxy_mode(paths, config, app, mode.value()).await?;
     app.return_to_previous_or(Page::ProxyConfig, format!("Mode={} saved", mode.label()));
     Ok(())
 }
@@ -1438,13 +1826,7 @@ async fn submit_proxy_config_item(
 ) -> Result<()> {
     match app.selected_proxy_config_field() {
         ProxyConfigField::Enabled => {
-            if app.selected_main == 0 {
-                toggle_system_proxy(paths, config, app).await?;
-            } else {
-                app.status =
-                    "Enable/disable for extra port proxies is not implemented in this preview"
-                        .into();
-            }
+            toggle_selected_main_proxy(paths, config, app).await?;
         }
         ProxyConfigField::Subscription => {
             app.open_subscription_dropdown(config);
@@ -1453,16 +1835,21 @@ async fn submit_proxy_config_item(
             app.open_mode_dropdown(config);
         }
         ProxyConfigField::ProxyGroups => {
-            app.proxy_pane = ProxyPane::Groups;
-            app.enter_page(Page::ProxyGroups, "Choose a group, then choose a proxy");
+            if proxy_mode(config, app).eq_ignore_ascii_case("global") {
+                app.proxy_pane = ProxyPane::Proxies;
+                app.selected_proxy = 0;
+                app.enter_page(Page::ProxyGroups, "Choose a proxy server");
+            } else {
+                app.proxy_pane = ProxyPane::Groups;
+                app.enter_page(Page::ProxyGroups, "Choose a group, then choose a proxy");
+            }
         }
         ProxyConfigField::LocalPort => match main_proxy_kind(config, app.selected_main) {
             MainProxyKind::System => begin_mixed_port_input(config, app),
             MainProxyKind::Http => begin_http_port_input(config, app),
             MainProxyKind::Socks => begin_socks_port_input(config, app),
-            MainProxyKind::Service => {
-                app.status = "Custom listener editing is not implemented in this preview".into();
-            }
+            MainProxyKind::Service => begin_service_port_input(config, app),
+            MainProxyKind::AddPortProxy => add_port_proxy(paths, config, app).await?,
         },
         ProxyConfigField::OsProxy => toggle_system_proxy(paths, config, app).await?,
         ProxyConfigField::Pac => {
@@ -1521,6 +1908,7 @@ async fn submit_input(paths: &Paths, config: &mut AppConfig, app: &mut ConfigApp
         InputMode::Controller => {
             if !value.is_empty() {
                 config.controller.url = value;
+                config.port_allocation.auto_controller = false;
                 config.save(paths).await?;
                 app.status = "Controller saved".into();
                 app.refresh_runtime(config).await;
@@ -1529,12 +1917,22 @@ async fn submit_input(paths: &Paths, config: &mut AppConfig, app: &mut ConfigApp
             app.input_mode = InputMode::Normal;
         }
         InputMode::MixedPort => {
-            let Some(port) = parse_port_or_alert(app, &value, "mixed port") else {
+            let Some((host, port)) =
+                parse_listen_port_or_alert(app, &value, &config.proxy_host, "mixed port")
+            else {
                 return Ok(());
             };
+            config.proxy_host = host;
             config.mixed_port = port;
+            config.port_allocation.auto_mixed = false;
             config.save(paths).await?;
-            reload_current_runtime(paths, config, app, format!("Mixed port={port}")).await;
+            reload_current_runtime(
+                paths,
+                config,
+                app,
+                format!("MIX={}:{}", config.proxy_host, config.mixed_port),
+            )
+            .await;
             app.input.clear();
             app.input_mode = InputMode::Normal;
         }
@@ -1573,9 +1971,43 @@ async fn submit_input(paths: &Paths, config: &mut AppConfig, app: &mut ConfigApp
             app.input.clear();
             app.input_mode = InputMode::Normal;
         }
+        InputMode::ServicePort => {
+            let Some(service_index) = service_index_for_main_proxy(config, app.selected_main)
+            else {
+                app.input.clear();
+                app.input_mode = InputMode::Normal;
+                app.alert("Invalid Proxy", "Select a port proxy first.");
+                return Ok(());
+            };
+            let current_listen = config
+                .proxy_ports
+                .services
+                .get(service_index)
+                .map(|service| service.listen.clone())
+                .unwrap_or_else(|| "127.0.0.1".into());
+            let Some((listen_host, port)) =
+                parse_service_listen_port_or_alert(app, &value, &current_listen)
+            else {
+                return Ok(());
+            };
+            let Some(service) = config.proxy_ports.services.get_mut(service_index) else {
+                app.input.clear();
+                app.input_mode = InputMode::Normal;
+                app.alert("Invalid Proxy", "Select a port proxy first.");
+                return Ok(());
+            };
+            service.listen = listen_host;
+            service.port = port;
+            let listen = service_listen(service);
+            config.save(paths).await?;
+            app.status = format!("Port proxy={listen} saved; daemon will apply");
+            app.input.clear();
+            app.input_mode = InputMode::Normal;
+        }
         InputMode::DnsListen => {
             if !value.is_empty() {
                 config.dns.listen = value;
+                config.port_allocation.auto_dns = false;
                 save_dns_config(paths, config, app, "DNS listen saved").await?;
             }
             app.input.clear();
@@ -1655,8 +2087,8 @@ fn begin_controller_input(config: &AppConfig, app: &mut ConfigApp) {
 
 fn begin_mixed_port_input(config: &AppConfig, app: &mut ConfigApp) {
     app.input_mode = InputMode::MixedPort;
-    app.input = config.mixed_port.to_string();
-    app.status = "Edit mixed port".into();
+    app.input = format!("{}:{}", config.proxy_host, config.mixed_port);
+    app.status = "Edit mixed listen address; use 0.0.0.0:7070 for LAN".into();
 }
 
 fn begin_http_port_input(config: &AppConfig, app: &mut ConfigApp) {
@@ -1669,6 +2101,15 @@ fn begin_socks_port_input(config: &AppConfig, app: &mut ConfigApp) {
     app.input_mode = InputMode::SocksPort;
     app.input = optional_port_value(config.proxy_ports.socks);
     app.status = "Edit SOCKS port; empty/off disables it".into();
+}
+
+fn begin_service_port_input(config: &AppConfig, app: &mut ConfigApp) {
+    app.input_mode = InputMode::ServicePort;
+    app.input = service_index_for_main_proxy(config, app.selected_main)
+        .and_then(|index| config.proxy_ports.services.get(index))
+        .map(service_listen)
+        .unwrap_or_else(|| "auto".into());
+    app.status = "Edit port proxy listen address; empty/auto uses allocator".into();
 }
 
 fn begin_dns_listen_input(config: &AppConfig, app: &mut ConfigApp) {
@@ -1733,6 +2174,74 @@ async fn toggle_system_proxy(
     config.system_proxy.enabled = !config.system_proxy.enabled;
     config.save(paths).await?;
     app.status = format!("System proxy={}", on_off(config.system_proxy.enabled));
+    Ok(())
+}
+
+async fn toggle_selected_main_proxy(
+    paths: &Paths,
+    config: &mut AppConfig,
+    app: &mut ConfigApp,
+) -> Result<()> {
+    if app.page != Page::Main && app.page != Page::ProxyConfig {
+        app.status = "Quick toggle is available on Main and proxy config pages".into();
+        return Ok(());
+    }
+
+    match main_proxy_kind(config, app.selected_main) {
+        MainProxyKind::System => toggle_system_proxy(paths, config, app).await?,
+        MainProxyKind::Http => {
+            config.proxy_ports.http = None;
+            config.save(paths).await?;
+            app.status = "HTTP port=off".into();
+        }
+        MainProxyKind::Socks => {
+            config.proxy_ports.socks = None;
+            config.save(paths).await?;
+            app.status = "SOCKS port=off".into();
+        }
+        MainProxyKind::Service => {
+            let Some(service_index) = service_index_for_main_proxy(config, app.selected_main)
+            else {
+                app.alert("Invalid Proxy", "Select a port proxy first.");
+                return Ok(());
+            };
+            let Some(service) = config.proxy_ports.services.get_mut(service_index) else {
+                app.alert("Invalid Proxy", "Select a port proxy first.");
+                return Ok(());
+            };
+            service.enabled = !service.enabled;
+            let enabled = service.enabled;
+            let name = service_name(service);
+            config.save(paths).await?;
+            app.status = format!("{name}={}", on_off(enabled));
+        }
+        MainProxyKind::AddPortProxy => {
+            app.status = "Press Enter to add a port proxy".into();
+        }
+    }
+
+    app.clamp_selection(paths, config);
+    Ok(())
+}
+
+async fn add_port_proxy(paths: &Paths, config: &mut AppConfig, app: &mut ConfigApp) -> Result<()> {
+    let service_index = config.proxy_ports.services.len();
+    let service = PortProxyService {
+        name: format!("Port Proxy {}", service_index + 1),
+        port: next_port_proxy_port(config),
+        subscription: config.active_profile.clone(),
+        mode: "global".into(),
+        ..PortProxyService::default()
+    };
+    config.proxy_ports.services.push(service);
+    config.save(paths).await?;
+
+    app.selected_main = main_proxy_index_for_service(config, service_index).unwrap_or(0);
+    app.selected_proxy_field = 0;
+    app.enter_page(
+        Page::ProxyConfig,
+        format!("Added {}", main_proxy_name(config, app.selected_main)),
+    );
     Ok(())
 }
 
@@ -1812,6 +2321,9 @@ async fn add_subscription(
         url,
         refresh,
         updated_at: None,
+        last_error: None,
+        user_info: Default::default(),
+        rule_selections: Default::default(),
     });
     config.active_profile = Some(name.clone());
     app.selected_subscription = config.subscriptions.len() - 1;
@@ -1819,7 +2331,8 @@ async fn add_subscription(
     app.input_mode = InputMode::Normal;
     app.subscription_form.clear();
 
-    match subscription::update(paths, config, app.selected_subscription).await {
+    match subscription::update_preserving_last_good(paths, config, app.selected_subscription).await
+    {
         Ok(path) => {
             app.status = format!(
                 "Added {}; downloaded {}",
@@ -1855,11 +2368,211 @@ async fn activate_subscription(
     Ok(())
 }
 
+async fn update_selected_subscription(
+    paths: &Paths,
+    config: &mut AppConfig,
+    app: &mut ConfigApp,
+) -> Result<()> {
+    let index = app.selected_subscription;
+    let Some(sub) = config.subscriptions.get(index) else {
+        app.alert("No Subscription", "Select a subscription first.");
+        return Ok(());
+    };
+    let name = sub.name.clone();
+
+    match subscription::update_preserving_last_good(paths, config, index).await {
+        Ok(path) => {
+            config.save(paths).await?;
+            app.status = format!(
+                "Updated {}; profile={}",
+                display_name(&name),
+                path.display()
+            );
+        }
+        Err(err) => {
+            config.save(paths).await?;
+            app.status = format!(
+                "Update failed for {}; last good kept: {err}",
+                display_name(&name)
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn delete_selected_subscription(
+    paths: &Paths,
+    config: &mut AppConfig,
+    app: &mut ConfigApp,
+) -> Result<()> {
+    let index = app.selected_subscription;
+    if index >= config.subscriptions.len() {
+        app.alert("No Subscription", "Select a subscription first.");
+        return Ok(());
+    }
+
+    let removed = config.subscriptions.remove(index);
+    let profile = subscription::profile_path(paths, &removed);
+    let mut status = format!("Deleted {}", display_name(&removed.name));
+    if let Err(err) = tokio::fs::remove_file(&profile).await
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        status = format!("{status}; profile removal failed: {err}");
+    }
+
+    if config.active_profile.as_ref() == Some(&removed.name) {
+        config.active_profile = config
+            .subscriptions
+            .first()
+            .map(|subscription| subscription.name.clone());
+    }
+    app.selected_subscription = app
+        .selected_subscription
+        .min(subscription_menu_count(config).saturating_sub(1));
+    app.selected_subscription_detail = 0;
+    config.save(paths).await?;
+
+    app.return_to_previous_or(Page::Subscription, status);
+    Ok(())
+}
+
+async fn test_selected_subscription_proxy(
+    paths: &Paths,
+    config: &mut AppConfig,
+    app: &mut ConfigApp,
+) -> Result<()> {
+    if !ensure_selected_subscription_loaded_for_check(paths, config, app).await? {
+        return Ok(());
+    };
+    let Some(subscription) = selected_subscription(config, app).cloned() else {
+        app.alert("No Subscription", "Select a subscription first.");
+        return Ok(());
+    };
+
+    let proxies = subscription_proxy_names_for_view(paths, config, app);
+    if app.selected_subscription_proxy >= proxies.len() {
+        test_all_subscription_proxies(paths, config, app).await?;
+        return Ok(());
+    }
+    let Some(proxy) = proxies.get(app.selected_subscription_proxy) else {
+        app.alert("No Proxy", "No proxy node selected.");
+        return Ok(());
+    };
+    let Some(client) = runtime_mihomo_client(paths, config, app).await else {
+        return Ok(());
+    };
+    match client
+        .proxy_delay(proxy, DEFAULT_DELAY_TEST_URL, DEFAULT_DELAY_TEST_TIMEOUT_MS)
+        .await
+    {
+        Ok(delay) => {
+            app.proxy_delays.insert(
+                subscription_proxy_delay_key(&subscription, proxy),
+                format!("{delay}ms"),
+            );
+            app.status = format!("{} {}ms", display_name(proxy), delay);
+        }
+        Err(err) => {
+            app.proxy_delays.insert(
+                subscription_proxy_delay_key(&subscription, proxy),
+                "fail".into(),
+            );
+            app.status = format!("{} check failed: {err}", display_name(proxy));
+        }
+    }
+    Ok(())
+}
+
+async fn test_all_subscription_proxies(
+    paths: &Paths,
+    config: &mut AppConfig,
+    app: &mut ConfigApp,
+) -> Result<()> {
+    if !ensure_selected_subscription_loaded_for_check(paths, config, app).await? {
+        return Ok(());
+    }
+    let Some(subscription) = selected_subscription(config, app).cloned() else {
+        app.alert("No Subscription", "Select a subscription first.");
+        return Ok(());
+    };
+    let proxies = subscription_proxy_names_for_view(paths, config, app);
+    if proxies.is_empty() {
+        app.status = "No proxies to check".into();
+        return Ok(());
+    }
+    let Some(client) = runtime_mihomo_client(paths, config, app).await else {
+        return Ok(());
+    };
+    app.start_delay_check(subscription.name, client, proxies);
+    Ok(())
+}
+
+async fn run_delay_check_task(
+    sender: mpsc::Sender<DelayCheckEvent>,
+    subscription_name: String,
+    client: MihomoClient,
+    proxies: Vec<String>,
+) {
+    for (index, proxy) in proxies.into_iter().enumerate() {
+        if sender
+            .send(DelayCheckEvent::Checking {
+                index: index + 1,
+                proxy: proxy.clone(),
+            })
+            .is_err()
+        {
+            return;
+        }
+
+        let delay = client
+            .proxy_delay(
+                &proxy,
+                DEFAULT_DELAY_TEST_URL,
+                DEFAULT_DELAY_TEST_TIMEOUT_MS,
+            )
+            .await
+            .map_err(|err| err.to_string());
+        if sender
+            .send(DelayCheckEvent::ProxyFinished {
+                subscription_name: subscription_name.clone(),
+                proxy,
+                delay,
+            })
+            .is_err()
+        {
+            return;
+        }
+    }
+
+    let _ = sender.send(DelayCheckEvent::Finished);
+}
+
+async fn ensure_selected_subscription_loaded_for_check(
+    paths: &Paths,
+    config: &mut AppConfig,
+    app: &mut ConfigApp,
+) -> Result<bool> {
+    let Some(subscription) = selected_subscription(config, app).cloned() else {
+        app.alert("No Subscription", "Select a subscription first.");
+        return Ok(false);
+    };
+
+    if !is_selected_subscription_active(config, &subscription) {
+        config.active_profile = Some(subscription.name.clone());
+        config.save(paths).await?;
+        load_selected_profile(paths, config, app).await;
+    }
+
+    Ok(true)
+}
+
 async fn load_selected_profile(paths: &Paths, config: &AppConfig, app: &mut ConfigApp) {
     let Some(sub) = config.subscriptions.get(app.selected_subscription) else {
         return;
     };
-    let client = MihomoClient::new(&config.controller);
+    let Some(client) = runtime_mihomo_client(paths, config, app).await else {
+        return;
+    };
     let path = match runtime_profile::write_active_config(paths, config, sub).await {
         Ok(path) => path,
         Err(err) => {
@@ -1885,7 +2598,9 @@ async fn reload_current_runtime(
     app: &mut ConfigApp,
     success: String,
 ) -> bool {
-    let client = MihomoClient::new(&config.controller);
+    let Some(client) = runtime_mihomo_client(paths, config, app).await else {
+        return false;
+    };
     let path = match runtime_profile::write_current_config(paths, config).await {
         Ok(path) => path,
         Err(err) => {
@@ -1907,6 +2622,55 @@ async fn reload_current_runtime(
     }
 }
 
+async fn writable_mihomo_client(
+    paths: &Paths,
+    config: &AppConfig,
+    app: &mut ConfigApp,
+) -> Option<MihomoClient> {
+    let client = MihomoClient::new(&config.controller);
+    match core::ensure_controller_is_owned(paths, config, &client).await {
+        Ok(()) => Some(client),
+        Err(err) => {
+            app.status = format!("Runtime write blocked: {err}");
+            app.alert(
+                "External Mihomo",
+                "This controller is not owned by clashtui.",
+            );
+            None
+        }
+    }
+}
+
+async fn runtime_mihomo_client(
+    paths: &Paths,
+    config: &AppConfig,
+    app: &mut ConfigApp,
+) -> Option<MihomoClient> {
+    let client = writable_mihomo_client(paths, config, app).await?;
+    if client.version().await.is_ok() {
+        return Some(client);
+    }
+
+    if let Err(err) = core::ensure_running(paths, config).await {
+        app.status = format!("Mihomo start failed: {err:#}");
+        app.alert(
+            "Mihomo Offline",
+            "Set core_path or install mihomo, then retry.",
+        );
+        return None;
+    }
+
+    for _ in 0..RUNTIME_START_RETRIES {
+        if client.version().await.is_ok() {
+            return Some(client);
+        }
+        sleep(RUNTIME_START_WAIT).await;
+    }
+
+    app.status = "Mihomo runtime did not become ready".into();
+    None
+}
+
 async fn set_runtime_mode(
     paths: &Paths,
     config: &mut AppConfig,
@@ -1915,7 +2679,10 @@ async fn set_runtime_mode(
 ) -> Result<()> {
     config.runtime_mode = mode.to_string();
     config.save(paths).await?;
-    let client = MihomoClient::new(&config.controller);
+    let Some(client) = runtime_mihomo_client(paths, config, app).await else {
+        app.status = format!("Mode={mode} saved; runtime not patched");
+        return Ok(());
+    };
     match client.set_mode(mode).await {
         Ok(()) => {
             app.status = format!("Mode={mode} saved");
@@ -1926,31 +2693,138 @@ async fn set_runtime_mode(
     Ok(())
 }
 
-async fn select_proxy(paths: &Paths, config: &mut AppConfig, app: &mut ConfigApp) -> Result<()> {
-    let Some(group) = app.current_group() else {
-        app.status = "No proxy group selected".into();
-        return Ok(());
-    };
-    let Some(proxy) = group.all.get(app.selected_proxy) else {
-        app.status = "No proxy selected".into();
-        return Ok(());
-    };
+async fn set_selected_proxy_mode(
+    paths: &Paths,
+    config: &mut AppConfig,
+    app: &mut ConfigApp,
+    mode: &str,
+) -> Result<()> {
+    match main_proxy_kind(config, app.selected_main) {
+        MainProxyKind::System => set_runtime_mode(paths, config, app, mode).await,
+        MainProxyKind::Service => {
+            let Some(service_index) = service_index_for_main_proxy(config, app.selected_main)
+            else {
+                app.alert("Invalid Proxy", "Select a port proxy first.");
+                return Ok(());
+            };
+            let Some(service) = config.proxy_ports.services.get_mut(service_index) else {
+                app.alert("Invalid Proxy", "Select a port proxy first.");
+                return Ok(());
+            };
+            service.mode = mode.to_string();
+            config.save(paths).await?;
+            app.status = format!("Mode={mode} saved; daemon will apply");
+            Ok(())
+        }
+        MainProxyKind::Http | MainProxyKind::Socks => {
+            set_runtime_mode(paths, config, app, mode).await
+        }
+        MainProxyKind::AddPortProxy => Ok(()),
+    }
+}
 
-    let group_name = group.name.clone();
-    let proxy_name = proxy.clone();
-    config
-        .proxy_selections
-        .insert(group_name.clone(), proxy_name.clone());
+async fn set_selected_proxy_subscription(
+    paths: &Paths,
+    config: &mut AppConfig,
+    app: &mut ConfigApp,
+    index: usize,
+) -> Result<()> {
+    match main_proxy_kind(config, app.selected_main) {
+        MainProxyKind::System | MainProxyKind::Http | MainProxyKind::Socks => {
+            activate_subscription(paths, config, app, index).await
+        }
+        MainProxyKind::Service => {
+            let name = config.subscriptions[index].name.clone();
+            let Some(service_index) = service_index_for_main_proxy(config, app.selected_main)
+            else {
+                app.alert("Invalid Proxy", "Select a port proxy first.");
+                return Ok(());
+            };
+            let Some(service) = config.proxy_ports.services.get_mut(service_index) else {
+                app.alert("Invalid Proxy", "Select a port proxy first.");
+                return Ok(());
+            };
+            service.subscription = Some(name.clone());
+            config.save(paths).await?;
+            app.status = format!("Subscription={}", display_name(&name));
+            Ok(())
+        }
+        MainProxyKind::AddPortProxy => Ok(()),
+    }
+}
+
+async fn select_proxy(paths: &Paths, config: &mut AppConfig, app: &mut ConfigApp) -> Result<()> {
+    let mode = proxy_mode(config, app).to_string();
+    let (group_name, proxy_name) = if mode.eq_ignore_ascii_case("global") {
+        let proxies = route_proxy_names(paths, config, app);
+        let Some(proxy) = proxies.get(app.selected_proxy) else {
+            app.status = "No proxy selected".into();
+            return Ok(());
+        };
+        ("GLOBAL".to_string(), proxy.clone())
+    } else {
+        let Some(group) = app.current_group() else {
+            app.status = "No proxy group selected".into();
+            return Ok(());
+        };
+        let Some(proxy) = group.all.get(app.selected_proxy) else {
+            app.status = "No proxy selected".into();
+            return Ok(());
+        };
+        (group.name.clone(), proxy.clone())
+    };
+    let selection_scope = save_selected_proxy_choice(config, app, &mode, &group_name, &proxy_name);
     config.save(paths).await?;
-    let client = MihomoClient::new(&config.controller);
-    match client.select_proxy(&group_name, &proxy_name).await {
+    if matches!(
+        main_proxy_kind(config, app.selected_main),
+        MainProxyKind::Service
+    ) {
+        app.status = format!(
+            "{} saved ({selection_scope}); daemon will apply",
+            display_name(&proxy_name)
+        );
+        return Ok(());
+    }
+    let Some(client) = runtime_mihomo_client(paths, config, app).await else {
+        app.status = format!(
+            "{} -> {} saved; runtime not patched",
+            display_name(&group_name),
+            display_name(&proxy_name)
+        );
+        return Ok(());
+    };
+    let runtime_group = if mode.eq_ignore_ascii_case("global") {
+        "GLOBAL"
+    } else {
+        group_name.as_str()
+    };
+    match client.select_proxy(runtime_group, &proxy_name).await {
         Ok(()) => {
             app.status = format!(
-                "{} -> {} saved",
-                display_name(&group_name),
+                "{} -> {} saved ({selection_scope})",
+                display_name(runtime_group),
                 display_name(&proxy_name)
             );
             app.refresh_runtime(config).await;
+        }
+        Err(err) if runtime_group == "GLOBAL" => {
+            let fallback_group =
+                runtime_group_for_proxy(app, &proxy_name).unwrap_or_else(|| group_name.clone());
+            match client.select_proxy(&fallback_group, &proxy_name).await {
+                Ok(()) => {
+                    app.status = format!(
+                        "{} -> {} saved ({selection_scope})",
+                        display_name(&fallback_group),
+                        display_name(&proxy_name)
+                    );
+                    app.refresh_runtime(config).await;
+                }
+                Err(fallback_err) => {
+                    app.status = format!(
+                        "Proxy selection saved; runtime patch failed: {err}; fallback failed: {fallback_err}"
+                    );
+                }
+            }
         }
         Err(err) => app.status = format!("Proxy selection saved; runtime patch failed: {err}"),
     }
@@ -1984,6 +2858,9 @@ fn draw(frame: &mut Frame, paths: &Paths, config: &AppConfig, app: &ConfigApp) {
     }
     if app.alert.is_some() {
         draw_alert(frame, app);
+    }
+    if app.delay_check.is_some() {
+        draw_delay_check(frame, app);
     }
 }
 
@@ -2056,7 +2933,9 @@ fn draw_settings(
         )),
     ];
 
-    for (index, row) in rows.iter().enumerate() {
+    let visible_rows = area.height.saturating_sub(2) as usize;
+    let start = visible_window_start(selected, rows.len(), visible_rows);
+    for (index, row) in rows.iter().enumerate().skip(start).take(visible_rows) {
         let submenu = matches!(row.kind, RowKind::Submenu(_));
         let prefix = if submenu { "> " } else { "  " };
         let text = fit_width(
@@ -2072,7 +2951,7 @@ fn draw_settings(
 
 fn draw_main_settings(
     frame: &mut Frame,
-    paths: &Paths,
+    _paths: &Paths,
     config: &AppConfig,
     app: &ConfigApp,
     area: Rect,
@@ -2091,27 +2970,42 @@ fn draw_main_settings(
         )),
     ];
 
-    let runtime_line = proxy_runtime_line(app);
     for (index, row) in rows.iter().enumerate() {
         let selected_row = index == selected;
-        let first = fit_width(
-            &format!("> {:<14} {:<7} {}", row.name, row.status, row.listen),
-            content_width,
-        );
+        let first = if row.action {
+            fit_width(&format!("  {}", row.name), content_width)
+        } else {
+            fit_width(
+                &format!(
+                    "> {:<3} {}={}  {}",
+                    on_off_upper(row.enabled),
+                    row.listener,
+                    row.listen,
+                    row.name
+                ),
+                content_width,
+            )
+        };
+        let normal_style = if row.action {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::Cyan)
+        };
         lines.push(with_padding(Line::from(Span::styled(
             first,
             if selected_row {
                 selected_style()
             } else {
-                Style::default().fg(Color::Cyan)
+                normal_style
             },
         ))));
 
+        if row.action {
+            continue;
+        }
+
         let second = fit_width(
-            &format!(
-                "  mode={:<8} sub={} {}",
-                row.mode, row.subscription, row.features
-            ),
+            &format!("  {}", main_proxy_settings_line(config, row)),
             content_width,
         );
         lines.push(with_padding(Line::from(Span::styled(
@@ -2119,10 +3013,7 @@ fn draw_main_settings(
             Style::default().fg(Color::Gray),
         ))));
 
-        let third = fit_width(
-            &format!("  {}  workdir={}", runtime_line, paths.config_dir.display()),
-            content_width,
-        );
+        let third = fit_width(&format!("  {}", proxy_runtime_line(app)), content_width);
         lines.push(with_padding(Line::from(Span::styled(
             third,
             Style::default().fg(Color::DarkGray),
@@ -2133,7 +3024,7 @@ fn draw_main_settings(
 }
 
 fn draw_help(frame: &mut Frame, paths: &Paths, config: &AppConfig, app: &ConfigApp, area: Rect) {
-    const HOTKEY_ROWS: u16 = 6;
+    const HOTKEY_ROWS: u16 = 7;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(6), Constraint::Length(HOTKEY_ROWS)])
@@ -2152,15 +3043,37 @@ fn draw_help(frame: &mut Frame, paths: &Paths, config: &AppConfig, app: &ConfigA
 
     if app.page == Page::Main {
         let row = main_proxy_row(config, app.selected_main);
-        lines.extend([
-            Line::from(Span::styled(row.name, Style::default().fg(Color::Cyan))),
-            Line::from(""),
-            Line::from(format!("Listen: {}", row.listen)),
-            Line::from(format!("Mode: {}", row.mode)),
-            Line::from(format!("Subscription: {}", row.subscription)),
-            Line::from(row.features),
-            Line::from(proxy_runtime_line(app)),
-        ]);
+        if row.action {
+            lines.extend([
+                Line::from(Span::styled(row.name, Style::default().fg(Color::Cyan))),
+                Line::from(""),
+                Line::from("Action: add port proxy"),
+                Line::from("Kind: mixed"),
+                Line::from("Port: auto"),
+                Line::from("Enter: create and edit"),
+            ]);
+        } else {
+            lines.extend([
+                Line::from(Span::styled(row.name, Style::default().fg(Color::Cyan))),
+                Line::from(""),
+                Line::from(format!("Kind: {}", row.kind)),
+                Line::from(format!("State: {}", on_off_upper(row.enabled))),
+                Line::from(format!("Listener: {}={}", row.listener, row.listen)),
+                Line::from(format!("Port: {}", row.port)),
+                Line::from(format!("Mode: {}", row.mode)),
+                Line::from(format!("Subscription: {}", row.subscription)),
+                Line::from(format!("Config: {}", row.features)),
+                Line::from(format!(
+                    "Traffic: {}",
+                    traffic_speed_summary(app.runtime.traffic.as_ref())
+                )),
+                Line::from(format!(
+                    "Total: {}",
+                    traffic_total_summary(app.runtime.traffic.as_ref())
+                )),
+                Line::from(format!("IP: {}", ip_info_summary(app))),
+            ]);
+        }
     } else if let Some(row) = row {
         lines.extend([
             Line::from(Span::styled(
@@ -2186,6 +3099,7 @@ fn draw_help(frame: &mut Frame, paths: &Paths, config: &AppConfig, app: &ConfigA
         )),
         Line::from("↑↓ select"),
         Line::from("Enter open/edit page"),
+        Line::from("O quick on/off"),
         Line::from("Esc back one page"),
         Line::from("←→/Tab switch section"),
         Line::from("F10 save & restart"),
@@ -2196,24 +3110,32 @@ fn draw_help(frame: &mut Frame, paths: &Paths, config: &AppConfig, app: &ConfigA
     );
 }
 
-fn setting_rows(_paths: &Paths, config: &AppConfig, app: &ConfigApp) -> Vec<SettingRow> {
+fn setting_rows(paths: &Paths, config: &AppConfig, app: &ConfigApp) -> Vec<SettingRow> {
     match app.page {
         Page::Main => main_proxy_rows(config)
             .into_iter()
             .map(|row| SettingRow {
                 label: row.name,
-                value: row.listen,
+                value: if row.action { String::new() } else { row.port },
                 help: row.features,
-                kind: RowKind::Submenu(Page::ProxyConfig),
+                kind: if row.action {
+                    RowKind::Action(ActionKind::AddPortProxy)
+                } else {
+                    RowKind::Submenu(Page::ProxyConfig)
+                },
             })
             .collect(),
         Page::Subscription => subscription_rows(config),
+        Page::SubscriptionDetail => subscription_detail_rows(paths, config, app),
+        Page::SubscriptionRuleGroups => subscription_rule_group_rows(config, app),
+        Page::SubscriptionProxies => subscription_proxy_rows(paths, config, app),
+        Page::SubscriptionRules => subscription_rule_rows(paths, config, app),
         Page::AddSubscription => add_subscription_rows(app),
         Page::Runtime => runtime_rows(config, app),
         Page::Chat => chat_rows(config, app),
         Page::Help => help_rows(),
         Page::ProxyConfig => proxy_config_rows(config, app),
-        Page::ProxyGroups => proxy_group_rows(app),
+        Page::ProxyGroups => proxy_group_rows(paths, config, app),
         Page::Mode => mode_rows(config, app),
         Page::Dns => dns_rows(config),
     }
@@ -2223,35 +3145,242 @@ fn subscription_rows(config: &AppConfig) -> Vec<SettingRow> {
     let mut rows = config
         .subscriptions
         .iter()
-        .map(|subscription| {
-            let active = config.active_profile.as_ref() == Some(&subscription.name);
-            SettingRow {
-                label: if active {
-                    format!("* {}", display_name(&subscription.name))
-                } else {
-                    display_name(&subscription.name)
-                },
-                value: format!(
-                    "{}  updated={}",
-                    subscription_refresh_label(subscription.refresh),
-                    subscription.updated_at.as_deref().unwrap_or("-")
-                ),
-                help: format!(
-                    "Enter activates this subscription. URL: {}",
-                    subscription.url
-                ),
-                kind: RowKind::Action(ActionKind::RefreshRuntime),
-            }
+        .map(|subscription| SettingRow {
+            label: display_name(&subscription.name),
+            value: subscription_usage_summary(subscription),
+            help: subscription_list_help(subscription),
+            kind: RowKind::Submenu(Page::SubscriptionDetail),
         })
         .collect::<Vec<_>>();
 
     rows.push(SettingRow {
         label: "Add Subscription".into(),
-        value: "page".into(),
+        value: String::new(),
         help: "Open a child page for name, URL, refresh interval, and OK.".into(),
-        kind: RowKind::Submenu(Page::AddSubscription),
+        kind: RowKind::Action(ActionKind::AddSubscription),
     });
     rows
+}
+
+fn subscription_detail_rows(paths: &Paths, config: &AppConfig, app: &ConfigApp) -> Vec<SettingRow> {
+    let Some(subscription) = selected_subscription(config, app) else {
+        return vec![SettingRow {
+            label: "No Subscription".into(),
+            value: "-".into(),
+            help: "Go back and add a subscription first.".into(),
+            kind: RowKind::Info,
+        }];
+    };
+    let profile = subscription::profile_path(paths, subscription);
+    let summary = subscription_profile_summary(paths, subscription);
+    vec![
+        SettingRow {
+            label: "Overview".into(),
+            value: format!(
+                "{}  {}",
+                subscription_usage_summary(subscription),
+                summary.short_counts()
+            ),
+            help: format!(
+                "URL: {} | profile: {} | updated: {}",
+                subscription.url,
+                profile.display(),
+                subscription.updated_at.as_deref().unwrap_or("-")
+            ),
+            kind: RowKind::Info,
+        },
+        SettingRow {
+            label: "Rule Groups".into(),
+            value: format!(
+                "{} saved / {} runtime",
+                subscription.rule_selections.len(),
+                app.runtime.groups.len()
+            ),
+            help: "Rule-mode group selections belong to the subscription, so multiple proxies can share them.".into(),
+            kind: RowKind::Submenu(Page::SubscriptionRuleGroups),
+        },
+        SettingRow {
+            label: "Proxies".into(),
+            value: format!("{} nodes", summary.proxies),
+            help: "Inspect proxy nodes from the local subscription profile; delay testing uses mihomo runtime.".into(),
+            kind: RowKind::Submenu(Page::SubscriptionProxies),
+        },
+        SettingRow {
+            label: "Rules".into(),
+            value: summary.rules_value(),
+            help: "Read-only overview of rules and providers in the local subscription profile.".into(),
+            kind: RowKind::Submenu(Page::SubscriptionRules),
+        },
+        SettingRow {
+            label: "Update Now".into(),
+            value: subscription.updated_at.as_deref().unwrap_or("never").to_string(),
+            help: "Refresh from URL. Failure records last_error and keeps the existing profile file.".into(),
+            kind: RowKind::Action(ActionKind::UpdateSubscription),
+        },
+        SettingRow {
+            label: "Edit".into(),
+            value: "pending".into(),
+            help: "Edit name, URL, and refresh cadence. This will reuse the Add Subscription form model.".into(),
+            kind: RowKind::Action(ActionKind::EditSubscription),
+        },
+        SettingRow {
+            label: "Delete".into(),
+            value: "confirm".into(),
+            help: "Delete this subscription and its local profile file after confirmation.".into(),
+            kind: RowKind::Action(ActionKind::DeleteSubscription),
+        },
+    ]
+}
+
+fn subscription_rule_group_rows(config: &AppConfig, app: &ConfigApp) -> Vec<SettingRow> {
+    let Some(subscription) = selected_subscription(config, app) else {
+        return empty_rows("No Subscription", "Go back and add a subscription first.");
+    };
+
+    if !is_selected_subscription_active(config, subscription) {
+        if subscription.rule_selections.is_empty() {
+            return vec![SettingRow {
+                label: "Runtime View".into(),
+                value: "inactive".into(),
+                help:
+                    "Load this subscription through Proxy settings to inspect runtime rule groups."
+                        .into(),
+                kind: RowKind::Info,
+            }];
+        }
+        return subscription_rule_selection_rows(subscription);
+    }
+
+    if app.runtime.groups.is_empty() && subscription.rule_selections.is_empty() {
+        return empty_rows(
+            "No Groups",
+            "Start mihomo and refresh runtime, or update this subscription profile first.",
+        );
+    }
+
+    if app.runtime.groups.is_empty() {
+        return subscription_rule_selection_rows(subscription);
+    }
+
+    app.runtime
+        .groups
+        .iter()
+        .map(|group| {
+            let saved = subscription
+                .rule_selections
+                .get(&group.name)
+                .map_or_else(|| display_name(&group.now), |value| display_name(value));
+            SettingRow {
+                label: display_name(&group.name),
+                value: format!("{} -> {}", group.kind, saved),
+                help: "Rule mode uses this subscription-level group choice. Select concrete nodes from Proxy Groups.".into(),
+                kind: RowKind::Info,
+            }
+        })
+        .collect()
+}
+
+fn subscription_rule_selection_rows(subscription: &Subscription) -> Vec<SettingRow> {
+    subscription
+        .rule_selections
+        .iter()
+        .map(|(group, proxy)| SettingRow {
+            label: display_name(group),
+            value: display_name(proxy),
+            help: "Saved subscription-level rule-mode selection.".into(),
+            kind: RowKind::Info,
+        })
+        .collect()
+}
+
+fn subscription_proxy_rows(paths: &Paths, config: &AppConfig, app: &ConfigApp) -> Vec<SettingRow> {
+    let Some(subscription) = selected_subscription(config, app) else {
+        return empty_rows("No Subscription", "Go back and add a subscription first.");
+    };
+    let proxies = subscription_proxy_names_for_view(paths, config, app);
+    if proxies.is_empty() {
+        return empty_rows(
+            "No Proxies",
+            "No proxy nodes found in the local subscription profile.",
+        );
+    }
+
+    let mut rows = proxies
+        .into_iter()
+        .map(|proxy| SettingRow {
+            value: app
+                .proxy_delays
+                .get(&subscription_proxy_delay_key(subscription, &proxy))
+                .cloned()
+                .unwrap_or_else(|| {
+                    if is_selected_subscription_active(config, subscription) {
+                        "Check".into()
+                    } else {
+                        "profile".into()
+                    }
+                }),
+            label: display_name(&proxy),
+            help: if is_selected_subscription_active(config, subscription) {
+                "Runs mihomo /proxies/{name}/delay against the default generate_204 URL.".into()
+            } else {
+                "Loaded from the local subscription profile. Select this subscription and start runtime before testing delay.".into()
+            },
+            kind: RowKind::Action(ActionKind::TestProxyDelay),
+        })
+        .collect::<Vec<_>>();
+
+    rows.push(SettingRow {
+        label: "Check All".into(),
+        value: format!("{} nodes", rows.len()),
+        help: "Run delay checks for every proxy in this subscription.".into(),
+        kind: RowKind::Action(ActionKind::TestProxyDelay),
+    });
+    rows
+}
+
+fn subscription_rule_rows(paths: &Paths, config: &AppConfig, app: &ConfigApp) -> Vec<SettingRow> {
+    let Some(subscription) = selected_subscription(config, app) else {
+        return empty_rows("No Subscription", "Go back and add a subscription first.");
+    };
+    let summary = subscription_profile_summary(paths, subscription);
+    vec![
+        SettingRow {
+            label: "Rules".into(),
+            value: summary.rules.to_string(),
+            help: "Number of rules in the local subscription profile.".into(),
+            kind: RowKind::Info,
+        },
+        SettingRow {
+            label: "Rule Providers".into(),
+            value: summary.rule_providers.to_string(),
+            help: "Number of rule providers in the local profile.".into(),
+            kind: RowKind::Info,
+        },
+        SettingRow {
+            label: "Proxy Groups".into(),
+            value: summary.proxy_groups.to_string(),
+            help: "Number of proxy groups owned by the subscription profile.".into(),
+            kind: RowKind::Info,
+        },
+        SettingRow {
+            label: "Raw Proxies".into(),
+            value: summary.proxies.to_string(),
+            help: "Number of concrete proxy entries in the subscription profile.".into(),
+            kind: RowKind::Info,
+        },
+        SettingRow {
+            label: "Profile".into(),
+            value: if summary.exists {
+                "local".into()
+            } else {
+                "missing".into()
+            },
+            help: subscription::profile_path(paths, subscription)
+                .display()
+                .to_string(),
+            kind: RowKind::Info,
+        },
+    ]
 }
 
 fn add_subscription_rows(app: &ConfigApp) -> Vec<SettingRow> {
@@ -2292,7 +3421,7 @@ fn proxy_config_rows(config: &AppConfig, app: &ConfigApp) -> Vec<SettingRow> {
                     if app.selected_main == 0 {
                         RowKind::Toggle(ToggleAction::SystemProxy)
                     } else {
-                        RowKind::Info
+                        RowKind::Toggle(ToggleAction::PortProxy)
                     }
                 }
                 ProxyConfigField::Subscription => RowKind::Choice(ChoiceAction::Subscription),
@@ -2302,7 +3431,8 @@ fn proxy_config_rows(config: &AppConfig, app: &ConfigApp) -> Vec<SettingRow> {
                     MainProxyKind::System => RowKind::Input(InputMode::MixedPort),
                     MainProxyKind::Http => RowKind::Input(InputMode::HttpPort),
                     MainProxyKind::Socks => RowKind::Input(InputMode::SocksPort),
-                    MainProxyKind::Service => RowKind::Info,
+                    MainProxyKind::Service => RowKind::Input(InputMode::ServicePort),
+                    MainProxyKind::AddPortProxy => RowKind::Action(ActionKind::AddPortProxy),
                 },
                 ProxyConfigField::OsProxy => RowKind::Toggle(ToggleAction::SystemProxy),
                 ProxyConfigField::Pac => RowKind::Info,
@@ -2319,7 +3449,31 @@ fn proxy_config_rows(config: &AppConfig, app: &ConfigApp) -> Vec<SettingRow> {
         .collect()
 }
 
-fn proxy_group_rows(app: &ConfigApp) -> Vec<SettingRow> {
+fn proxy_group_rows(paths: &Paths, config: &AppConfig, app: &ConfigApp) -> Vec<SettingRow> {
+    if proxy_groups_page_is_global_proxy_list(config, app) {
+        let proxies = route_proxy_names(paths, config, app);
+        if proxies.is_empty() {
+            return empty_rows(
+                "No Proxies",
+                "Update the selected subscription or start runtime before choosing a proxy.",
+            );
+        }
+        let saved = selected_global_proxy(config, app);
+        return proxies
+            .into_iter()
+            .map(|proxy| SettingRow {
+                label: display_name(&proxy),
+                value: if saved.as_deref() == Some(proxy.as_str()) {
+                    "selected".into()
+                } else {
+                    "select".into()
+                },
+                help: "Enter saves this proxy for global mode.".into(),
+                kind: RowKind::Action(ActionKind::SelectProxy),
+            })
+            .collect();
+    }
+
     match app.proxy_pane {
         ProxyPane::Groups => {
             if app.runtime.groups.is_empty() {
@@ -2463,11 +3617,12 @@ fn help_rows() -> Vec<SettingRow> {
 }
 
 fn mode_rows(config: &AppConfig, app: &ConfigApp) -> Vec<SettingRow> {
+    let saved_mode = proxy_mode(config, app);
     ModeItem::ALL
         .iter()
         .map(|mode| SettingRow {
             label: mode.label().into(),
-            value: if mode.value() == config.runtime_mode {
+            value: if mode.value().eq_ignore_ascii_case(saved_mode) {
                 "saved".into()
             } else if Some(mode.value()) == app.runtime.mode.as_deref() {
                 "runtime".into()
@@ -2489,6 +3644,10 @@ fn page_summary(page: Page) -> &'static str {
     match page {
         Page::Main => "runtime overview / proxy entrypoints",
         Page::Subscription => "profiles / refresh / usage",
+        Page::SubscriptionDetail => "profile detail / maintenance",
+        Page::SubscriptionRuleGroups => "rule-mode group selections",
+        Page::SubscriptionProxies => "proxy nodes / delay checks",
+        Page::SubscriptionRules => "rules / providers / raw profile",
         Page::AddSubscription => "new profile / URL / refresh",
         Page::Runtime => "service / controller / logs",
         Page::Chat => "assistant / structured patch",
@@ -2582,7 +3741,7 @@ fn draw_main_dashboard(
             config.controller.url
         )),
         Line::from(format!(
-            "System Proxy={}  TUN={}  DNS={}  Mode desired={} runtime={}",
+            "Sys Proxy={}  TUN={}  DNS={}  Mode desired={} runtime={}",
             on_off(config.system_proxy.enabled),
             on_off(config.tun.enable),
             on_off(config.dns.enable),
@@ -2605,21 +3764,12 @@ fn draw_main_proxies(frame: &mut Frame, config: &AppConfig, app: &ConfigApp, are
                 Style::default()
             };
             let feature_summary = match main_proxy_kind(config, index) {
-                MainProxyKind::System => format!(
-                    "os={} tun={}",
-                    on_off(config.system_proxy.enabled),
-                    on_off(config.tun.enable)
-                ),
-                MainProxyKind::Http | MainProxyKind::Socks | MainProxyKind::Service => {
-                    row.features.clone()
-                }
+                MainProxyKind::AddPortProxy => "create".into(),
+                _ => row.features.clone(),
             };
             ListItem::new(vec![
                 Line::from(Span::styled(
-                    format!(
-                        "{:<3} {:<14} {:<6} {}",
-                        row.status, row.name, row.kind, row.listen
-                    ),
+                    format!("{:<18} {:<7} {}", row.name, row.kind, row.listen),
                     style,
                 )),
                 Line::from(Span::styled(
@@ -2665,19 +3815,16 @@ fn draw_main_proxy_detail(
     ];
     match main_proxy_kind(config, app.selected_main) {
         MainProxyKind::System => lines.extend([
-            Line::from(format!(
-                "os={} pac=off",
-                on_off(config.system_proxy.enabled),
-            )),
-            Line::from(format!(
-                "tun={} dns={}",
-                on_off(config.tun.enable),
-                on_off(config.dns.enable)
-            )),
+            Line::from(format!("State: {}", on_off_upper(row.enabled))),
+            Line::from(row.features),
+        ]),
+        MainProxyKind::AddPortProxy => lines.extend([
+            Line::from("Action: add port proxy"),
+            Line::from("Enter: create and configure"),
         ]),
         _ => lines.extend([
-            Line::from("os/pac/tun: system only"),
-            Line::from(format!("listener: {}", row.listen)),
+            Line::from(format!("State: {}", on_off_upper(row.enabled))),
+            Line::from(format!("Listener: {}={}", row.listener, row.listen)),
         ]),
     }
     lines.extend([
@@ -2813,11 +3960,11 @@ fn draw_subscription_help(
             Line::from(""),
             Line::from(match action {
                 SubscriptionAction::Add => "Action: Add Subscription",
-                SubscriptionAction::Activate(_) => "Action: Activate Subscription",
+                SubscriptionAction::Open(_) => "Action: Open Subscription",
             }),
             Line::from(match action {
                 SubscriptionAction::Add => "The form collects name, URL, and refresh interval.",
-                SubscriptionAction::Activate(_) => "Sets the selected subscription active.",
+                SubscriptionAction::Open(_) => "Opens maintenance details for this subscription.",
             }),
         ]);
     }
@@ -2957,10 +4104,8 @@ fn draw_proxy_help(frame: &mut Frame, config: &AppConfig, app: &ConfigApp, area:
             Line::from(format!("Members: {}", group.all.len())),
             Line::from(format!(
                 "Saved: {}",
-                config
-                    .proxy_selections
-                    .get(&group.name)
-                    .map_or_else(|| "-".into(), |value| display_name(value))
+                desired_proxy_selection(config, app, &group.name)
+                    .map_or_else(|| "-".into(), display_name)
             )),
         ]);
     }
@@ -3028,7 +4173,7 @@ fn draw_proxy_config_help(frame: &mut Frame, config: &AppConfig, app: &ConfigApp
         Line::from("Esc returns to Main."),
     ];
     if app.selected_main == 0 {
-        lines.push(Line::from("TUN is only configured on System Proxy."));
+        lines.push(Line::from("TUN is only configured on Global Proxy."));
     }
     frame.render_widget(bios_panel("Item Help", lines), area);
 }
@@ -3080,7 +4225,7 @@ fn draw_mode_help(frame: &mut Frame, config: &AppConfig, app: &ConfigApp, area: 
             ModeItem::Direct => "Bypass proxy rules and send traffic directly.",
         }),
         Line::from(""),
-        Line::from(format!("Saved mode: {}", config.runtime_mode)),
+        Line::from(format!("Saved mode: {}", proxy_mode(config, app))),
         Line::from(format!(
             "Runtime mode: {}",
             app.runtime.mode.as_deref().unwrap_or("unknown")
@@ -3619,6 +4764,48 @@ fn draw_alert(frame: &mut Frame, app: &ConfigApp) {
     frame.render_widget(dialog_panel(lines), area);
 }
 
+fn draw_delay_check(frame: &mut Frame, app: &ConfigApp) {
+    let Some(task) = &app.delay_check else {
+        return;
+    };
+
+    let progress = &task.progress;
+    let area = fixed_rect(56, 8, frame.area());
+    frame.render_widget(Clear, area);
+
+    let percent = progress_percent(progress.done, progress.total);
+    let bar = progress_bar(
+        progress.done,
+        progress.total,
+        area.width.saturating_sub(12) as usize,
+    );
+    let action = if progress.finished {
+        "Enter OK | Esc close"
+    } else {
+        "Esc cancel"
+    };
+    let lines = vec![
+        popup_title_line(&progress.title, area.width.saturating_sub(2)),
+        Line::from(""),
+        Line::from(fit_width(
+            &progress.current,
+            area.width.saturating_sub(4) as usize,
+        )),
+        Line::from(vec![
+            Span::styled(bar, Style::default().fg(Color::Cyan)),
+            Span::raw(format!(" {percent:>3}%")),
+        ]),
+        Line::from(format!(
+            "{}/{}  ok={}  fail={}",
+            progress.done, progress.total, progress.ok, progress.failed
+        ))
+        .alignment(Alignment::Center),
+        Line::from(Span::styled(action, Style::default().fg(Color::Gray)))
+            .alignment(Alignment::Center),
+    ];
+    frame.render_widget(dialog_panel(lines), area);
+}
+
 fn confirm_choice_style(selected: bool) -> Style {
     button_style(selected)
 }
@@ -3827,6 +5014,20 @@ fn fit_width(value: &str, width: usize) -> String {
     output
 }
 
+fn progress_percent(done: usize, total: usize) -> usize {
+    done.saturating_mul(100).checked_div(total).unwrap_or(100)
+}
+
+fn progress_bar(done: usize, total: usize, width: usize) -> String {
+    let width = width.max(8);
+    let filled = done
+        .saturating_mul(width)
+        .checked_div(total)
+        .unwrap_or(width)
+        .min(width);
+    format!("[{}{}]", "█".repeat(filled), "░".repeat(width - filled))
+}
+
 fn fixed_rect(width: u16, height: u16, area: Rect) -> Rect {
     let width = width.min(area.width.saturating_sub(2)).max(20);
     let height = height.min(area.height.saturating_sub(2)).max(6);
@@ -3840,7 +5041,7 @@ fn fixed_rect(width: u16, height: u16, area: Rect) -> Rect {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SubscriptionAction {
-    Activate(usize),
+    Open(usize),
     Add,
 }
 
@@ -3850,16 +5051,20 @@ enum MainProxyKind {
     Http,
     Socks,
     Service,
+    AddPortProxy,
 }
 
 struct MainProxyRow {
-    status: String,
     name: String,
     kind: String,
+    listener: String,
+    port: String,
     listen: String,
     mode: String,
     subscription: String,
     features: String,
+    enabled: bool,
+    action: bool,
 }
 
 fn subscription_menu_count(config: &AppConfig) -> usize {
@@ -3870,13 +5075,185 @@ fn subscription_dropdown_count(config: &AppConfig) -> usize {
     config.subscriptions.len().max(1)
 }
 
+const SUBSCRIPTION_DETAIL_COUNT: usize = 7;
+const SUBSCRIPTION_RULE_FALLBACK_COUNT: usize = 5;
+
+const fn subscription_detail_count() -> usize {
+    SUBSCRIPTION_DETAIL_COUNT
+}
+
+fn subscription_rule_group_count(config: &AppConfig, app: &ConfigApp) -> usize {
+    let saved = selected_subscription(config, app)
+        .map(|subscription| subscription.rule_selections.len())
+        .unwrap_or_default();
+    app.runtime.groups.len().max(saved).max(1)
+}
+
+fn subscription_proxy_count(paths: &Paths, config: &AppConfig, app: &ConfigApp) -> usize {
+    let count = subscription_proxy_names_for_view(paths, config, app).len();
+    if count > 0 { count + 1 } else { 1 }
+}
+
 fn selected_subscription_action(config: &AppConfig, app: &ConfigApp) -> SubscriptionAction {
     let index = app.selected_subscription;
     if index < config.subscriptions.len() {
-        return SubscriptionAction::Activate(index);
+        return SubscriptionAction::Open(index);
     }
 
     SubscriptionAction::Add
+}
+
+fn selected_subscription<'a>(config: &'a AppConfig, app: &ConfigApp) -> Option<&'a Subscription> {
+    config.subscriptions.get(app.selected_subscription)
+}
+
+fn active_subscription(config: &AppConfig) -> Option<&Subscription> {
+    let active = config.active_profile.as_ref()?;
+    config
+        .subscriptions
+        .iter()
+        .find(|subscription| &subscription.name == active)
+}
+
+fn active_subscription_mut(config: &mut AppConfig) -> Option<&mut Subscription> {
+    let active = config.active_profile.clone()?;
+    config
+        .subscriptions
+        .iter_mut()
+        .find(|subscription| subscription.name == active)
+}
+
+fn service_for_main_proxy<'a>(
+    config: &'a AppConfig,
+    app: &ConfigApp,
+) -> Option<&'a PortProxyService> {
+    let index = service_index_for_main_proxy(config, app.selected_main)?;
+    config.proxy_ports.services.get(index)
+}
+
+fn service_for_main_proxy_mut(
+    config: &mut AppConfig,
+    selected_main: usize,
+) -> Option<&mut PortProxyService> {
+    let index = service_index_for_main_proxy(config, selected_main)?;
+    config.proxy_ports.services.get_mut(index)
+}
+
+fn is_selected_subscription_active(config: &AppConfig, subscription: &Subscription) -> bool {
+    config.active_profile.as_ref() == Some(&subscription.name)
+}
+
+fn proxy_mode<'a>(config: &'a AppConfig, app: &ConfigApp) -> &'a str {
+    service_for_main_proxy(config, app)
+        .map(|service| service.mode.as_str())
+        .unwrap_or(config.runtime_mode.as_str())
+}
+
+fn proxy_subscription_name<'a>(config: &'a AppConfig, app: &ConfigApp) -> Option<&'a str> {
+    service_for_main_proxy(config, app)
+        .and_then(|service| service.subscription.as_deref())
+        .or(config.active_profile.as_deref())
+}
+
+fn proxy_subscription_index(config: &AppConfig, app: &ConfigApp) -> Option<usize> {
+    let name = proxy_subscription_name(config, app)?;
+    config
+        .subscriptions
+        .iter()
+        .position(|subscription| subscription.name == name)
+}
+
+fn mode_index(mode: &str) -> usize {
+    ModeItem::ALL
+        .iter()
+        .position(|item| item.value().eq_ignore_ascii_case(mode))
+        .unwrap_or_default()
+}
+
+fn uses_subscription_rule_selections(config: &AppConfig) -> bool {
+    config.runtime_mode.eq_ignore_ascii_case("rule")
+}
+
+fn desired_proxy_selection<'a>(
+    config: &'a AppConfig,
+    app: &ConfigApp,
+    group: &str,
+) -> Option<&'a str> {
+    if let Some(service) = service_for_main_proxy(config, app) {
+        if service.mode.eq_ignore_ascii_case("rule")
+            && let Some(selection) = service.rule_selections.get(group)
+        {
+            return Some(selection.as_str());
+        }
+        if service.mode.eq_ignore_ascii_case("global") {
+            return service.proxy.as_deref();
+        }
+        return None;
+    }
+
+    if config.runtime_mode.eq_ignore_ascii_case("rule")
+        && let Some(selection) = active_subscription(config)
+            .and_then(|subscription| subscription.rule_selections.get(group))
+    {
+        return Some(selection.as_str());
+    }
+    if config.runtime_mode.eq_ignore_ascii_case("global")
+        && let Some(selection) = config.proxy_selections.get("GLOBAL")
+    {
+        return Some(selection.as_str());
+    }
+    config.proxy_selections.get(group).map(String::as_str)
+}
+
+fn save_selected_proxy_choice(
+    config: &mut AppConfig,
+    app: &ConfigApp,
+    mode: &str,
+    group: &str,
+    proxy: &str,
+) -> String {
+    if let Some(service) = service_for_main_proxy_mut(config, app.selected_main) {
+        if mode.eq_ignore_ascii_case("rule") {
+            service
+                .rule_selections
+                .insert(group.to_string(), proxy.to_string());
+            service.rule = Some(group.to_string());
+            return format!("{} rule", service_name(service));
+        }
+
+        if mode.eq_ignore_ascii_case("global") {
+            service.proxy = Some(proxy.to_string());
+            return format!("{} global", service_name(service));
+        }
+
+        service.proxy = Some("DIRECT".into());
+        return format!("{} direct", service_name(service));
+    }
+
+    if mode.eq_ignore_ascii_case("rule") {
+        if let Some(subscription) = active_subscription_mut(config) {
+            subscription
+                .rule_selections
+                .insert(group.to_string(), proxy.to_string());
+            return format!("{} rule", display_name(&subscription.name));
+        }
+        config
+            .proxy_selections
+            .insert(group.to_string(), proxy.to_string());
+        return "global rule".into();
+    }
+
+    if mode.eq_ignore_ascii_case("global") {
+        config
+            .proxy_selections
+            .insert("GLOBAL".into(), proxy.to_string());
+        config
+            .proxy_selections
+            .insert(group.to_string(), proxy.to_string());
+        return "global".into();
+    }
+
+    "direct".into()
 }
 
 fn runtime_mode_index(config: &AppConfig) -> usize {
@@ -3890,6 +5267,7 @@ fn main_proxy_count(config: &AppConfig) -> usize {
     1 + usize::from(config.proxy_ports.http.is_some())
         + usize::from(config.proxy_ports.socks.is_some())
         + config.proxy_ports.services.len()
+        + 1
 }
 
 fn main_proxy_rows(config: &AppConfig) -> Vec<MainProxyRow> {
@@ -3905,27 +5283,27 @@ fn main_proxy_row(config: &AppConfig, index: usize) -> MainProxyRow {
         .map_or_else(|| "-".into(), display_name);
     match main_proxy_kind(config, index) {
         MainProxyKind::System => MainProxyRow {
-            status: if config.system_proxy.enabled || config.tun.enable {
-                "OK".into()
-            } else {
-                "Off".into()
-            },
-            name: "System Proxy".into(),
-            kind: "System".into(),
+            name: "Global Proxy".into(),
+            kind: "Global".into(),
+            listener: "MIX".into(),
+            port: config.mixed_port.to_string(),
             listen: format!("{}:{}", config.proxy_host, config.mixed_port),
             mode: config.runtime_mode.clone(),
             subscription,
             features: format!(
-                "os={} pac=off tun={} dns={}",
-                on_off(config.system_proxy.enabled),
-                on_off(config.tun.enable),
-                on_off(config.dns.enable)
+                "SYS={} TUN={} DNS={}",
+                on_off_upper(config.system_proxy.enabled),
+                on_off_upper(config.tun.enable),
+                on_off_upper(config.dns.enable)
             ),
+            enabled: config.system_proxy.enabled || config.tun.enable,
+            action: false,
         },
         MainProxyKind::Http => MainProxyRow {
-            status: "OK".into(),
-            name: "HTTP Port".into(),
-            kind: "HTTP".into(),
+            name: "HTTP Proxy".into(),
+            kind: "Port".into(),
+            listener: "HTTP".into(),
+            port: config.proxy_ports.http.unwrap_or_default().to_string(),
             listen: format!(
                 "{}:{}",
                 config.proxy_host,
@@ -3933,12 +5311,18 @@ fn main_proxy_row(config: &AppConfig, index: usize) -> MainProxyRow {
             ),
             mode: config.runtime_mode.clone(),
             subscription,
-            features: format!("allow-lan={}", on_off(config.proxy_ports.allow_lan)),
+            features: format!(
+                "listener=http allow-lan={}",
+                on_off(config.proxy_ports.allow_lan)
+            ),
+            enabled: true,
+            action: false,
         },
         MainProxyKind::Socks => MainProxyRow {
-            status: "OK".into(),
-            name: "SOCKS Port".into(),
-            kind: "SOCKS5".into(),
+            name: "SOCKS Proxy".into(),
+            kind: "Port".into(),
+            listener: "SOCKS".into(),
+            port: config.proxy_ports.socks.unwrap_or_default().to_string(),
             listen: format!(
                 "{}:{}",
                 config.proxy_host,
@@ -3946,50 +5330,76 @@ fn main_proxy_row(config: &AppConfig, index: usize) -> MainProxyRow {
             ),
             mode: config.runtime_mode.clone(),
             subscription,
-            features: format!("allow-lan={}", on_off(config.proxy_ports.allow_lan)),
+            features: format!(
+                "listener=socks5 allow-lan={}",
+                on_off(config.proxy_ports.allow_lan)
+            ),
+            enabled: true,
+            action: false,
         },
         MainProxyKind::Service => {
             let service_index = service_index_for_main_proxy(config, index).unwrap_or_default();
             let service = config.proxy_ports.services.get(service_index);
-            let listen = service
-                .map(|service| {
-                    let host = if service.listen.trim().is_empty() {
-                        "127.0.0.1"
-                    } else {
-                        service.listen.trim()
-                    };
-                    format!("{host}:{}", service.port)
-                })
-                .unwrap_or_else(|| "-".into());
+            let service_subscription = service
+                .and_then(|service| service.subscription.as_deref())
+                .map_or_else(|| subscription.clone(), display_name);
             MainProxyRow {
-                status: service
-                    .map(|service| if service.enabled { "OK" } else { "Off" })
-                    .unwrap_or("Off")
-                    .into(),
                 name: service
-                    .map(|service| {
-                        if service.name.trim().is_empty() {
-                            format!("{} Port", service.kind)
-                        } else {
-                            service.name.clone()
-                        }
-                    })
+                    .map(service_name)
                     .unwrap_or_else(|| "Port Proxy".into()),
-                kind: service.map_or_else(|| "Port".into(), |service| service.kind.clone()),
-                listen,
-                mode: config.runtime_mode.clone(),
-                subscription,
+                kind: "Port".into(),
+                listener: service
+                    .map(|service| listener_label(&service.kind))
+                    .unwrap_or_else(|| "PORT".into()),
+                port: service
+                    .map(service_port_value)
+                    .unwrap_or_else(|| "-".into()),
+                listen: service.map(service_listen).unwrap_or_else(|| "-".into()),
+                mode: service
+                    .map(|service| service.mode.clone())
+                    .unwrap_or_else(|| "global".into()),
+                subscription: service_subscription,
                 features: service
-                    .map(|service| format!("udp={}", on_off(service.udp)))
+                    .map(|service| {
+                        let route = if service.mode.eq_ignore_ascii_case("global") {
+                            service
+                                .proxy
+                                .as_deref()
+                                .map_or("proxy=-", |proxy| proxy)
+                                .to_string()
+                        } else if service.mode.eq_ignore_ascii_case("rule") {
+                            format!("groups={}", service.rule_selections.len())
+                        } else {
+                            "DIRECT".into()
+                        };
+                        format!("{} udp={}", route, on_off_upper(service.udp))
+                    })
                     .unwrap_or_else(|| "custom".into()),
+                enabled: service.map(|service| service.enabled).unwrap_or_default(),
+                action: false,
             }
         }
+        MainProxyKind::AddPortProxy => MainProxyRow {
+            name: "Add Port Proxy".into(),
+            kind: "Action".into(),
+            listener: "MIX".into(),
+            port: "auto".into(),
+            listen: "new mixed listener".into(),
+            mode: String::new(),
+            subscription: "-".into(),
+            features: "create a local port proxy".into(),
+            enabled: false,
+            action: true,
+        },
     }
 }
 
 fn main_proxy_kind(config: &AppConfig, index: usize) -> MainProxyKind {
     if index == 0 {
         return MainProxyKind::System;
+    }
+    if index + 1 >= main_proxy_count(config) {
+        return MainProxyKind::AddPortProxy;
     }
     let mut cursor = 1;
     if config.proxy_ports.http.is_some() {
@@ -4012,11 +5422,169 @@ fn service_index_for_main_proxy(config: &AppConfig, index: usize) -> Option<usiz
     if config.proxy_ports.socks.is_some() {
         cursor += 1;
     }
-    index.checked_sub(cursor)
+    let service_index = index.checked_sub(cursor)?;
+    (service_index < config.proxy_ports.services.len()).then_some(service_index)
+}
+
+fn main_proxy_index_for_service(config: &AppConfig, service_index: usize) -> Option<usize> {
+    if service_index >= config.proxy_ports.services.len() {
+        return None;
+    }
+
+    let mut cursor = 1;
+    if config.proxy_ports.http.is_some() {
+        cursor += 1;
+    }
+    if config.proxy_ports.socks.is_some() {
+        cursor += 1;
+    }
+    Some(cursor + service_index)
+}
+
+fn service_name(service: &PortProxyService) -> String {
+    if service.name.trim().is_empty() {
+        format!("{} Port", service.kind)
+    } else {
+        service.name.clone()
+    }
+}
+
+fn service_listen(service: &PortProxyService) -> String {
+    let host = if service.listen.trim().is_empty() {
+        "127.0.0.1"
+    } else {
+        service.listen.trim()
+    };
+    format!("{host}:{}", service_port_value(service))
+}
+
+fn service_port_value(service: &PortProxyService) -> String {
+    if service.port == 0 {
+        "auto".into()
+    } else {
+        service.port.to_string()
+    }
+}
+
+fn next_port_proxy_port(config: &AppConfig) -> u16 {
+    let mut port = 7071;
+    loop {
+        let used = config.proxy_ports.http == Some(port)
+            || config.proxy_ports.socks == Some(port)
+            || config
+                .proxy_ports
+                .services
+                .iter()
+                .any(|service| service.port == port)
+            || config.mixed_port == port;
+        if !used {
+            return port;
+        }
+        port = port.saturating_add(1);
+        if port == u16::MAX {
+            return 0;
+        }
+    }
+}
+
+fn listener_label(kind: &str) -> String {
+    match kind.trim().to_ascii_lowercase().as_str() {
+        "mixed" | "mix" => "MIX".into(),
+        "http" => "HTTP".into(),
+        "socks" | "socks5" => "SOCKS".into(),
+        value if !value.is_empty() => value.to_ascii_uppercase(),
+        _ => "PORT".into(),
+    }
 }
 
 fn main_proxy_name(config: &AppConfig, index: usize) -> String {
     main_proxy_row(config, index).name
+}
+
+fn main_proxy_settings_line(config: &AppConfig, row: &MainProxyRow) -> String {
+    let mode = row.mode.to_ascii_uppercase();
+    if row.kind == "Global" {
+        format!(
+            "{} {} SYS={} TUN={}",
+            mode,
+            row.subscription,
+            on_off_upper(config.system_proxy.enabled),
+            on_off_upper(config.tun.enable)
+        )
+    } else {
+        format!("{mode} {} {}", row.subscription, row.features)
+    }
+}
+
+fn proxy_server_value(config: &AppConfig, app: &ConfigApp) -> String {
+    let mode = proxy_mode(config, app);
+    if mode.eq_ignore_ascii_case("direct") {
+        return "DIRECT".into();
+    }
+
+    if mode.eq_ignore_ascii_case("global") {
+        if let Some(service) = service_for_main_proxy(config, app) {
+            return service
+                .proxy
+                .as_deref()
+                .map_or_else(|| "choose proxy".into(), display_name);
+        }
+        return config
+            .proxy_selections
+            .get("GLOBAL")
+            .or_else(|| config.proxy_selections.values().next())
+            .map_or_else(|| "choose proxy".into(), |value| display_name(value));
+    }
+
+    app.current_group()
+        .map(|group| {
+            let selected =
+                desired_proxy_selection(config, app, &group.name).unwrap_or(group.now.as_str());
+            format!(
+                "{} -> {}",
+                display_name(&group.name),
+                display_name(selected)
+            )
+        })
+        .unwrap_or_else(|| "choose group".into())
+}
+
+fn proxy_groups_page_is_global_proxy_list(config: &AppConfig, app: &ConfigApp) -> bool {
+    proxy_mode(config, app).eq_ignore_ascii_case("global")
+}
+
+fn selected_global_proxy(config: &AppConfig, app: &ConfigApp) -> Option<String> {
+    if let Some(service) = service_for_main_proxy(config, app) {
+        return service.proxy.clone();
+    }
+    config
+        .proxy_selections
+        .get("GLOBAL")
+        .or_else(|| config.proxy_selections.values().next())
+        .cloned()
+}
+
+fn route_proxy_names(paths: &Paths, config: &AppConfig, app: &ConfigApp) -> Vec<String> {
+    if let Some(subscription) = proxy_subscription_name(config, app).and_then(|name| {
+        config
+            .subscriptions
+            .iter()
+            .find(|subscription| subscription.name == name)
+    }) {
+        let proxies = subscription_profile_proxy_names(paths, subscription);
+        if !proxies.is_empty() {
+            return proxies;
+        }
+    }
+    runtime_proxy_names(app)
+}
+
+fn runtime_group_for_proxy(app: &ConfigApp, proxy: &str) -> Option<String> {
+    app.runtime
+        .groups
+        .iter()
+        .find(|group| group.all.iter().any(|candidate| candidate == proxy))
+        .map(|group| group.name.clone())
 }
 
 fn proxy_config_field_value(
@@ -4027,30 +5595,32 @@ fn proxy_config_field_value(
     match field {
         ProxyConfigField::Enabled => {
             if app.selected_main == 0 {
-                on_off(config.system_proxy.enabled || config.tun.enable).into()
+                on_off(config.system_proxy.enabled).into()
             } else {
-                main_proxy_row(config, app.selected_main).status
+                on_off(main_proxy_row(config, app.selected_main).enabled).into()
             }
         }
         ProxyConfigField::Subscription => config
-            .active_profile
-            .as_deref()
-            .map_or_else(|| "-".into(), display_name),
-        ProxyConfigField::Mode => format!(
-            "{} / {}",
-            config.runtime_mode,
-            app.runtime.mode.as_deref().unwrap_or("unknown")
-        ),
-        ProxyConfigField::ProxyGroups => app
-            .current_group()
-            .map(|group| {
-                format!(
-                    "{} -> {}",
-                    display_name(&group.name),
-                    display_name(&group.now)
-                )
+            .subscriptions
+            .iter()
+            .find(|subscription| {
+                Some(subscription.name.as_str()) == proxy_subscription_name(config, app)
             })
-            .unwrap_or_else(|| "start daemon and refresh".into()),
+            .map(|subscription| subscription.name.as_str())
+            .map_or_else(|| "-".into(), display_name),
+        ProxyConfigField::Mode => {
+            let mode = proxy_mode(config, app);
+            if app.selected_main == 0 {
+                format!(
+                    "{} / {}",
+                    mode,
+                    app.runtime.mode.as_deref().unwrap_or("unknown")
+                )
+            } else {
+                mode.to_string()
+            }
+        }
+        ProxyConfigField::ProxyGroups => proxy_server_value(config, app),
         ProxyConfigField::LocalPort => main_proxy_row(config, app.selected_main).listen,
         ProxyConfigField::OsProxy => on_off(config.system_proxy.enabled).into(),
         ProxyConfigField::Pac => "off".into(),
@@ -4061,7 +5631,7 @@ fn proxy_config_field_value(
 
 const fn proxy_config_field_help(field: ProxyConfigField) -> &'static str {
     match field {
-        ProxyConfigField::Enabled => "System Proxy enabled means OS proxy or TUN is active.",
+        ProxyConfigField::Enabled => "Enable or disable the selected proxy entry.",
         ProxyConfigField::Subscription => "Choose the source from an inline dropdown.",
         ProxyConfigField::Mode => "Choose rule, global, or direct behavior.",
         ProxyConfigField::ProxyGroups => {
@@ -4069,9 +5639,9 @@ const fn proxy_config_field_help(field: ProxyConfigField) -> &'static str {
         }
         ProxyConfigField::LocalPort => "Edit the local listener port for this proxy.",
         ProxyConfigField::OsProxy => "Point the operating system proxy settings to the mixed port.",
-        ProxyConfigField::Pac => "PAC support is planned; it will live on System Proxy.",
+        ProxyConfigField::Pac => "PAC support is planned; it will live on Global Proxy.",
         ProxyConfigField::Tun => {
-            "TUN is transparent system traffic and belongs only to System Proxy."
+            "TUN is transparent system traffic and belongs only to Global Proxy."
         }
         ProxyConfigField::Dns => "Open DNS settings used by mihomo runtime.",
     }
@@ -4140,21 +5710,227 @@ fn compact_list(values: &[String]) -> String {
     }
 }
 
+fn subscription_usage_summary(subscription: &Subscription) -> String {
+    let used = subscription
+        .user_info
+        .used()
+        .map(format_bytes_short)
+        .unwrap_or_else(|| "-".into());
+    let total = subscription
+        .user_info
+        .total
+        .map(format_bytes_short)
+        .unwrap_or_else(|| "-".into());
+    let expire = subscription
+        .user_info
+        .expire
+        .map(format_unix_timestamp)
+        .unwrap_or_else(|| "-".into());
+    let state = if subscription.last_error.is_some() {
+        "error"
+    } else {
+        "ok"
+    };
+    format!("used {used}/{total} exp {expire} {state}")
+}
+
+fn subscription_list_help(subscription: &Subscription) -> String {
+    let error = subscription
+        .last_error
+        .as_deref()
+        .map(|error| format!(" | last error: {error}"))
+        .unwrap_or_default();
+    format!(
+        "Enter opens details. refresh={} updated={} URL: {}{}",
+        subscription_refresh_label(subscription.refresh),
+        subscription.updated_at.as_deref().unwrap_or("-"),
+        subscription.url,
+        error
+    )
+}
+
+fn format_unix_timestamp(value: u64) -> String {
+    format!("unix:{value}")
+}
+
+fn runtime_proxy_names(app: &ConfigApp) -> Vec<String> {
+    let mut proxies = Vec::new();
+    for group in &app.runtime.groups {
+        for proxy in &group.all {
+            if !proxies.iter().any(|existing| existing == proxy) {
+                proxies.push(proxy.clone());
+            }
+        }
+    }
+    proxies
+}
+
+fn subscription_proxy_names_for_view(
+    paths: &Paths,
+    config: &AppConfig,
+    app: &ConfigApp,
+) -> Vec<String> {
+    let Some(subscription) = selected_subscription(config, app) else {
+        return Vec::new();
+    };
+    let proxies = subscription_profile_proxy_names(paths, subscription);
+    if !proxies.is_empty() {
+        return proxies;
+    }
+    if is_selected_subscription_active(config, subscription) {
+        return runtime_proxy_names(app);
+    }
+    Vec::new()
+}
+
+fn subscription_proxy_delay_key(subscription: &Subscription, proxy: &str) -> String {
+    subscription_proxy_delay_key_for_name(&subscription.name, proxy)
+}
+
+fn subscription_proxy_delay_key_for_name(subscription_name: &str, proxy: &str) -> String {
+    format!("{subscription_name}::{proxy}")
+}
+
+fn subscription_profile_proxy_names(paths: &Paths, subscription: &Subscription) -> Vec<String> {
+    let profile = subscription::profile_path(paths, subscription);
+    let Ok(content) = std::fs::read_to_string(profile) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&content) else {
+        return Vec::new();
+    };
+    let Some(proxies) = value
+        .as_mapping()
+        .and_then(|mapping| mapping.get("proxies"))
+        .and_then(serde_yaml_ng::Value::as_sequence)
+    else {
+        return Vec::new();
+    };
+
+    proxies
+        .iter()
+        .filter_map(|proxy| {
+            proxy
+                .as_mapping()
+                .and_then(|mapping| mapping.get("name"))
+                .and_then(serde_yaml_ng::Value::as_str)
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+fn empty_rows(label: &str, help: &str) -> Vec<SettingRow> {
+    vec![SettingRow {
+        label: label.into(),
+        value: "-".into(),
+        help: help.into(),
+        kind: RowKind::Info,
+    }]
+}
+
+#[derive(Debug, Default)]
+struct SubscriptionProfileSummary {
+    exists: bool,
+    proxies: usize,
+    proxy_groups: usize,
+    rules: usize,
+    rule_providers: usize,
+    error: Option<String>,
+}
+
+impl SubscriptionProfileSummary {
+    fn short_counts(&self) -> String {
+        if !self.exists {
+            return "profile missing".into();
+        }
+        if self.error.is_some() {
+            return "profile error".into();
+        }
+        format!("groups={} rules={}", self.proxy_groups, self.rules)
+    }
+
+    fn rules_value(&self) -> String {
+        if !self.exists {
+            return "missing".into();
+        }
+        if self.error.is_some() {
+            return "parse error".into();
+        }
+        format!("{} rules / {} providers", self.rules, self.rule_providers)
+    }
+}
+
+fn subscription_profile_summary(
+    paths: &Paths,
+    subscription: &Subscription,
+) -> SubscriptionProfileSummary {
+    let profile = subscription::profile_path(paths, subscription);
+    let content = match std::fs::read_to_string(&profile) {
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return SubscriptionProfileSummary::default();
+        }
+        Err(err) => {
+            return SubscriptionProfileSummary {
+                exists: true,
+                error: Some(err.to_string()),
+                ..SubscriptionProfileSummary::default()
+            };
+        }
+    };
+    let value: serde_yaml_ng::Value = match serde_yaml_ng::from_str(&content) {
+        Ok(value) => value,
+        Err(err) => {
+            return SubscriptionProfileSummary {
+                exists: true,
+                error: Some(err.to_string()),
+                ..SubscriptionProfileSummary::default()
+            };
+        }
+    };
+    let Some(mapping) = value.as_mapping() else {
+        return SubscriptionProfileSummary {
+            exists: true,
+            error: Some("root is not a mapping".into()),
+            ..SubscriptionProfileSummary::default()
+        };
+    };
+    SubscriptionProfileSummary {
+        exists: true,
+        proxies: yaml_sequence_len(mapping.get("proxies")),
+        proxy_groups: yaml_sequence_len(mapping.get("proxy-groups")),
+        rules: yaml_sequence_len(mapping.get("rules")),
+        rule_providers: yaml_mapping_len(mapping.get("rule-providers")),
+        error: None,
+    }
+}
+
+fn yaml_sequence_len(value: Option<&serde_yaml_ng::Value>) -> usize {
+    value
+        .and_then(serde_yaml_ng::Value::as_sequence)
+        .map_or(0, Vec::len)
+}
+
+fn yaml_mapping_len(value: Option<&serde_yaml_ng::Value>) -> usize {
+    value
+        .and_then(serde_yaml_ng::Value::as_mapping)
+        .map_or(0, |mapping| mapping.len())
+}
+
 fn proxy_runtime_line(app: &ConfigApp) -> String {
     format!(
-        "n {} t {} {}",
+        "{} {}",
         traffic_speed_summary(app.runtime.traffic.as_ref()),
-        traffic_total_summary(app.runtime.traffic.as_ref()),
         ip_info_summary(app)
     )
 }
 
 fn traffic_speed_summary(traffic: Option<&TrafficState>) -> String {
     traffic.map_or_else(
-        || "-/-".into(),
+        || "↑- ↓-".into(),
         |traffic| {
             format!(
-                "{}/{}",
+                "↑{}/s ↓{}/s",
                 format_bytes_short(traffic.upload_speed),
                 format_bytes_short(traffic.download_speed)
             )
@@ -4165,18 +5941,24 @@ fn traffic_speed_summary(traffic: Option<&TrafficState>) -> String {
 fn traffic_total_summary(traffic: Option<&TrafficState>) -> String {
     traffic.map_or_else(
         || "-".into(),
-        |traffic| format_bytes_short(traffic.download_total),
+        |traffic| {
+            format!(
+                "{}/{}",
+                format_bytes_short(traffic.upload_total),
+                format_bytes_short(traffic.download_total)
+            )
+        },
     )
 }
 
 fn ip_info_summary(app: &ConfigApp) -> String {
     if let Some(info) = &app.runtime.ip_info {
-        let mut location = [info.country.as_deref()]
+        let mut location = [info.country.as_deref(), info.city.as_deref()]
             .into_iter()
             .flatten()
             .filter(|value| !value.is_empty())
             .collect::<Vec<_>>()
-            .join("/");
+            .join(" ");
         if location.is_empty() {
             location = "-".into();
         }
@@ -4189,6 +5971,10 @@ fn ip_info_summary(app: &ConfigApp) -> String {
 }
 
 fn traffic_from_value(value: &serde_json::Value) -> Option<TrafficState> {
+    let upload_total = value
+        .get("uploadTotal")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
     let download_total = value
         .get("downloadTotal")
         .and_then(serde_json::Value::as_u64)?;
@@ -4213,6 +5999,7 @@ fn traffic_from_value(value: &serde_json::Value) -> Option<TrafficState> {
         })
         .unwrap_or_default();
     Some(TrafficState {
+        upload_total,
         download_total,
         upload_speed,
         download_speed,
@@ -4241,6 +6028,10 @@ async fn fetch_ip_info() -> Result<IpInfoState> {
         ip,
         country: value
             .get("country")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        city: value
+            .get("city")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string),
     })
@@ -4368,6 +6159,14 @@ const fn prev_index(current: usize, len: usize) -> usize {
     }
 }
 
+fn visible_window_start(selected: usize, len: usize, visible: usize) -> usize {
+    if visible == 0 || len <= visible {
+        return 0;
+    }
+    let half = visible / 2;
+    selected.saturating_sub(half).min(len - visible)
+}
+
 fn active_subscription_index(config: &AppConfig) -> Option<usize> {
     let active = config.active_profile.as_ref()?;
     config
@@ -4433,15 +6232,52 @@ fn parse_optional_port_or_alert(
     }
 }
 
+fn parse_listen_port_or_alert(
+    app: &mut ConfigApp,
+    value: &str,
+    default_host: &str,
+    label: &str,
+) -> Option<(String, u16)> {
+    let value = value.trim();
+    if value.is_empty() {
+        app.alert("Invalid Port", "Use a port or host:port.");
+        return None;
+    }
+    if let Some((host, port)) = split_host_port_input(value) {
+        let port = parse_port_or_alert(app, port, label)?;
+        return Some((host.to_string(), port));
+    }
+    parse_port_or_alert(app, value, label).map(|port| (default_host.to_string(), port))
+}
+
+fn parse_service_listen_port_or_alert(
+    app: &mut ConfigApp,
+    value: &str,
+    default_host: &str,
+) -> Option<(String, u16)> {
+    let value = value.trim();
+    let lower = value.to_ascii_lowercase();
+    if value.is_empty() || matches!(lower.as_str(), "0" | "auto") {
+        return Some((default_host.to_string(), 0));
+    }
+
+    parse_listen_port_or_alert(app, value, default_host, "port proxy port")
+}
+
+fn split_host_port_input(value: &str) -> Option<(&str, &str)> {
+    let (host, port) = value.rsplit_once(':')?;
+    if host.trim().is_empty() || port.trim().is_empty() {
+        return None;
+    }
+    Some((host.trim(), port.trim()))
+}
+
 fn optional_port_value(port: Option<u16>) -> String {
     port.map_or_else(|| "off".into(), |port| port.to_string())
 }
 
 fn is_number_input(input_mode: InputMode) -> bool {
-    matches!(
-        input_mode,
-        InputMode::MixedPort | InputMode::HttpPort | InputMode::SocksPort
-    )
+    matches!(input_mode, InputMode::HttpPort | InputMode::SocksPort)
 }
 
 fn adjust_number_input(value: &mut String, delta: i32) {
@@ -4467,6 +6303,10 @@ fn join_list(values: &[String]) -> String {
 
 const fn on_off(value: bool) -> &'static str {
     if value { "on" } else { "off" }
+}
+
+const fn on_off_upper(value: bool) -> &'static str {
+    if value { "ON" } else { "OFF" }
 }
 
 fn display_name(value: &str) -> String {
@@ -4562,5 +6402,12 @@ mod tests {
                 "https://dns.alidns.com/dns-query".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn progress_helpers_handle_empty_and_partial_work() {
+        assert_eq!(progress_percent(0, 0), 100);
+        assert_eq!(progress_percent(45, 180), 25);
+        assert_eq!(progress_bar(2, 4, 8), "[████░░░░]");
     }
 }
