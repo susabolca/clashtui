@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
-use std::net::{TcpListener, UdpSocket};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::net::{TcpStream, ToSocketAddrs};
+use std::process::Command;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
 
@@ -14,6 +15,7 @@ const MIXED_BASE: u16 = 17070;
 const DNS_BASE: u16 = 15053;
 const LISTENER_BASE: u16 = 7071;
 const LOCALHOST: &str = "127.0.0.1";
+const TCP_CONNECT_TIMEOUT: Duration = Duration::from_millis(120);
 
 pub async fn ensure_allocated(paths: &Paths, config: &mut AppConfig) -> Result<bool> {
     ensure_allocated_with_controller(paths, config, true, false).await
@@ -131,12 +133,14 @@ pub fn validate_required_ports_available(config: &AppConfig) -> Result<()> {
         .filter(|(_, service)| service.enabled)
     {
         let (index, service) = service;
-        check_tcp_port(
-            &mut tcp_ports,
-            &format!("{} controller", service.name),
-            LOCALHOST,
-            service_controller_port(config, index),
-        )?;
+        if !config.use_single_runtime() {
+            check_tcp_port(
+                &mut tcp_ports,
+                &format!("{} controller", service.name),
+                LOCALHOST,
+                service_controller_port(config, index),
+            )?;
+        }
         let listen = if service.listen.trim().is_empty() {
             LOCALHOST
         } else {
@@ -275,20 +279,94 @@ fn check_udp_available(host: &str, port: u16, label: &str) -> Result<()> {
 }
 
 fn tcp_available(host: &str, port: u16) -> bool {
-    TcpListener::bind((bind_host(host), port)).is_ok()
+    !tcp_port_in_use(host, port)
 }
 
-fn udp_available(host: &str, port: u16) -> bool {
-    UdpSocket::bind((bind_host(host), port)).is_ok()
+fn udp_available(_host: &str, port: u16) -> bool {
+    !udp_port_in_use(port)
 }
 
-fn bind_host(host: &str) -> &str {
+fn tcp_port_in_use(host: &str, port: u16) -> bool {
+    tcp_connects(host, port)
+        || proc_net_port_in_use("tcp", port, true)
+        || lsof_port_in_use("TCP", port)
+}
+
+fn udp_port_in_use(port: u16) -> bool {
+    proc_net_port_in_use("udp", port, false) || lsof_port_in_use("UDP", port)
+}
+
+fn tcp_connects(host: &str, port: u16) -> bool {
+    let target = (probe_host(host), port);
+    let Ok(addrs) = target.to_socket_addrs() else {
+        return false;
+    };
+    addrs
+        .into_iter()
+        .any(|addr| TcpStream::connect_timeout(&addr, TCP_CONNECT_TIMEOUT).is_ok())
+}
+
+fn probe_host(host: &str) -> &str {
     let host = host.trim();
-    if host.is_empty() || host == "*" {
-        "0.0.0.0"
+    if host.is_empty() || host == "*" || host == "0.0.0.0" || host == "::" {
+        LOCALHOST
     } else {
         host
     }
+}
+
+fn lsof_port_in_use(protocol: &str, port: u16) -> bool {
+    let mut command = Command::new("lsof");
+    command.arg("-nP").arg(format!("-i{protocol}:{port}"));
+    if protocol == "TCP" {
+        command.arg("-sTCP:LISTEN");
+    }
+    let Ok(output) = command.output() else {
+        return false;
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .skip(1)
+        .any(|line| !line.trim().is_empty())
+}
+
+#[cfg(target_os = "linux")]
+fn proc_net_port_in_use(protocol: &str, port: u16, tcp_listen_only: bool) -> bool {
+    [
+        format!("/proc/net/{protocol}"),
+        format!("/proc/net/{protocol}6"),
+    ]
+    .iter()
+    .any(|path| proc_net_file_port_in_use(path, port, tcp_listen_only))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn proc_net_port_in_use(_protocol: &str, _port: u16, _tcp_listen_only: bool) -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn proc_net_file_port_in_use(path: &str, port: u16, tcp_listen_only: bool) -> bool {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    content.lines().skip(1).any(|line| {
+        let mut fields = line.split_whitespace();
+        let _slot = fields.next();
+        let Some(local_address) = fields.next() else {
+            return false;
+        };
+        let Some(state) = fields.next() else {
+            return false;
+        };
+        if tcp_listen_only && state != "0A" {
+            return false;
+        }
+        let Some((_addr, port_hex)) = local_address.rsplit_once(':') else {
+            return false;
+        };
+        u16::from_str_radix(port_hex, 16).is_ok_and(|value| value == port)
+    })
 }
 
 fn controller_host(value: &str) -> Option<&str> {
@@ -344,6 +422,7 @@ mod tests {
             log_file: std::env::temp_dir().join("clashtui-port-test/clashtui.log"),
             core_log_file: std::env::temp_dir().join("clashtui-port-test/mihomo.log"),
             profiles_dir: std::env::temp_dir().join("clashtui-port-test/profiles"),
+            cores_dir: std::env::temp_dir().join("clashtui-port-test/cores"),
         };
 
         ensure_allocated(&paths, &mut config).await?;

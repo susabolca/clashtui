@@ -14,12 +14,16 @@
 - A listen host of `0.0.0.0`, for example `0.0.0.0:7070`, means LAN-accessible.
 - Auto-managed ports are persisted after allocation so one instance does not drift between restarts.
 - New Port Proxy services start at `127.0.0.1:7071`; services with `port: 0` are auto-assigned from the same listener range.
-- Each enabled Port Proxy also gets a private mihomo controller port from a non-user-facing range.
+- In the default single-runtime/service backend, Port Proxy services do not get
+  private mihomo controller ports; they are listeners inside the one mihomo
+  runtime.
+- Private Port Proxy controller ports exist only for legacy `multi` /
+  `multi-process` compatibility backends.
 
 ## Current Auto Ranges
 
 - Controller: `19090-19989`
-- Port Proxy controllers: `20090-20989`
+- Port Proxy controllers: `20090-20989` in legacy multi-process mode only
 - Global Proxy mixed port: fixed default `7070`
 - DNS listen: `15053-15952`
 - Extra listeners: `7071-7970`
@@ -33,7 +37,13 @@
 - TUI edits for controller, mixed port, and DNS listen mark those ports fixed.
 - `start` allocates and saves auto ports before spawning the daemon.
 - The daemon allocates missing listener ports when config is reloaded.
-- Startup validates Global Proxy, DNS, Port Proxy listener, and Port Proxy controller ports before spawning mihomo.
+- Startup validates Global Proxy, DNS, and Port Proxy listener ports before
+  spawning mihomo.
+- Startup validates Port Proxy controller ports only when the configured backend
+  is not a single-runtime backend.
+- Port checks are validation only. They must not bind and hold user-facing
+  listener ports as a readiness strategy, because a successful bind can itself
+  delay the next mihomo start from acquiring the port.
 
 ## Follow-Up
 

@@ -1,19 +1,26 @@
 use std::env;
 use std::fs::OpenOptions;
+use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
+use flate2::read::GzDecoder;
+use reqwest::{
+    Client, Proxy,
+    header::{HeaderMap, HeaderValue, USER_AGENT},
+};
+use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tokio::time::sleep;
 
 use crate::config::{AppConfig, Paths, PortProxyService, RuntimePaths};
 use crate::mihomo::MihomoClient;
 use crate::port_allocator;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use crate::privilege;
 use crate::runtime_profile;
+use crate::service;
+use crate::system_proxy;
 
 const CORE_NAMES: [&str; 4] = ["mihomo", "verge-mihomo", "verge-mihomo-alpha", "clash-meta"];
 const GEODATA_FILES: [&str; 4] = ["Country.mmdb", "geoip.metadb", "geoip.dat", "geosite.dat"];
@@ -25,9 +32,147 @@ const GEODATA_APP_DIRS: [&str; 5] = [
     "clash",
 ];
 const START_WAIT: Duration = Duration::from_millis(250);
-const START_RETRIES: usize = 20;
+const STOP_WAIT: Duration = Duration::from_millis(200);
+const STOP_RETRIES: usize = 75;
+const CORE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(90);
+const CORE_DOWNLOAD_USER_AGENT: &str = concat!("clashtui/v", env!("CARGO_PKG_VERSION"));
+const META_ALPHA_VERSION_URL: &str =
+    "https://github.com/MetaCubeX/mihomo/releases/download/Prerelease-Alpha/version.txt";
+const META_ALPHA_URL_PREFIX: &str =
+    "https://github.com/MetaCubeX/mihomo/releases/download/Prerelease-Alpha";
+const META_VERSION_URL: &str =
+    "https://github.com/MetaCubeX/mihomo/releases/latest/download/version.txt";
+const META_URL_PREFIX: &str = "https://github.com/MetaCubeX/mihomo/releases/download";
+
+pub const CORE_SOURCE_AUTO: &str = "auto";
+pub const CORE_SOURCE_RELEASE: &str = "verge-mihomo";
+pub const CORE_SOURCE_ALPHA: &str = "verge-mihomo-alpha";
+pub const CORE_SOURCE_CUSTOM: &str = "custom";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoreSource {
+    Auto,
+    Release,
+    Alpha,
+    Custom,
+}
+
+impl CoreSource {
+    pub const ALL: [Self; 4] = [Self::Auto, Self::Release, Self::Alpha, Self::Custom];
+
+    pub const fn value(self) -> &'static str {
+        match self {
+            Self::Auto => CORE_SOURCE_AUTO,
+            Self::Release => CORE_SOURCE_RELEASE,
+            Self::Alpha => CORE_SOURCE_ALPHA,
+            Self::Custom => CORE_SOURCE_CUSTOM,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Release => "Mihomo",
+            Self::Alpha => "Mihomo Alpha",
+            Self::Custom => "Custom Path",
+        }
+    }
+
+    pub fn parse(value: &str) -> Self {
+        match normalize_core_source(value).as_str() {
+            CORE_SOURCE_RELEASE | "release" | "stable" | "mihomo" => Self::Release,
+            CORE_SOURCE_ALPHA | "alpha" => Self::Alpha,
+            CORE_SOURCE_CUSTOM | "path" => Self::Custom,
+            _ => Self::Auto,
+        }
+    }
+
+    const fn managed(self) -> Option<ManagedCore> {
+        match self {
+            Self::Release => Some(ManagedCore::Release),
+            Self::Alpha => Some(ManagedCore::Alpha),
+            Self::Auto | Self::Custom => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ManagedCoreInstall {
+    pub source: CoreSource,
+    pub path: PathBuf,
+    pub version: String,
+    pub updated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedCore {
+    Release,
+    Alpha,
+}
+
+impl ManagedCore {
+    const fn source(self) -> CoreSource {
+        match self {
+            Self::Release => CoreSource::Release,
+            Self::Alpha => CoreSource::Alpha,
+        }
+    }
+
+    const fn binary_name(self) -> &'static str {
+        match self {
+            Self::Release => CORE_SOURCE_RELEASE,
+            Self::Alpha => CORE_SOURCE_ALPHA,
+        }
+    }
+
+    const fn version_url(self) -> &'static str {
+        match self {
+            Self::Release => META_VERSION_URL,
+            Self::Alpha => META_ALPHA_VERSION_URL,
+        }
+    }
+
+    const fn url_prefix(self) -> &'static str {
+        match self {
+            Self::Release => META_URL_PREFIX,
+            Self::Alpha => META_ALPHA_URL_PREFIX,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ManagedCoreMetadata {
+    source: String,
+    version: String,
+    asset: String,
+}
+
+struct DownloadAttempt {
+    label: &'static str,
+    proxy_url: Option<String>,
+}
 
 pub async fn ensure_running(paths: &Paths, config: &mut AppConfig) -> Result<()> {
+    if config.use_service_runtime() {
+        let status = service::status()?;
+        if status.reachable {
+            return ensure_service_runtime(paths, config).await;
+        }
+
+        let mut fallback_config = config.clone();
+        fallback_config.runtime_backend = "single".into();
+        fallback_config.tun.enable = false;
+        return ensure_user_single_runtime(paths, &fallback_config).await;
+    }
+
+    if config.use_single_runtime() {
+        return ensure_user_single_runtime(paths, config).await;
+    }
+
+    ensure_legacy_global_runtime(paths, config).await
+}
+
+async fn ensure_legacy_global_runtime(paths: &Paths, config: &AppConfig) -> Result<()> {
     let instance = global_instance(paths, config);
     if let Some(pid) = read_pid(&instance.pid_file).await?
         && is_process_running(pid)
@@ -36,23 +181,13 @@ pub async fn ensure_running(paths: &Paths, config: &mut AppConfig) -> Result<()>
     }
 
     remove_pid(&instance.pid_file).await?;
-    let Some(core_path) = resolve_core_path(config) else {
-        anyhow::bail!(
-            "mihomo core is not running and no core binary was found; set core_path in {} or MIHOMO_CORE",
-            paths.config_file.display()
-        );
-    };
+    let core_path = ensure_core_path(paths, config).await?;
 
     ensure_geodata(&instance.work_dir).await?;
     port_allocator::validate_required_ports_available(config)?;
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    let tun_device = prepare_helper_tun(config).await?;
-
     let mut bootstrap_config = config.clone();
-    let helper_tun = bootstrap_config.tun.file_descriptor.is_some()
-        && cfg!(any(target_os = "linux", target_os = "macos"));
-    if bootstrap_config.active_profile.is_some() && !helper_tun {
+    if bootstrap_config.active_profile.is_some() {
         bootstrap_config.tun.enable = false;
         bootstrap_config.dns.enable = false;
     }
@@ -70,30 +205,41 @@ pub async fn ensure_running(paths: &Paths, config: &mut AppConfig) -> Result<()>
     } else {
         runtime_profile::write_bootstrap_config(paths, &bootstrap_config).await?;
     }
-    if let Err(err) = start_instance(&instance, &core_path, config.tun.file_descriptor).await {
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        if tun_device.is_some() {
-            let _ = privilege::teardown_tun();
-            config.tun.file_descriptor = None;
-            config.runtime_interface_name = None;
-        }
-        return Err(err);
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    if tun_device.is_some()
-        && let Err(err) = activate_helper_tun_routes(&instance, config).await
-    {
-        let _ = privilege::teardown_tun();
-        let _ = stop_instance(&instance).await;
-        config.tun.file_descriptor = None;
-        config.runtime_interface_name = None;
-        return Err(err);
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    drop(tun_device);
+    start_instance(&instance, &core_path).await?;
     Ok(())
+}
+
+async fn ensure_user_single_runtime(paths: &Paths, config: &AppConfig) -> Result<()> {
+    let instance = global_instance(paths, config);
+    if let Some(pid) = read_pid(&instance.pid_file).await?
+        && is_process_running(pid)
+    {
+        return Ok(());
+    }
+
+    remove_pid(&instance.pid_file).await?;
+    let core_path = ensure_core_path(paths, config).await?;
+
+    ensure_geodata(&paths.config_dir).await?;
+    port_allocator::validate_required_ports_available(config)?;
+    runtime_profile::write_single_runtime_config(paths, config).await?;
+    start_instance(&instance, &core_path).await
+}
+
+async fn ensure_service_runtime(paths: &Paths, config: &AppConfig) -> Result<()> {
+    if service::core_running()? {
+        return Ok(());
+    }
+
+    service::stop_core()?;
+    stop_legacy_global(paths).await?;
+
+    let core_path = ensure_core_path(paths, config).await?;
+
+    ensure_geodata(&paths.config_dir).await?;
+    port_allocator::validate_required_ports_available(config)?;
+    let runtime_config = runtime_profile::write_single_runtime_config(paths, config).await?;
+    service::start_core(&core_path, paths, &runtime_config)
 }
 
 pub async fn ensure_service_running(
@@ -110,17 +256,13 @@ pub async fn ensure_service_running(
     }
 
     remove_pid(&instance.pid_file).await?;
-    let Some(core_path) = resolve_core_path(config) else {
-        anyhow::bail!(
-            "{} mihomo core is not running and no core binary was found; set core_path in {} or MIHOMO_CORE",
-            instance.label,
-            paths.config_file.display()
-        );
-    };
+    let core_path = ensure_core_path(paths, config)
+        .await
+        .with_context(|| format!("{} mihomo core is not available", instance.label))?;
 
     ensure_geodata(&instance.work_dir).await?;
     runtime_profile::write_service_config(paths, &instance, config, service).await?;
-    start_instance(&instance, &core_path, None).await?;
+    start_instance(&instance, &core_path).await?;
     Ok(instance)
 }
 
@@ -130,12 +272,22 @@ pub async fn owned_core_running(paths: &Paths) -> Result<bool> {
         .is_some_and(is_process_running))
 }
 
+pub async fn owned_core_running_for(paths: &Paths, config: &AppConfig) -> Result<bool> {
+    if config.use_service_runtime() {
+        let status = service::status()?;
+        if status.reachable {
+            return Ok(status.core_running);
+        }
+    }
+    owned_core_running(paths).await
+}
+
 pub async fn ensure_controller_is_owned(
     paths: &Paths,
     config: &AppConfig,
     client: &MihomoClient,
 ) -> Result<()> {
-    if owned_core_running(paths).await? {
+    if owned_core_running_for(paths, config).await? {
         return Ok(());
     }
 
@@ -150,10 +302,19 @@ pub async fn ensure_controller_is_owned(
     Ok(())
 }
 
-pub async fn stop(paths: &Paths) -> Result<()> {
+pub async fn stop(paths: &Paths, config: &AppConfig) -> Result<()> {
+    if config.use_service_runtime() {
+        if service::status()?.reachable {
+            service::stop_core()?;
+        }
+        return stop_legacy_global(paths).await;
+    }
     let instance = paths.global_runtime(String::new());
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    let _ = privilege::deactivate_tun();
+    stop_instance(&instance).await
+}
+
+pub async fn stop_legacy_global(paths: &Paths) -> Result<()> {
+    let instance = paths.global_runtime(String::new());
     stop_instance(&instance).await
 }
 
@@ -168,7 +329,7 @@ pub async fn stop_service(
 }
 
 pub async fn stop_all(paths: &Paths, config: &AppConfig) -> Result<()> {
-    stop(paths).await?;
+    stop(paths, config).await?;
     for (index, service) in config.proxy_ports.services.iter().enumerate() {
         stop_service(paths, config, index, service).await?;
     }
@@ -209,33 +370,402 @@ async fn stop_instance(instance: &RuntimePaths) -> Result<()> {
     if is_process_running(pid) {
         terminate_process(pid)
             .with_context(|| format!("failed to stop {} mihomo pid {pid}", instance.label))?;
-        wait_for_exit(pid).await;
+        if !wait_for_exit(pid).await {
+            force_terminate_process(pid).with_context(|| {
+                format!("failed to force stop {} mihomo pid {pid}", instance.label)
+            })?;
+        }
+        if !wait_for_exit(pid).await {
+            anyhow::bail!(
+                "{} mihomo pid {pid} did not exit after stop",
+                instance.label
+            );
+        }
     }
     remove_pid(&instance.pid_file).await
 }
 
-pub fn resolve_core_path(config: &AppConfig) -> Option<PathBuf> {
-    config
-        .core_path
-        .as_deref()
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .filter(|path| path.exists())
-        .or_else(|| {
-            env::var_os("MIHOMO_CORE")
-                .map(PathBuf::from)
-                .filter(|path| path.exists())
-        })
-        .or_else(resolve_sibling_core)
+pub fn selected_core_source(config: &AppConfig) -> CoreSource {
+    CoreSource::parse(&config.mihomo.core)
+}
+
+pub fn resolve_core_path(paths: &Paths, config: &AppConfig) -> Option<PathBuf> {
+    match selected_core_source(config) {
+        CoreSource::Custom => configured_core_path(config, true),
+        CoreSource::Release => existing_managed_core_path(paths, ManagedCore::Release),
+        CoreSource::Alpha => existing_managed_core_path(paths, ManagedCore::Alpha),
+        CoreSource::Auto => resolve_auto_core_path(paths, config),
+    }
+}
+
+pub async fn ensure_core_path(paths: &Paths, config: &AppConfig) -> Result<PathBuf> {
+    match selected_core_source(config) {
+        CoreSource::Custom => configured_core_path(config, true).with_context(|| {
+            format!(
+                "custom mihomo core is missing; set core_path in {} or choose auto",
+                paths.config_file.display()
+            )
+        }),
+        CoreSource::Release => Ok(ensure_managed_core(paths, ManagedCore::Release, false)
+            .await?
+            .path),
+        CoreSource::Alpha => Ok(ensure_managed_core(paths, ManagedCore::Alpha, false)
+            .await?
+            .path),
+        CoreSource::Auto => ensure_auto_core_path(paths, config).await,
+    }
+}
+
+pub async fn update_managed_core(paths: &Paths, config: &AppConfig) -> Result<ManagedCoreInstall> {
+    let core = selected_core_source(config)
+        .managed()
+        .unwrap_or(ManagedCore::Release);
+    ensure_managed_core(paths, core, true).await
+}
+
+async fn ensure_auto_core_path(paths: &Paths, config: &AppConfig) -> Result<PathBuf> {
+    if let Some(path) = configured_core_path(config, false) {
+        return Ok(path);
+    }
+    if let Some(path) = env_core_path() {
+        return Ok(path);
+    }
+
+    if let Some(path) = existing_managed_core_path(paths, ManagedCore::Release) {
+        return Ok(path);
+    }
+
+    match ensure_managed_core(paths, ManagedCore::Release, false).await {
+        Ok(install) => return Ok(install.path),
+        Err(err) => {
+            if let Some(path) = resolve_unmanaged_core_path() {
+                eprintln!("mihomo core: managed download failed, using discovered core: {err:#}");
+                return Ok(path);
+            }
+            Err(err).with_context(|| {
+                format!(
+                    "mihomo core is not running and no core binary was found; set core_path in {} or MIHOMO_CORE",
+                    paths.config_file.display()
+                )
+            })
+        }
+    }
+}
+
+fn resolve_auto_core_path(paths: &Paths, config: &AppConfig) -> Option<PathBuf> {
+    configured_core_path(config, false)
+        .or_else(env_core_path)
+        .or_else(|| existing_managed_core_path(paths, ManagedCore::Release))
+        .or_else(resolve_unmanaged_core_path)
+}
+
+fn resolve_unmanaged_core_path() -> Option<PathBuf> {
+    resolve_sibling_core()
         .or_else(resolve_known_app_core)
         .or_else(resolve_path_core)
 }
 
-async fn start_instance(
-    instance: &RuntimePaths,
-    core_path: &Path,
-    inherited_fd: Option<i32>,
+fn configured_core_path(config: &AppConfig, strict_custom: bool) -> Option<PathBuf> {
+    let value = config.core_path.as_deref()?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if !strict_custom && is_core_source_alias(value) {
+        return None;
+    }
+    Some(PathBuf::from(value)).filter(|path| path.exists())
+}
+
+fn env_core_path() -> Option<PathBuf> {
+    env::var_os("MIHOMO_CORE")
+        .map(PathBuf::from)
+        .filter(|path| path.exists())
+}
+
+fn is_core_source_alias(value: &str) -> bool {
+    matches!(
+        normalize_core_source(value).as_str(),
+        CORE_SOURCE_AUTO | CORE_SOURCE_RELEASE | CORE_SOURCE_ALPHA | CORE_SOURCE_CUSTOM
+    )
+}
+
+fn normalize_core_source(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+async fn ensure_managed_core(
+    paths: &Paths,
+    core: ManagedCore,
+    force_update: bool,
+) -> Result<ManagedCoreInstall> {
+    paths.ensure().await?;
+    let path = managed_core_path(paths, core);
+
+    if !force_update && is_usable_file(&path).await? {
+        return Ok(ManagedCoreInstall {
+            source: core.source(),
+            version: read_managed_core_metadata(paths, core)
+                .await?
+                .map(|metadata| metadata.version)
+                .unwrap_or_else(|| "unknown".into()),
+            path,
+            updated: false,
+        });
+    }
+
+    let version = fetch_text(core.version_url()).await.with_context(|| {
+        format!(
+            "failed to fetch mihomo {} version",
+            core.source().label().to_ascii_lowercase()
+        )
+    })?;
+    let version = version.trim().to_string();
+    if version.is_empty() {
+        anyhow::bail!("mihomo version response is empty");
+    }
+
+    if force_update
+        && is_usable_file(&path).await?
+        && read_managed_core_metadata(paths, core)
+            .await?
+            .is_some_and(|metadata| metadata.version == version)
+    {
+        return Ok(ManagedCoreInstall {
+            source: core.source(),
+            version,
+            path,
+            updated: false,
+        });
+    }
+
+    let asset = managed_core_asset(core)
+        .with_context(|| format!("unsupported mihomo download target {}", env::consts::ARCH))?;
+    let archive_ext = managed_core_archive_ext()?;
+    let archive_name = format!("{asset}-{version}.{archive_ext}");
+    let download_url = match core {
+        ManagedCore::Release => format!("{}/{version}/{archive_name}", core.url_prefix()),
+        ManagedCore::Alpha => format!("{}/{}", core.url_prefix(), archive_name),
+    };
+
+    let archive = fetch_bytes(&download_url).await.with_context(|| {
+        format!(
+            "failed to download mihomo core {} from {download_url}",
+            core.source().label()
+        )
+    })?;
+    let binary = unpack_core_archive(&archive, archive_ext)?;
+    let temp_path = path.with_extension("download");
+    fs::write(&temp_path, binary)
+        .await
+        .with_context(|| format!("failed to write {}", temp_path.display()))?;
+    chmod_executable(&temp_path).await?;
+    fs::rename(&temp_path, &path)
+        .await
+        .with_context(|| format!("failed to install {}", path.display()))?;
+    write_managed_core_metadata(
+        paths,
+        core,
+        &ManagedCoreMetadata {
+            source: core.source().value().into(),
+            version: version.clone(),
+            asset: asset.into(),
+        },
+    )
+    .await?;
+
+    Ok(ManagedCoreInstall {
+        source: core.source(),
+        path,
+        version,
+        updated: true,
+    })
+}
+
+fn managed_core_path(paths: &Paths, core: ManagedCore) -> PathBuf {
+    paths.cores_dir.join(binary_name(core.binary_name()))
+}
+
+fn existing_managed_core_path(paths: &Paths, core: ManagedCore) -> Option<PathBuf> {
+    let path = managed_core_path(paths, core);
+    path.exists().then_some(path)
+}
+
+fn managed_core_metadata_path(paths: &Paths, core: ManagedCore) -> PathBuf {
+    paths.cores_dir.join(format!("{}.json", core.binary_name()))
+}
+
+async fn read_managed_core_metadata(
+    paths: &Paths,
+    core: ManagedCore,
+) -> Result<Option<ManagedCoreMetadata>> {
+    let path = managed_core_metadata_path(paths, core);
+    let content = match fs::read_to_string(&path).await {
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("failed to read {}", path.display())),
+    };
+    let metadata = serde_json::from_str(&content)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    Ok(Some(metadata))
+}
+
+async fn write_managed_core_metadata(
+    paths: &Paths,
+    core: ManagedCore,
+    metadata: &ManagedCoreMetadata,
 ) -> Result<()> {
+    let path = managed_core_metadata_path(paths, core);
+    let content = serde_json::to_string_pretty(metadata)?;
+    fs::write(&path, content)
+        .await
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
+async fn fetch_text(url: &str) -> Result<String> {
+    let bytes = fetch_bytes(url).await?;
+    String::from_utf8(bytes).context("response is not valid UTF-8")
+}
+
+async fn fetch_bytes(url: &str) -> Result<Vec<u8>> {
+    let attempts = core_download_attempts();
+    let mut errors = Vec::new();
+    for attempt in attempts {
+        match fetch_bytes_once(url, &attempt).await {
+            Ok(bytes) => return Ok(bytes),
+            Err(err) => errors.push(format!("{}: {err:#}", attempt.label)),
+        }
+    }
+    anyhow::bail!("{}", errors.join("; "))
+}
+
+async fn fetch_bytes_once(url: &str, attempt: &DownloadAttempt) -> Result<Vec<u8>> {
+    let client = core_download_client(attempt.proxy_url.as_deref())?;
+    let response = client.get(url).send().await.context("request failed")?;
+    let status = response.status();
+    let body = response
+        .bytes()
+        .await
+        .context("failed to read response body")?;
+    if !status.is_success() {
+        anyhow::bail!("status {status}");
+    }
+    Ok(body.to_vec())
+}
+
+fn core_download_client(proxy_url: Option<&str>) -> Result<Client> {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        USER_AGENT,
+        HeaderValue::from_str(CORE_DOWNLOAD_USER_AGENT)
+            .context("invalid core download user agent")?,
+    );
+
+    let mut builder = Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .tcp_keepalive(Duration::from_secs(60))
+        .pool_max_idle_per_host(0)
+        .pool_idle_timeout(None)
+        .timeout(CORE_DOWNLOAD_TIMEOUT)
+        .connect_timeout(CORE_DOWNLOAD_TIMEOUT)
+        .default_headers(headers);
+
+    if let Some(proxy_url) = proxy_url {
+        builder = builder.proxy(Proxy::all(proxy_url)?);
+    } else {
+        builder = builder.no_proxy();
+    }
+
+    Ok(builder.build()?)
+}
+
+fn core_download_attempts() -> Vec<DownloadAttempt> {
+    let mut attempts = vec![DownloadAttempt {
+        label: "direct",
+        proxy_url: None,
+    }];
+
+    if let Some(proxy) = local_proxy_from_env() {
+        attempts.push(DownloadAttempt {
+            label: "environment proxy",
+            proxy_url: Some(proxy),
+        });
+    }
+
+    if let Ok(status) = system_proxy::status()
+        && status.enabled
+        && !status.server.trim().is_empty()
+    {
+        attempts.push(DownloadAttempt {
+            label: "system proxy",
+            proxy_url: Some(format!("http://{}", status.server)),
+        });
+    }
+
+    attempts
+}
+
+fn local_proxy_from_env() -> Option<String> {
+    env::var("HTTPS_PROXY")
+        .or_else(|_| env::var("https_proxy"))
+        .or_else(|_| env::var("HTTP_PROXY"))
+        .or_else(|_| env::var("http_proxy"))
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn managed_core_asset(core: ManagedCore) -> Option<&'static str> {
+    let platform = env::consts::OS;
+    let arch = env::consts::ARCH;
+    match (core, platform, arch) {
+        (ManagedCore::Release, "macos", "x86_64") => Some("mihomo-darwin-amd64-v2-go122"),
+        (ManagedCore::Alpha, "macos", "x86_64") => Some("mihomo-darwin-amd64-v1-go122"),
+        (_, "macos", "aarch64") => Some("mihomo-darwin-arm64-go122"),
+        (_, "linux", "x86_64") => Some("mihomo-linux-amd64-v2"),
+        (_, "linux", "aarch64") => Some("mihomo-linux-arm64"),
+        (_, "linux", "arm") => Some("mihomo-linux-armv7"),
+        (_, "linux", "riscv64") => Some("mihomo-linux-riscv64"),
+        (_, "linux", "loongarch64") => Some("mihomo-linux-loong64"),
+        _ => None,
+    }
+}
+
+fn managed_core_archive_ext() -> Result<&'static str> {
+    if cfg!(windows) {
+        anyhow::bail!("managed mihomo download is not implemented on Windows yet");
+    }
+    Ok("gz")
+}
+
+fn unpack_core_archive(archive: &[u8], archive_ext: &str) -> Result<Vec<u8>> {
+    match archive_ext {
+        "gz" => {
+            let mut decoder = GzDecoder::new(Cursor::new(archive));
+            let mut output = Vec::new();
+            decoder
+                .read_to_end(&mut output)
+                .context("failed to unpack mihomo gz archive")?;
+            Ok(output)
+        }
+        _ => anyhow::bail!("unsupported mihomo archive type: {archive_ext}"),
+    }
+}
+
+#[cfg(unix)]
+async fn chmod_executable(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let permissions = std::fs::Permissions::from_mode(0o755);
+    fs::set_permissions(path, permissions)
+        .await
+        .with_context(|| format!("failed to chmod {}", path.display()))
+}
+
+#[cfg(not(unix))]
+async fn chmod_executable(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+async fn start_instance(instance: &RuntimePaths, core_path: &Path) -> Result<()> {
     fs::create_dir_all(&instance.work_dir)
         .await
         .with_context(|| format!("failed to create {}", instance.work_dir.display()))?;
@@ -247,10 +777,6 @@ async fn start_instance(
     let err = log
         .try_clone()
         .with_context(|| format!("failed to clone {}", instance.log_file.display()))?;
-
-    if let Some(fd) = inherited_fd {
-        clear_close_on_exec(fd)?;
-    }
 
     let mut command = Command::new(core_path);
     command
@@ -294,59 +820,6 @@ async fn start_instance(
         instance.log_file.display()
     );
     Ok(())
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-async fn prepare_helper_tun(config: &mut AppConfig) -> Result<Option<privilege::TunDevice>> {
-    if !config.tun.enable {
-        config.tun.file_descriptor = None;
-        config.runtime_interface_name = None;
-        return Ok(None);
-    }
-
-    let status = privilege::current_tun_permission_status()
-        .context("failed to inspect TUN helper status")?;
-    if !status.helper_reachable {
-        config.tun.file_descriptor = None;
-        config.runtime_interface_name = None;
-        return Ok(None);
-    }
-
-    let fallback_interface = crate::platform::tun::default_route_interface().ok();
-    let tun_device = privilege::prepare_tun(&config.tun).context("failed to prepare TUN helper")?;
-    config.tun.device.clone_from(&tun_device.interface);
-    config.tun.file_descriptor = Some(tun_device.file_descriptor());
-    config.runtime_interface_name = tun_device.outbound_interface.clone().or(fallback_interface);
-    Ok(Some(tun_device))
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-async fn activate_helper_tun_routes(instance: &RuntimePaths, config: &AppConfig) -> Result<()> {
-    let client = MihomoClient::new(&config.controller);
-    wait_for_mihomo_controller(&client).await.with_context(|| {
-        format!(
-            "{} mihomo controller was not healthy before TUN route activation",
-            instance.label
-        )
-    })?;
-    let mihomo_pid = read_pid(&instance.pid_file).await?;
-    privilege::activate_tun(mihomo_pid).context("failed to activate TUN helper routes")
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-async fn wait_for_mihomo_controller(client: &MihomoClient) -> Result<()> {
-    let mut last_error = None;
-    for _ in 0..START_RETRIES {
-        match client.version().await {
-            Ok(_) => return Ok(()),
-            Err(err) => last_error = Some(err),
-        }
-        sleep(START_WAIT).await;
-    }
-    match last_error {
-        Some(err) => Err(err).context("mihomo controller did not become healthy"),
-        None => anyhow::bail!("mihomo controller did not become healthy"),
-    }
 }
 
 async fn ensure_geodata(target_dir: &Path) -> Result<()> {
@@ -526,26 +999,6 @@ fn path_to_str(path: &Path) -> Result<&str> {
         .with_context(|| format!("path is not valid UTF-8: {}", path.display()))
 }
 
-#[cfg(target_os = "macos")]
-fn clear_close_on_exec(fd: i32) -> Result<()> {
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-    if flags < 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("failed to read fd flags for inherited fd {fd}"));
-    }
-    let status = unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) };
-    if status != 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("failed to clear FD_CLOEXEC for inherited fd {fd}"));
-    }
-    Ok(())
-}
-
-#[cfg(not(target_os = "macos"))]
-fn clear_close_on_exec(_fd: i32) -> Result<()> {
-    Ok(())
-}
-
 async fn read_pid(path: &Path) -> Result<Option<u32>> {
     let content = match fs::read_to_string(path).await {
         Ok(content) => content,
@@ -567,13 +1020,14 @@ async fn remove_pid(path: &Path) -> Result<()> {
     }
 }
 
-async fn wait_for_exit(pid: u32) {
-    for _ in 0..START_RETRIES {
+async fn wait_for_exit(pid: u32) -> bool {
+    for _ in 0..STOP_RETRIES {
         if !is_process_running(pid) {
-            return;
+            return true;
         }
-        sleep(START_WAIT).await;
+        sleep(STOP_WAIT).await;
     }
+    !is_process_running(pid)
 }
 
 #[cfg(unix)]
@@ -595,12 +1049,11 @@ fn prepare_background_command(_command: &mut Command) {}
 
 #[cfg(unix)]
 fn is_process_running(pid: u32) -> bool {
-    Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+    let status = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if status == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 #[cfg(windows)]
@@ -621,12 +1074,7 @@ fn is_process_running(_pid: u32) -> bool {
 
 #[cfg(unix)]
 fn terminate_process(pid: u32) -> Result<()> {
-    let status = Command::new("kill").arg(pid.to_string()).status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        anyhow::bail!("kill exited with {status}");
-    }
+    signal_process(pid, libc::SIGTERM)
 }
 
 #[cfg(windows)]
@@ -644,4 +1092,32 @@ fn terminate_process(pid: u32) -> Result<()> {
 #[cfg(not(any(unix, windows)))]
 fn terminate_process(_pid: u32) -> Result<()> {
     anyhow::bail!("stop is not supported on this platform");
+}
+
+#[cfg(unix)]
+fn force_terminate_process(pid: u32) -> Result<()> {
+    signal_process(pid, libc::SIGKILL)
+}
+
+#[cfg(windows)]
+fn force_terminate_process(pid: u32) -> Result<()> {
+    terminate_process(pid)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn force_terminate_process(_pid: u32) -> Result<()> {
+    anyhow::bail!("stop is not supported on this platform");
+}
+
+#[cfg(unix)]
+fn signal_process(pid: u32, signal: libc::c_int) -> Result<()> {
+    let status = unsafe { libc::kill(pid as libc::pid_t, signal) };
+    if status == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(err).with_context(|| format!("failed to signal pid {pid}"))
 }

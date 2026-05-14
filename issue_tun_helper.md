@@ -1,5 +1,27 @@
 # TUN Helper Design
 
+## Status
+
+Superseded by `issue_mihomo_single_runtime.md`.
+
+The helper-fd architecture described below is retained only as historical
+analysis. The current implementation removed `tun-install`, `tun-uninstall`,
+`__tun-*`, `clashtui-tun-helper`, and `src/privilege/*`.
+
+The active direction is a Clash Verge Rev-like service mode:
+
+- `service-install`, `service-uninstall`, and `service-status` are the
+  user-facing privilege lifecycle commands.
+- The service starts one service-owned/root-owned mihomo runtime when TUN is
+  required.
+- Global Proxy, DNS, TUN, and Port Proxy listeners are generated into the same
+  mihomo config.
+- Root-owned mihomo uses a root-owned persistent work directory, not the normal
+  user config directory.
+
+Do not use this document as an implementation target unless the project
+explicitly revives helper-fd mode.
+
 ## Problem
 
 `clashtui` can enable TUN in its config, but on macOS the current user-mode

@@ -24,18 +24,41 @@ Runtime symptoms:
 - System proxy can point GUI apps at Global Proxy.
 - TUN is reported as unavailable in `status` when the process is not privileged.
 - The daemon logs a warning instead of repeatedly failing the whole runtime apply.
+- In `runtime_backend=service`, an installed and reachable service starts one
+  privileged mihomo runtime that owns TUN, DNS, Global Proxy, and all enabled
+  Port Proxy listeners.
+- If the service is missing or unreachable, `clashtui start` falls back to a
+  user-mode single runtime for that run. Proxy listeners still work, but TUN is
+  disabled in the runtime copy.
 
 ## Required Design
 
 macOS TUN needs a privileged execution path for the Global Proxy mihomo runtime:
 
-- LaunchDaemon or privileged helper owns Global Proxy mihomo.
-- Service file pins `CLASHTUI_CONFIG_DIR` to the user's config directory.
-- Port Proxy runtimes can remain user-mode because they do not own TUN.
+- LaunchDaemon owns a small privileged `clashtui` service.
+- The service starts one service-owned mihomo process from an authenticated IPC
+  request.
+- Service-owned/root-owned mihomo uses a root-owned persistent work directory:
+  `/Library/Application Support/clashtui/service/<uid>/`.
+- `/var/run` is reserved for volatile IPC and pid/state files.
+- Port Proxy listeners run inside the same mihomo process as TUN; the old hybrid
+  model with root TUN mihomo plus user-mode Port Proxy mihomo is not supported.
 - TUI should expose this as setup, not as a hidden requirement.
+
+## Implemented
+
+- `service-install`, `service-uninstall`, and `service-status` are implemented.
+- `tun-install` / `tun-uninstall` and the helper-fd path have been removed.
+- `service-install` prints a short sudo/elevation explanation before requesting
+  root installation.
+- Service install/upgrade stops stale service-owned mihomo before replacing the
+  LaunchDaemon.
+- Service start cleans stale old-architecture user-mode cores before validating
+  listener ports.
 
 ## Follow-Up
 
-- Add macOS `service-install` / `service-uninstall` or a dedicated privileged helper.
-- Make TUN setup explain why user-mode start can only provide port/system proxy behavior.
-- Consider a "Start without TUN" confirmation when TUN is enabled but privileges are missing.
+- Surface service install/uninstall from config as settings/actions rather than
+  adding more top-level CLI commands.
+- Consider a "Start without TUN" confirmation when TUN is enabled but privileges
+  are missing.

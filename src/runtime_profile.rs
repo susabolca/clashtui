@@ -111,6 +111,256 @@ pub async fn write_current_config(paths: &Paths, config: &AppConfig) -> Result<s
     write_active_config(paths, config, sub).await
 }
 
+pub async fn write_single_runtime_config(
+    paths: &Paths,
+    config: &AppConfig,
+) -> Result<std::path::PathBuf> {
+    let mut value = match config.active_profile.as_deref() {
+        Some(profile_name) => {
+            let sub = config
+                .subscriptions
+                .iter()
+                .find(|sub| sub.name == profile_name)
+                .with_context(|| format!("active profile not found: {profile_name}"))?;
+            read_subscription_profile(paths, sub).await?
+        }
+        None => Value::Mapping(empty_profile()),
+    };
+
+    merge_single_runtime_port_profiles(paths, config, &mut value).await?;
+    value = build_single_runtime_config(config, value)?;
+    let content = serde_yaml_ng::to_string(&value)?;
+    fs::write(&paths.active_config_file, &content)
+        .await
+        .with_context(|| format!("failed to write {}", paths.active_config_file.display()))?;
+    fs::write(&paths.core_config_file, content)
+        .await
+        .with_context(|| format!("failed to write {}", paths.core_config_file.display()))?;
+    Ok(paths.core_config_file.clone())
+}
+
+fn build_single_runtime_config(config: &AppConfig, mut value: Value) -> Result<Value> {
+    apply_overrides(&mut value, config)?;
+    let mapping = value
+        .as_mapping_mut()
+        .context("mihomo profile root must be a YAML mapping")?;
+    insert_single_runtime_listeners(mapping, &config.proxy_ports.services)?;
+    Ok(value)
+}
+
+async fn merge_single_runtime_port_profiles(
+    paths: &Paths,
+    config: &AppConfig,
+    target: &mut Value,
+) -> Result<()> {
+    let active_profile = config.active_profile.as_deref();
+    for (index, service) in config
+        .proxy_ports
+        .services
+        .iter()
+        .enumerate()
+        .filter(|(_, service)| service.enabled)
+    {
+        let Some(subscription) = service
+            .subscription
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            continue;
+        };
+        if Some(subscription) == active_profile {
+            continue;
+        }
+        let sub = config
+            .subscriptions
+            .iter()
+            .find(|sub| sub.name == subscription)
+            .with_context(|| format!("port proxy subscription not found: {subscription}"))?;
+        let source = read_subscription_profile(paths, sub).await?;
+        merge_port_proxy_profile(target, &source, index, service)
+            .with_context(|| format!("failed to merge port proxy profile {}", service.name))?;
+    }
+    Ok(())
+}
+
+fn merge_port_proxy_profile(
+    target: &mut Value,
+    source: &Value,
+    _index: usize,
+    service: &PortProxyService,
+) -> Result<()> {
+    if service.mode.eq_ignore_ascii_case("global")
+        && let Some(proxy) = service
+            .proxy
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    {
+        let mut seen = Vec::new();
+        merge_proxy_or_group(target, source, proxy, &mut seen)?;
+    }
+
+    if service.mode.eq_ignore_ascii_case("rule")
+        && let Some(rule) = service
+            .rule
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    {
+        merge_named_map_entry(target, source, "sub-rules", rule)?;
+    }
+
+    Ok(())
+}
+
+fn merge_proxy_or_group(
+    target: &mut Value,
+    source: &Value,
+    name: &str,
+    seen: &mut Vec<String>,
+) -> Result<()> {
+    if matches!(
+        name,
+        "DIRECT" | "REJECT" | "REJECT-DROP" | "PASS" | "COMPATIBLE"
+    ) {
+        return Ok(());
+    }
+    if seen.iter().any(|item| item == name) {
+        return Ok(());
+    }
+    seen.push(name.to_string());
+
+    if let Some(proxy) = find_named_sequence_item(source, "proxies", name) {
+        append_named_sequence_item(target, "proxies", proxy, name)?;
+        return Ok(());
+    }
+
+    if let Some(group) = find_named_sequence_item(source, "proxy-groups", name) {
+        for proxy in group
+            .as_mapping()
+            .and_then(|mapping| mapping.get("proxies"))
+            .and_then(Value::as_sequence)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            merge_proxy_or_group(target, source, proxy, seen)?;
+        }
+        for provider in group
+            .as_mapping()
+            .and_then(|mapping| mapping.get("use"))
+            .and_then(Value::as_sequence)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            merge_named_map_entry(target, source, "proxy-providers", provider)?;
+        }
+        append_named_sequence_item(target, "proxy-groups", group, name)?;
+        return Ok(());
+    }
+
+    if target_has_proxy_or_group(target, name) {
+        return Ok(());
+    }
+
+    anyhow::bail!("proxy or group not found in port proxy subscription: {name}")
+}
+
+fn find_named_sequence_item(value: &Value, key: &str, name: &str) -> Option<Value> {
+    value
+        .as_mapping()?
+        .get(key)?
+        .as_sequence()?
+        .iter()
+        .find(|item| named_item_name(item) == Some(name))
+        .cloned()
+}
+
+fn append_named_sequence_item(
+    target: &mut Value,
+    key: &str,
+    item: Value,
+    name: &str,
+) -> Result<()> {
+    let mapping = target
+        .as_mapping_mut()
+        .context("mihomo profile root must be a YAML mapping")?;
+    let key_value = Value::from(key);
+    if !mapping.contains_key(&key_value) {
+        mapping.insert(key_value.clone(), Vec::<Value>::new().into());
+    }
+    let sequence = mapping
+        .get_mut(&key_value)
+        .and_then(Value::as_sequence_mut)
+        .with_context(|| format!("mihomo profile {key} must be a YAML sequence"))?;
+
+    if let Some(existing) = sequence
+        .iter()
+        .find(|candidate| named_item_name(candidate) == Some(name))
+    {
+        if existing == &item {
+            return Ok(());
+        }
+        anyhow::bail!("{key} entry {name} conflicts with an existing entry");
+    }
+
+    sequence.push(item);
+    Ok(())
+}
+
+fn merge_named_map_entry(target: &mut Value, source: &Value, key: &str, name: &str) -> Result<()> {
+    let Some(item) = source
+        .as_mapping()
+        .and_then(|mapping| mapping.get(key))
+        .and_then(Value::as_mapping)
+        .and_then(|mapping| mapping.get(name))
+        .cloned()
+    else {
+        if target
+            .as_mapping()
+            .and_then(|mapping| mapping.get(key))
+            .and_then(Value::as_mapping)
+            .is_some_and(|mapping| mapping.contains_key(name))
+        {
+            return Ok(());
+        }
+        anyhow::bail!("{key} entry not found in port proxy subscription: {name}");
+    };
+
+    let mapping = target
+        .as_mapping_mut()
+        .context("mihomo profile root must be a YAML mapping")?;
+    let key_value = Value::from(key);
+    if !mapping.contains_key(&key_value) {
+        mapping.insert(key_value.clone(), Value::Mapping(Mapping::new()));
+    }
+    let section = mapping
+        .get_mut(&key_value)
+        .and_then(Value::as_mapping_mut)
+        .with_context(|| format!("mihomo profile {key} must be a YAML mapping"))?;
+    let name_value = Value::from(name);
+
+    if let Some(existing) = section.get(&name_value) {
+        if existing == &item {
+            return Ok(());
+        }
+        anyhow::bail!("{key} entry {name} conflicts with an existing entry");
+    }
+
+    section.insert(name_value, item);
+    Ok(())
+}
+
+fn target_has_proxy_or_group(target: &Value, name: &str) -> bool {
+    find_named_sequence_item(target, "proxies", name).is_some()
+        || find_named_sequence_item(target, "proxy-groups", name).is_some()
+}
+
+fn named_item_name(item: &Value) -> Option<&str> {
+    item.as_mapping()?.get("name")?.as_str()
+}
+
 async fn read_subscription_profile(paths: &Paths, sub: &Subscription) -> Result<Value> {
     let profile = subscription::profile_path(paths, sub);
     let content = fs::read_to_string(&profile)
@@ -152,14 +402,6 @@ fn apply_overrides(value: &mut Value, config: &AppConfig) -> Result<()> {
     mapping.insert("allow-lan".into(), config.proxy_ports.allow_lan.into());
     mapping.insert("ipv6".into(), true.into());
     mapping.insert("unified-delay".into(), true.into());
-    if let Some(interface_name) = config
-        .runtime_interface_name
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        mapping.insert("interface-name".into(), interface_name.into());
-    }
-
     if let Some(secret) = config
         .controller
         .secret
@@ -216,6 +458,88 @@ fn insert_service_listener(mapping: &mut Mapping, service: &PortProxyService) ->
 
     mapping.insert("listeners".into(), vec![Value::Mapping(listener)].into());
     Ok(())
+}
+
+fn insert_single_runtime_listeners(
+    mapping: &mut Mapping,
+    services: &[PortProxyService],
+) -> Result<()> {
+    let mut listeners = Vec::new();
+    for (index, service) in services.iter().enumerate() {
+        if !service.enabled {
+            continue;
+        }
+        listeners.push(Value::Mapping(single_runtime_listener(index, service)?));
+    }
+
+    if listeners.is_empty() {
+        mapping.remove("listeners");
+    } else {
+        mapping.insert("listeners".into(), listeners.into());
+    }
+    Ok(())
+}
+
+fn single_runtime_listener(index: usize, service: &PortProxyService) -> Result<Mapping> {
+    if service.port == 0 {
+        anyhow::bail!("port proxy service has invalid port: {}", service.name);
+    }
+
+    let kind = service.kind.trim().to_ascii_lowercase();
+    if !matches!(kind.as_str(), "http" | "socks" | "mixed") {
+        anyhow::bail!(
+            "port proxy service {} has unsupported kind {}; expected http, socks, or mixed",
+            service.name,
+            service.kind
+        );
+    }
+
+    let listen = if service.listen.trim().is_empty() {
+        "127.0.0.1"
+    } else {
+        service.listen.trim()
+    };
+
+    let mut listener = Mapping::new();
+    listener.insert(
+        "name".into(),
+        single_runtime_listener_name(index, service).into(),
+    );
+    listener.insert("type".into(), kind.clone().into());
+    listener.insert("port".into(), service.port.into());
+    listener.insert("listen".into(), listen.into());
+    if kind != "http" {
+        listener.insert("udp".into(), service.udp.into());
+    }
+    if service.mode.eq_ignore_ascii_case("global")
+        && let Some(proxy) = service
+            .proxy
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    {
+        listener.insert("proxy".into(), proxy.into());
+    }
+    if service.mode.eq_ignore_ascii_case("rule")
+        && let Some(rule) = service
+            .rule
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    {
+        listener.insert("rule".into(), rule.into());
+    }
+
+    Ok(listener)
+}
+
+pub fn single_runtime_listener_name(index: usize, service: &PortProxyService) -> String {
+    let name = service.name.trim();
+    if name.is_empty() {
+        format!("clashtui-port-proxy-{}", index + 1)
+    } else {
+        format!("clashtui-port-proxy-{}-{name}", index + 1)
+    }
 }
 
 fn remove_unmanaged_inbounds(mapping: &mut Mapping) {
@@ -396,48 +720,137 @@ rules: []
     }
 
     #[test]
-    fn service_runtime_keeps_interface_name_for_global_tun_bypass() {
-        let config = AppConfig {
-            runtime_interface_name: Some("en0".into()),
-            tun: crate::config::TunConfig {
-                enable: true,
-                ..crate::config::TunConfig::default()
-            },
+    fn single_runtime_config_adds_all_enabled_port_proxy_listeners() -> Result<()> {
+        let profile: Value = serde_yaml_ng::from_str(
+            r"
+proxies:
+  - name: node-a
+    type: http
+    server: 127.0.0.1
+    port: 8080
+proxy-groups:
+  - name: GLOBAL
+    type: select
+    proxies: [node-a]
+rules:
+  - MATCH,GLOBAL
+listeners:
+  - name: old
+    type: mixed
+    port: 7000
+",
+        )?;
+        let mut config = AppConfig {
+            mixed_port: 7070,
+            runtime_mode: "rule".into(),
             ..AppConfig::default()
         };
-        let service = PortProxyService {
-            name: "port-1".into(),
-            mode: "global".into(),
+        config.proxy_ports.services.push(PortProxyService {
+            name: "fixed".into(),
+            kind: "mixed".into(),
+            listen: "127.0.0.1".into(),
+            port: 7071,
+            proxy: Some("node-a".into()),
+            udp: true,
             ..PortProxyService::default()
-        };
+        });
+        config.proxy_ports.services.push(PortProxyService {
+            enabled: false,
+            name: "disabled".into(),
+            port: 7072,
+            ..PortProxyService::default()
+        });
+        config.proxy_ports.services.push(PortProxyService {
+            name: "rule".into(),
+            kind: "http".into(),
+            listen: "127.0.0.1".into(),
+            port: 7073,
+            mode: "rule".into(),
+            rule: Some("port-rule".into()),
+            ..PortProxyService::default()
+        });
 
-        let runtime_config = service_runtime_config(&config, "http://127.0.0.1:20090", &service);
+        let value = build_single_runtime_config(&config, profile)?;
+        let listeners = value
+            .as_mapping()
+            .and_then(|mapping| mapping.get("listeners"))
+            .and_then(Value::as_sequence)
+            .context("listeners missing")?;
 
+        assert_eq!(listeners.len(), 2);
+        let first = listeners
+            .first()
+            .and_then(Value::as_mapping)
+            .context("first listener missing")?;
         assert_eq!(
-            runtime_config.runtime_interface_name.as_deref(),
-            Some("en0")
+            first.get("name").and_then(Value::as_str),
+            Some("clashtui-port-proxy-1-fixed")
         );
-        assert!(!runtime_config.tun.enable);
-        assert!(!runtime_config.system_proxy.enabled);
-        assert!(!runtime_config.dns.enable);
+        assert_eq!(first.get("proxy").and_then(Value::as_str), Some("node-a"));
+        assert_eq!(first.get("udp").and_then(Value::as_bool), Some(true));
+
+        let second = listeners
+            .get(1)
+            .and_then(Value::as_mapping)
+            .context("second listener missing")?;
+        assert_eq!(second.get("type").and_then(Value::as_str), Some("http"));
+        assert_eq!(
+            second.get("rule").and_then(Value::as_str),
+            Some("port-rule")
+        );
+        assert!(second.get("udp").is_none());
+        Ok(())
     }
 
     #[test]
-    fn apply_overrides_adds_runtime_interface_name() -> Result<()> {
-        let mut profile = Value::Mapping(empty_profile());
-        let config = AppConfig {
-            runtime_interface_name: Some("en0".into()),
-            ..AppConfig::default()
+    fn single_runtime_merges_port_proxy_subscription_proxy() -> Result<()> {
+        let mut target: Value = serde_yaml_ng::from_str(
+            r"
+proxies:
+  - name: active
+    type: http
+    server: 127.0.0.1
+    port: 8080
+proxy-groups: []
+rules: []
+",
+        )?;
+        let source: Value = serde_yaml_ng::from_str(
+            r"
+proxies:
+  - name: imported
+    type: http
+    server: 127.0.0.2
+    port: 8081
+proxy-groups:
+  - name: imported-group
+    type: select
+    proxies: [imported]
+rules: []
+",
+        )?;
+        let service = PortProxyService {
+            mode: "global".into(),
+            proxy: Some("imported".into()),
+            ..PortProxyService::default()
         };
 
-        apply_overrides(&mut profile, &config)?;
+        merge_port_proxy_profile(&mut target, &source, 0, &service)?;
 
-        let mapping = profile
+        let proxies = target
             .as_mapping()
-            .context("profile root is not a mapping")?;
-        assert_eq!(
-            mapping.get("interface-name").and_then(Value::as_str),
-            Some("en0")
+            .and_then(|mapping| mapping.get("proxies"))
+            .and_then(Value::as_sequence)
+            .context("proxies missing")?;
+        assert!(
+            proxies
+                .iter()
+                .any(|item| named_item_name(item) == Some("active"))
+        );
+        assert!(
+            proxies
+                .iter()
+                .any(|item| named_item_name(item) == Some("imported"))
         );
         Ok(())
     }

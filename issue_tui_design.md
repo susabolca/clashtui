@@ -104,6 +104,8 @@ Navigation:
 - Esc closes the active popup first.
 - If no popup is open, Esc pops one `Location`.
 - On root section, Esc opens `Exit Without Saving?`.
+- The `Help` section was removed. Key hints and selected-row detail live in the
+  right pane, and save/exit/runtime commands live on the `Exit` section.
 - Location must preserve the active section, current page, and selected row within the current page path.
 
 ## Dialog Rules
@@ -168,7 +170,7 @@ Confirm popup:
 - Title bar spans the full popup inner width and is centered with a background color.
 - One-button confirm uses centered `OK`.
 - Yes/No confirm uses two buttons on one row, selected with Left/Right.
-- F10/F11 and exit confirmations must always be Yes/No.
+- F10 and exit confirmations must always be Yes/No.
 
 ## ClashTUI Mapping
 
@@ -207,7 +209,14 @@ Port Proxy page:
 Subscription page:
 
 - Subscription list is a maintenance surface, not a proxy selection surface.
-- Rows show subscription-owned state: used traffic, total traffic, expiry, last update, and last error.
+- Each existing subscription is rendered as two lines:
+  - first line: name, last update timestamp to seconds, and state such as `OK`
+  - second line: proxy count, usage, total, and expiry date
+- Only the first line participates in row selection/highlight. The secondary
+  line remains low-attention text.
+- The final `Add Subscription` action is a single-line row.
+- The right detail pane shows refresh cadence, update time, state, and last
+  error instead of the raw subscription URL.
 - Do not show `used by` in the list; proxy usage belongs to proxy configuration.
 - Enter on a subscription opens its detail page.
 - Add Subscription opens a child screen with:
@@ -304,10 +313,14 @@ Current Main implementation:
 Runtime startup policy:
 
 - Opening Config/TUI should not start mihomo just to display subscription data.
-- `start` starts the Global Proxy mihomo runtime plus one mihomo runtime for each enabled Port Proxy.
-- Global Proxy owns system proxy, TUN, and DNS behavior.
-- Each Port Proxy owns its listener, subscription, mode, selected proxy/rule choices, workdir, controller, pid file, and log file.
-- Port Proxy mihomo stdout/stderr is redirected to its own runtime log and must not pollute the TUI.
+- In the default service/single backend, `start` starts one mihomo runtime.
+- Global Proxy owns the top-level `mixed-port`, system proxy, TUN, and DNS behavior.
+- Each Port Proxy is generated as a mihomo `listener` inside that same runtime.
+- Legacy `multi` / `multi-process` backends keep the older per-Port-Proxy
+  mihomo process model only as compatibility behavior.
+- Runtime command stdout/stderr from `Start`, `Stop`, `Reload`, `Restart`, and
+  `Save & Restart` is captured and shown through status/alert/progress UI, not
+  written directly into the ratatui alternate screen.
 - Config browsing should not imply runtime side effects.
 
 Known follow-up:

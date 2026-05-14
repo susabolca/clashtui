@@ -6,6 +6,7 @@ use tokio::fs;
 
 pub const DEFAULT_MIXED_PORT: u16 = 7070;
 pub const DEFAULT_CONTROLLER_URL: &str = "http://127.0.0.1:19090";
+pub const DEFAULT_RUNTIME_BACKEND: &str = "service";
 const LEGACY_DEFAULT_MIXED_PORT: u16 = 7897;
 const LEGACY_DEFAULT_CONTROLLER_URLS: [&str; 1] = ["http://127.0.0.1:9097"];
 const DEFAULT_DNS_LISTEN: &str = "127.0.0.1:10553";
@@ -22,6 +23,7 @@ pub struct Paths {
     pub log_file: PathBuf,
     pub core_log_file: PathBuf,
     pub profiles_dir: PathBuf,
+    pub cores_dir: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +49,7 @@ impl Paths {
         let log_file = config_dir.join("clashtui.log");
         let core_log_file = config_dir.join("mihomo.log");
         let profiles_dir = config_dir.join("profiles");
+        let cores_dir = config_dir.join("cores");
         Ok(Self {
             config_dir,
             config_file,
@@ -57,12 +60,14 @@ impl Paths {
             log_file,
             core_log_file,
             profiles_dir,
+            cores_dir,
         })
     }
 
     pub async fn ensure(&self) -> Result<()> {
         fs::create_dir_all(&self.config_dir).await?;
         fs::create_dir_all(&self.profiles_dir).await?;
+        fs::create_dir_all(&self.cores_dir).await?;
         Ok(())
     }
 
@@ -140,6 +145,7 @@ fn home_dir() -> Option<PathBuf> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
+    pub mihomo: MihomoConfig,
     pub core_path: Option<String>,
     pub controller: ControllerConfig,
     pub proxy_host: String,
@@ -148,18 +154,19 @@ pub struct AppConfig {
     pub system_proxy: SystemProxyConfig,
     pub tun: TunConfig,
     pub dns: DnsConfig,
+    pub autostart: AutostartConfig,
     pub port_allocation: PortAllocationConfig,
+    pub runtime_backend: String,
     pub runtime_mode: String,
     pub proxy_selections: BTreeMap<String, String>,
     pub subscriptions: Vec<Subscription>,
     pub active_profile: Option<String>,
-    #[serde(skip)]
-    pub runtime_interface_name: Option<String>,
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
+            mihomo: MihomoConfig::default(),
             core_path: None,
             controller: ControllerConfig::default(),
             proxy_host: "127.0.0.1".into(),
@@ -168,12 +175,29 @@ impl Default for AppConfig {
             system_proxy: SystemProxyConfig::default(),
             tun: TunConfig::default(),
             dns: DnsConfig::default(),
+            autostart: AutostartConfig::default(),
             port_allocation: PortAllocationConfig::default(),
+            runtime_backend: DEFAULT_RUNTIME_BACKEND.into(),
             runtime_mode: "rule".into(),
             proxy_selections: BTreeMap::new(),
             subscriptions: Vec::new(),
             active_profile: None,
-            runtime_interface_name: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MihomoConfig {
+    pub core: String,
+    pub update: String,
+}
+
+impl Default for MihomoConfig {
+    fn default() -> Self {
+        Self {
+            core: "auto".into(),
+            update: "manual".into(),
         }
     }
 }
@@ -254,6 +278,20 @@ impl AppConfig {
         parts.join(" ")
     }
 
+    pub fn use_single_runtime(&self) -> bool {
+        !matches!(
+            self.runtime_backend.trim().to_ascii_lowercase().as_str(),
+            "legacy" | "multi" | "multi-process"
+        )
+    }
+
+    pub fn use_service_runtime(&self) -> bool {
+        matches!(
+            self.runtime_backend.trim().to_ascii_lowercase().as_str(),
+            "" | "service"
+        )
+    }
+
     fn migrate_legacy_defaults(&mut self) -> bool {
         let controller_changed =
             if LEGACY_DEFAULT_CONTROLLER_URLS.contains(&self.controller.url.as_str()) {
@@ -312,6 +350,12 @@ impl AppConfig {
         }
         changed || controller_changed || mixed_changed || dns_changed
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct AutostartConfig {
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -431,8 +475,6 @@ pub struct TunConfig {
     pub strict_route: bool,
     pub mtu: u16,
     pub route_exclude_address: Vec<String>,
-    #[serde(skip)]
-    pub file_descriptor: Option<i32>,
 }
 
 impl Default for TunConfig {
@@ -448,7 +490,6 @@ impl Default for TunConfig {
             strict_route: false,
             mtu: 1500,
             route_exclude_address: Vec::new(),
-            file_descriptor: None,
         }
     }
 }
@@ -616,29 +657,5 @@ mod tests {
         assert!(config.port_allocation.auto_controller);
         assert!(!config.port_allocation.auto_mixed);
         assert!(config.port_allocation.auto_dns);
-    }
-
-    #[test]
-    fn tun_file_descriptor_is_runtime_only() -> Result<()> {
-        let config = AppConfig {
-            runtime_interface_name: Some("en0".into()),
-            tun: TunConfig {
-                file_descriptor: Some(3),
-                ..TunConfig::default()
-            },
-            ..AppConfig::default()
-        };
-
-        let serialized = serde_yaml_ng::to_string(&config)?;
-        assert!(!serialized.contains("file_descriptor"));
-        assert!(!serialized.contains("file-descriptor"));
-        assert!(!serialized.contains("runtime_interface_name"));
-        assert!(!serialized.contains("interface-name"));
-
-        let decoded: AppConfig =
-            serde_yaml_ng::from_str("runtime_interface_name: en0\ntun:\n  file_descriptor: 9\n")?;
-        assert_eq!(decoded.runtime_interface_name, None);
-        assert_eq!(decoded.tun.file_descriptor, None);
-        Ok(())
     }
 }

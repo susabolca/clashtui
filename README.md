@@ -1,40 +1,70 @@
 # clashtui
 
-`clashtui` is a small Rust TUI and background controller for mihomo / Clash.Meta.
+<p align="right">
+English | <a href="./README.zh-CN.md">中文</a>
+</p>
 
-It does not implement a proxy core. It starts and controls mihomo, loads subscription profiles, and applies runtime settings for:
+`clashtui` is a terminal UI and background controller for
+[MetaCubeX/mihomo](https://github.com/MetaCubeX/mihomo). It is not a proxy core
+itself. It manages mihomo profiles, local listeners, runtime state, system
+proxy, DNS, and optional TUN from one compact TUI.
 
-- subscriptions and proxy group selection
-- Global Proxy mixed HTTP/SOCKS5 port, default `7070`
-- optional Port Proxies, each backed by its own mihomo process
-- system proxy
-- TUN mode
-- mihomo DNS, including LAN DNS policies
+<p align="center">
+  <img src="./doc/screen.png" alt="clashtui terminal UI screenshot" width="900">
+</p>
 
-## Build
+## What It Does
+
+- Runs a Global Proxy listener, defaulting to `127.0.0.1:7070`.
+- Adds multiple Port Proxy listeners, for example `127.0.0.1:7071`,
+  `127.0.0.1:7072`, and more.
+- Lets each Port Proxy choose its own subscription, mode, and proxy target.
+- Uses one mihomo runtime by default: Global Proxy, DNS, TUN, and Port Proxy
+  listeners are generated into one mihomo config.
+- Supports subscriptions, proxy groups, node selection, traffic usage, expiry,
+  and local profile cache.
+- Supports system proxy, mihomo DNS, and optional TUN mode.
+- Provides a privileged service mode for TUN on macOS/Linux, while ordinary
+  Port Proxy usage still works without the service.
+- Can use a custom mihomo binary or download a managed MetaCubeX/mihomo release
+  into the clashtui config directory.
+- Includes an LLM Chat page and LLM-friendly config spec. Chat integration is
+  still in development.
+
+## Quick Start
+
+Build:
 
 ```bash
 cargo build --release
 ```
 
-The binary is written to:
+Open the setup UI:
 
 ```bash
-target/release/clashtui
+target/release/clashtui config
 ```
 
-## Commands
+Start the background runtime:
 
 ```bash
-clashtui config
-clashtui start
-clashtui stop
-clashtui status
-clashtui tun-install
-clashtui tun-uninstall
+target/release/clashtui start
 ```
 
-During development:
+Check status:
+
+```bash
+target/release/clashtui status
+```
+
+Stop or restart:
+
+```bash
+target/release/clashtui stop
+target/release/clashtui restart
+```
+
+During development you can use:
 
 ```bash
 cargo run -- config
@@ -42,177 +72,134 @@ cargo run -- start
 cargo run -- status
 ```
 
-## TUN Setup
+## Basic Workflow
 
-### Linux
-
-Linux helper mode installs a root-owned `clashtui-tun-helper` systemd service. The helper opens `/dev/net/tun`, passes the TUN fd to user-mode `mihomo`, and owns route cleanup. Release builds should ship `clashtui-tun-helper` next to `clashtui`; during development, build both binaries first.
-
-```bash
-cargo build --release --bins
-target/release/clashtui tun-install
-```
-
-After that, normal commands do not need sudo:
+1. Run `clashtui config`.
+2. Add a subscription in the `Subscription` page.
+3. Configure `Global Proxy` or add Port Proxy listeners from the `Main` page.
+4. Use the `Exit` page and choose `Save & Restart`.
+5. Test the local listeners:
 
 ```bash
-target/release/clashtui start
-target/release/clashtui stop
+curl -x http://127.0.0.1:7070 -I https://www.gstatic.com/generate_204
+curl -x http://127.0.0.1:7071 -I https://www.gstatic.com/generate_204
+curl -x http://127.0.0.1:7072 -I https://www.gstatic.com/generate_204
 ```
 
-Remove the helper with:
+## Multiple Port Proxy Listeners
 
-```bash
-target/release/clashtui tun-uninstall
-```
+Port Proxy is the main reason to use clashtui when one local proxy port is not
+enough. Each service exposes one HTTP, SOCKS5, or mixed listener and can route
+traffic through a different subscription or node.
 
-Linux TUN requires the helper path. `clashtui` does not grant capabilities to `mihomo`; the helper owns privileged TUN and route operations while `mihomo` remains user-mode.
-Linux helper route activation is currently guarded until the cgroup/fwmark loop-prevention policy is implemented. Use `scripts/tun_guarded_test.sh` for Linux validation; it opts into the guarded route activation and stops `clashtui` on exit.
-
-### macOS
-
-macOS uses `utun` devices. The default generated TUN device is `utun1024`, and Linux-only `auto-redirect` is omitted from the runtime mihomo patch on macOS.
-
-macOS does not have Linux-style `setcap` permissions. `clashtui tun-install` installs a root-owned TUN helper as a LaunchDaemon. Release builds should ship `clashtui-tun-helper` next to `clashtui`; development builds fall back to the current `clashtui` helper entrypoint if the separate helper artifact is missing.
-
-```bash
-target/release/clashtui tun-install
-```
-
-The helper is installed under:
-
-```text
-/Library/PrivilegedHelperTools/com.clashtui.tun-helper
-/Library/LaunchDaemons/com.clashtui.tun-helper.plist
-```
-
-The helper is intentionally narrow: it creates/configures `utun`, passes the TUN fd to user-mode `mihomo`, activates split default routes after the mihomo controller is healthy, keeps scoped upstream routes for mihomo's own outbound sockets, and cleans up helper-owned routes. `mihomo` continues to run as the normal user. Remove the helper with:
-
-```bash
-target/release/clashtui tun-uninstall
-```
-
-If `clashtui status` reports `tun.enable=false` while `tun=true` is configured, or `ifconfig utun1024` says the interface does not exist, the helper is missing, unreachable, or the TUN FD path is not active.
-
-Port Proxy and system proxy can still work without TUN:
-
-```bash
-curl -x http://127.0.0.1:7070 -I https://google.com
-```
-
-Transparent TUN traffic requires the macOS helper. After `tun-install`, later `clashtui start` runs without another sudo prompt.
-
-For a bounded local TUN smoke test on macOS or Linux, build both binaries, run
-`tun-install` once if the helper changed, then run:
-
-```bash
-cargo build --bins
-scripts/tun_guarded_test.sh
-```
-
-The script exits through `clashtui stop` and also has a 60-second watchdog so a
-route loop does not leave TUN active indefinitely.
-
-## TUI
-
-Open the BIOS-style setup screen:
-
-```bash
-clashtui config
-```
-
-Navigation:
-
-- `Tab` / `Shift+Tab`: switch pages
-- `Up` / `Down`: move in the current menu
-- `Left` / `Right`: switch proxy group panes
-- `Enter`: edit or apply the selected item
-- `F1`, `h`, `?`: help
-- `F10`, `q`: save and exit
-
-The DNS page supports LAN-specific DNS:
-
-```text
-LAN Domains: +.lan, +.local, +.corp.local
-LAN DNS: system, 192.168.0.1
-Direct DNS: system, 192.168.0.1
-Direct follows policy: on
-```
-
-These values are rendered to mihomo `nameserver-policy`, `direct-nameserver`, and `fake-ip-filter`.
-
-## Runtime Model
-
-`clashtui` uses one mihomo runtime per configured proxy entry:
-
-- Global Proxy owns the default `mixed_port` `127.0.0.1:7070`.
-- Global Proxy is the only runtime allowed to own TUN, DNS, and system proxy settings.
-- Each Port Proxy owns a separate mihomo process with its own workdir, config, controller, pid file, and log file.
-- Subscription profiles are treated as proxy/rule sources; subscription-provided inbound ports and listeners are removed before generated runtime configs are written.
-
-Port proxy services are local settings. Each service exposes one HTTP, SOCKS5, or mixed listener and can use its own subscription, mode, and selected proxy. For different port-to-proxy needs, add services in `~/.config/clashtui/config.yaml`:
+Example config shape:
 
 ```yaml
 proxy_ports:
   services:
     - name: hk-mixed
+      enabled: true
       kind: mixed
       listen: 127.0.0.1
-      port: 7080
-      subscription: oist
+      port: 7071
+      subscription: work
       mode: global
       proxy: HK-01
+
+    - name: jp-mixed
+      enabled: true
+      kind: mixed
+      listen: 127.0.0.1
+      port: 7072
+      subscription: personal
+      mode: global
+      proxy: JP-01
 ```
 
-`kind` can be `http`, `socks`, or `mixed`. In `global` mode, `proxy` names a concrete proxy node from the service subscription. In `rule` mode, `rule_selections` stores group-to-node choices.
+In the default `service` or `single` backend, these are mihomo `listeners`
+inside the same mihomo process. Legacy `multi` / `multi-process` backends are
+kept only for compatibility.
 
-## Runtime Isolation
+## Service And TUN
 
-`clashtui` starts and manages its own mihomo processes by default. The Global Proxy controller auto-allocation range starts at `http://127.0.0.1:19090` to avoid Clash Verge's common controller port `9097`.
+The default backend is:
 
-Runtime write operations refuse to modify an already-online controller unless `clashtui` has a live owned mihomo pid file. This prevents accidental reloads or config patches against Clash Verge's mihomo instance.
+```yaml
+runtime_backend: service
+```
 
-Port Proxy controllers are assigned from a separate stable range and are checked for conflicts before startup.
+When the privileged service is installed, service mode starts one root/service
+owned mihomo runtime. That runtime owns TUN, DNS, Global Proxy, and all Port
+Proxy listeners together.
 
-## Port Management
+Install the service:
 
-Ports can be auto-managed or fixed. User-specified ports are fixed and are never changed automatically; if a fixed port is occupied, startup fails with a clear error.
+```bash
+target/release/clashtui service-install
+```
 
-Default user-facing proxy ports are stable:
+Check or uninstall:
 
-- Global Proxy mixed port: `127.0.0.1:7070`
-- New Port Proxy listeners: start at `127.0.0.1:7071`
+```bash
+target/release/clashtui service-status
+target/release/clashtui service-uninstall
+```
 
-Set the listen host to `0.0.0.0`, for example `0.0.0.0:7070`, to make a listener reachable from the LAN.
+If the service is not installed or cannot be reached, `clashtui start` falls
+back to a user-mode single mihomo runtime for that run. Global Proxy and Port
+Proxy listeners still work, but TUN is disabled because creating the TUN device
+and routes requires privilege.
 
-Other auto-managed ports are assigned from stable per-config ranges and then saved:
+## Mihomo Core
 
-- controller: `19090-19989`
-- Port Proxy controllers: `20090-20989`
-- DNS listen: `15053-15952`
-- extra listeners: `7071-7970`
+`mihomo.core: auto` is the default. Startup resolves the core in this order:
 
-Set a port proxy service `port` to `0` to let `clashtui` assign it. Set a non-zero port to keep it fixed.
+1. `core_path` if configured.
+2. `MIHOMO_CORE` environment variable.
+3. Managed MetaCubeX/mihomo release in the clashtui config directory.
+4. A known installed mihomo/verge-mihomo binary.
 
-## Runtime Files
+If no suitable core exists, clashtui can download a managed stable mihomo
+release on start. The Runtime page also exposes core source and update actions.
+
+## TUI Notes
+
+Sections:
+
+- `Main`: runtime summary, Global Proxy, Port Proxy list, Add Port Proxy.
+- `Subscription`: subscription list, profile cache, usage, expiry, refresh.
+- `Runtime`: service, autostart, logs, mihomo core, controller, DNS.
+- `Chat`: LLM-assisted configuration preview, still in development.
+- `Exit`: save, start, stop, reload, restart, defaults, and exit actions.
+
+Common keys:
+
+- `Up` / `Down`: move selection.
+- `Enter`: open, edit, or apply.
+- `Esc`: go back; at root opens the Exit page.
+- `Tab` / `Left` / `Right`: switch sections when at a section root.
+- `F9`: load defaults after confirmation.
+- `F10`: save and restart after confirmation.
+
+## Config Files
 
 User config lives outside the repository:
 
 ```text
 ~/.config/clashtui/config.yaml
 ~/.config/clashtui/profiles/
+~/.config/clashtui/cores/
 ~/.config/clashtui/mihomo-run.yaml
 ~/.config/clashtui/mihomo-active.yaml
 ~/.config/clashtui/*.log
-~/.config/clashtui/runtimes/port-proxy-N/
 ```
 
-Each Port Proxy runtime directory contains its own `mihomo-run.yaml`, `mihomo-active.yaml`, `mihomo.pid`, and `mihomo.log`. Child mihomo stdout/stderr is redirected to those log files and is never written into the TUI terminal.
+On macOS the config directory is under:
 
-## Documentation
+```text
+~/Library/Application Support/clashtui/
+```
 
-Design notes are in [`doc/`](doc/):
-
-- [`doc/architecture.md`](doc/architecture.md)
-- [`doc/dns-design.md`](doc/dns-design.md)
-- [`doc/system-proxy-tun-dns-modes.md`](doc/system-proxy-tun-dns-modes.md)
+Service-owned/root-owned mihomo state is intentionally kept outside the normal
+user config directory to avoid root-owned files polluting user-managed runtime
+files.

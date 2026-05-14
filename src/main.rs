@@ -1,3 +1,4 @@
+mod autostart;
 mod config;
 mod config_menu;
 mod core;
@@ -6,8 +7,8 @@ mod dns;
 mod mihomo;
 mod platform;
 mod port_allocator;
-mod privilege;
 mod runtime_profile;
+mod service;
 mod subscription;
 mod system_proxy;
 mod tun;
@@ -31,6 +32,10 @@ struct Cli {
     #[arg(long, env = "MIHOMO_SECRET")]
     secret: Option<String>,
 
+    /// Print detailed paths, network state, and log tails for start/status/stop.
+    #[arg(long, global = true)]
+    verbose: bool,
+
     #[arg(long, hide = true)]
     daemon_run: bool,
 
@@ -44,36 +49,35 @@ enum Command {
     Start,
     /// Stop the background process and clear runtime hooks.
     Stop,
+    /// Restart the background process and reapply saved config.
+    Restart,
     /// Show daemon and mihomo status.
     Status,
     /// Open the interactive config menu.
     Config,
-    /// Install TUN helper or platform permissions.
-    TunInstall {
-        /// Override the clashtui binary path to update.
+    /// Install the privileged clashtui service.
+    ServiceInstall {
+        /// Override the clashtui binary path to install.
         #[arg(long)]
         path: Option<PathBuf>,
     },
-    /// Remove TUN helper or platform permissions.
-    TunUninstall {
-        /// Override the clashtui binary path to update.
-        #[arg(long)]
-        path: Option<PathBuf>,
-    },
-    #[command(name = "__tun-install-root", hide = true)]
-    PrivilegedTunInstall {
+    /// Remove the privileged clashtui service.
+    ServiceUninstall,
+    /// Show privileged service status.
+    ServiceStatus,
+    #[command(name = "__service-install-root", hide = true)]
+    PrivilegedServiceInstall {
         #[arg(long)]
         path: PathBuf,
         #[arg(long)]
         user: String,
     },
-    #[command(name = "__tun-uninstall-root", hide = true)]
-    PrivilegedTunUninstall {
-        #[arg(long)]
-        path: PathBuf,
-    },
-    #[command(name = "__tun-helper-run", hide = true)]
-    TunHelperRun,
+    #[command(name = "__service-uninstall-root", hide = true)]
+    PrivilegedServiceUninstall,
+    #[command(name = "__service-run", hide = true)]
+    ServiceRun,
+    #[command(name = "__write-single-runtime-config", hide = true)]
+    WriteSingleRuntimeConfig,
 }
 
 #[tokio::main]
@@ -81,15 +85,14 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match &cli.command {
-        Some(Command::TunInstall { path }) => return privilege::tun_install(path.clone()),
-        Some(Command::TunUninstall { path }) => return privilege::tun_uninstall(path.clone()),
-        Some(Command::PrivilegedTunInstall { path, user }) => {
-            return privilege::tun_install_privileged(path.clone(), user.clone());
+        Some(Command::ServiceInstall { path }) => return service::install(path.clone()),
+        Some(Command::ServiceUninstall) => return service::uninstall(),
+        Some(Command::ServiceStatus) => return service::print_status(),
+        Some(Command::PrivilegedServiceInstall { path, user }) => {
+            return service::install_privileged(path.clone(), user.clone());
         }
-        Some(Command::PrivilegedTunUninstall { path }) => {
-            return privilege::tun_uninstall_privileged(path.clone());
-        }
-        Some(Command::TunHelperRun) => return privilege::tun_helper_run(),
+        Some(Command::PrivilegedServiceUninstall) => return service::uninstall_privileged(),
+        Some(Command::ServiceRun) => return service::run(),
         _ => {}
     }
 
@@ -120,18 +123,35 @@ async fn main() -> Result<()> {
                 &mut config,
                 cli.controller.as_deref(),
                 cli.secret.as_deref(),
+                cli.verbose,
             )
             .await
         }
-        Some(Command::Stop) => daemon::stop(&paths, &config, &client).await,
-        Some(Command::Status) => daemon::status(&paths, &config, &client).await,
+        Some(Command::Stop) => daemon::stop(&paths, &config, &client, cli.verbose).await,
+        Some(Command::Restart) => {
+            daemon::restart(
+                &paths,
+                &mut config,
+                cli.controller.as_deref(),
+                cli.secret.as_deref(),
+                cli.verbose,
+            )
+            .await
+        }
+        Some(Command::Status) => daemon::status(&paths, &config, &client, cli.verbose).await,
         Some(Command::Config) => config_menu::run(&paths, &mut config).await,
+        Some(Command::WriteSingleRuntimeConfig) => {
+            let path = runtime_profile::write_single_runtime_config(&paths, &config).await?;
+            println!("{}", path.display());
+            Ok(())
+        }
         Some(
-            Command::TunInstall { .. }
-            | Command::TunUninstall { .. }
-            | Command::PrivilegedTunInstall { .. }
-            | Command::PrivilegedTunUninstall { .. }
-            | Command::TunHelperRun,
+            Command::ServiceInstall { .. }
+            | Command::ServiceUninstall
+            | Command::ServiceStatus
+            | Command::PrivilegedServiceInstall { .. }
+            | Command::PrivilegedServiceUninstall
+            | Command::ServiceRun,
         ) => Ok(()),
         None => Ok(()),
     }

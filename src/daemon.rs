@@ -11,13 +11,14 @@ use tokio::time::sleep;
 use crate::config::{AppConfig, ControllerConfig, Paths, PortProxyService, RuntimePaths};
 use crate::mihomo::MihomoClient;
 use crate::{
-    core, dns, port_allocator, privilege, runtime_profile, subscription, system_proxy, tun,
+    autostart, core, dns, port_allocator, runtime_profile, service, subscription, system_proxy, tun,
 };
 
 const CONFIG_RELOAD_INTERVAL: Duration = Duration::from_secs(10);
 const STARTUP_CHECK_WAIT: Duration = Duration::from_millis(1200);
 const STOP_WAIT: Duration = Duration::from_millis(200);
-const STOP_RETRIES: usize = 20;
+const STOP_RETRIES: usize = 75;
+const PORT_RELEASE_RETRIES: usize = 75;
 const LOG_TAIL_LINES: usize = 30;
 
 pub async fn start(
@@ -25,18 +26,22 @@ pub async fn start(
     config: &mut AppConfig,
     cli_controller: Option<&str>,
     cli_secret: Option<&str>,
+    verbose: bool,
 ) -> Result<()> {
     paths.ensure().await?;
     println!("clashtui start");
-    print_static_summary(paths, config);
-    print_tun_permission_summary(config);
+    print_service_summary(config, verbose);
+    sync_autostart(paths, config, verbose)?;
 
     if let Some(pid) = read_pid(paths).await?
         && is_process_running(pid)
     {
-        println!("clashtui already running: pid={pid}");
+        if verbose {
+            print_static_summary(paths, config);
+        }
+        println!("daemon: already running pid={pid}");
         let client = MihomoClient::new(&config.controller);
-        if !print_runtime_summary(config, &client).await {
+        if !print_runtime_summary(config, &client, verbose).await {
             print_log_tail("clashtui log", &paths.log_file, LOG_TAIL_LINES);
             print_mihomo_log_tails(paths, config);
         }
@@ -55,10 +60,25 @@ pub async fn start(
     {
         config.save(paths).await?;
     }
-    port_allocator::validate_required_ports_available(config)?;
+    let core_path = core::ensure_core_path(paths, config).await?;
+    if verbose {
+        print_static_summary(paths, config);
+        println!("mihomo core: ready path={}", core_path.display());
+    }
+    if config.use_service_runtime() {
+        if verbose {
+            println!("runtime cleanup: stopping legacy runtimes before service start");
+        }
+        core::stop_all(paths, config).await?;
+    } else if config.use_single_runtime() {
+        core::stop_removed_services(paths, 0).await?;
+    }
+    wait_for_required_ports_available(config).await?;
 
     let exe = std::env::current_exe().context("failed to locate current executable")?;
-    println!("daemon executable: {}", exe.display());
+    if verbose {
+        println!("daemon executable: {}", exe.display());
+    }
     let log = OpenOptions::new()
         .create(true)
         .append(true)
@@ -86,7 +106,9 @@ pub async fn start(
 
     let child = command.spawn().context("failed to start clashtui daemon")?;
     let pid = child.id();
-    println!("daemon spawned: pid={pid}");
+    if verbose {
+        println!("daemon spawned: pid={pid}");
+    }
     sleep(STARTUP_CHECK_WAIT).await;
     if !is_process_running(pid) {
         print_log_tail("clashtui log", &paths.log_file, LOG_TAIL_LINES);
@@ -96,14 +118,23 @@ pub async fn start(
             paths.log_file.display()
         );
     }
-    println!(
-        "clashtui started: pid={} config={} log={}",
-        pid,
-        paths.config_file.display(),
-        paths.log_file.display()
-    );
+    if verbose {
+        println!(
+            "clashtui started: pid={} config={} log={}",
+            pid,
+            paths.config_file.display(),
+            paths.log_file.display()
+        );
+    } else {
+        println!("daemon: started pid={pid}");
+    }
     let client = MihomoClient::new(&config.controller);
-    if !print_runtime_summary(config, &client).await {
+    if let Err(err) = wait_for_mihomo(&client).await {
+        print_log_tail("clashtui log", &paths.log_file, LOG_TAIL_LINES);
+        print_mihomo_log_tails(paths, config);
+        return Err(err).context("mihomo runtime did not become ready after daemon start");
+    }
+    if !print_runtime_summary(config, &client, verbose).await {
         print_log_tail("clashtui log", &paths.log_file, LOG_TAIL_LINES);
         print_mihomo_log_tails(paths, config);
     }
@@ -134,7 +165,8 @@ pub async fn run(
         paths.core_log_file.display()
     );
     eprintln!(
-        "daemon desired runtime: controller={} proxy={} mode={} system_proxy={} tun={} dns={} active_profile={}",
+        "daemon desired runtime: backend={} controller={} proxy={} mode={} system_proxy={} tun={} dns={} active_profile={}",
+        config.runtime_backend,
         config.controller.url,
         config.proxy_port_summary(),
         config.runtime_mode,
@@ -143,18 +175,17 @@ pub async fn run(
         config.dns.enable,
         config.active_profile.as_deref().unwrap_or("-")
     );
-    match privilege::current_tun_permission_status() {
+    match service::status() {
         Ok(status) => eprintln!(
-            "daemon tun permissions: target={} can_start_tun={} legacy_file_capabilities_detected={} legacy_capabilities={} tun_device={} polkit_exists={} polkit_matches_user={}",
-            status.target.display(),
-            status.can_start_tun(),
-            status.legacy_file_capabilities_detected,
-            normalize_inline(status.capabilities.trim()),
-            status.tun_device_exists,
-            status.polkit_rule_exists,
-            status.polkit_rule_matches_user
+            "daemon service: installed={} reachable={} core_running={} core_pid={}",
+            status.installed,
+            status.reachable,
+            status.core_running,
+            status
+                .core_pid
+                .map_or_else(|| "-".into(), |pid| pid.to_string())
         ),
-        Err(err) => eprintln!("daemon tun permissions: check failed: {err:#}"),
+        Err(err) => eprintln!("daemon service: check failed: {err:#}"),
     }
     let mut last_config = serialize_config(&config)?;
     let mut needs_apply = true;
@@ -244,96 +275,91 @@ fn apply_controller_overrides(
 }
 
 fn preserve_runtime_state(current: &AppConfig, next: &mut AppConfig) {
-    #[cfg(target_os = "macos")]
-    if current.tun.enable && next.tun.enable {
-        next.tun.file_descriptor = current.tun.file_descriptor;
-        next.runtime_interface_name = current.runtime_interface_name.clone();
-        if current.tun.file_descriptor.is_some() && matches!(next.tun.device.trim(), "" | "utun") {
-            next.tun.device.clone_from(&current.tun.device);
-        }
-    }
-
-    #[cfg(not(target_os = "macos"))]
     let _ = (current, next);
 }
 
-#[cfg(target_os = "macos")]
-fn macos_tun_needs_core_restart(config: &AppConfig) -> bool {
-    config.tun.enable && config.tun.file_descriptor.is_none()
-}
-
-#[cfg(not(target_os = "macos"))]
-fn macos_tun_needs_core_restart(_config: &AppConfig) -> bool {
-    false
-}
-
-fn teardown_inactive_macos_tun(config: &mut AppConfig) {
-    #[cfg(target_os = "macos")]
-    {
-        if config.tun.enable {
-            return;
-        }
-        config.tun.file_descriptor = None;
-        config.runtime_interface_name = None;
-        let Ok(status) = privilege::current_tun_permission_status() else {
-            return;
-        };
-        if status.polkit_rule_matches_user
-            && let Err(err) = privilege::teardown_tun()
-        {
-            eprintln!("failed to teardown inactive macOS TUN helper state: {err:#}");
-        }
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    let _ = config;
-}
-
-pub async fn stop(paths: &Paths, config: &AppConfig, client: &MihomoClient) -> Result<()> {
+pub async fn stop(
+    paths: &Paths,
+    config: &AppConfig,
+    client: &MihomoClient,
+    verbose: bool,
+) -> Result<()> {
     println!("clashtui stop");
-    print_static_summary(paths, config);
+    if verbose {
+        print_static_summary(paths, config);
+    }
     let Some(pid) = read_pid(paths).await? else {
-        println!("clashtui is not running");
-        cleanup_owned_runtimes(paths, config, client).await?;
+        println!("daemon: stopped");
+        cleanup_owned_runtimes(paths, config, client, verbose).await?;
         print_process_summary(paths, config).await?;
         return Ok(());
     };
 
     if !is_process_running(pid) {
         remove_stale_pid(paths).await?;
-        println!("clashtui is not running; removed stale pid={pid}");
-        cleanup_owned_runtimes(paths, config, client).await?;
+        println!("daemon: stopped removed_stale_pid={pid}");
+        cleanup_owned_runtimes(paths, config, client, verbose).await?;
         print_process_summary(paths, config).await?;
         return Ok(());
     }
 
-    println!("daemon: stopping pid={pid}");
-    terminate_process(pid).with_context(|| format!("failed to stop pid {pid}"))?;
-    wait_for_exit(pid).await;
-    if is_process_running(pid) {
-        println!("daemon: stop requested but process still exists after wait pid={pid}");
-    } else {
-        println!("daemon: stopped pid={pid}");
+    if verbose {
+        println!("daemon: stopping pid={pid}");
     }
-    remove_stale_pid(paths).await?;
-    println!(
-        "runtime cleanup: system_proxy={} tun={} dns={}",
-        config.system_proxy.enabled, config.tun.enable, config.dns.enable
-    );
-    cleanup_owned_runtimes(paths, config, client).await?;
-    println!("clashtui stopped: pid={pid}");
-    print_process_summary(paths, config).await?;
-    if is_process_running(pid) {
+    terminate_process(pid).with_context(|| format!("failed to stop pid {pid}"))?;
+    if !wait_for_exit(pid).await {
+        if verbose {
+            println!("daemon: still running after graceful stop wait pid={pid}; force killing");
+        }
+        force_terminate_process(pid).with_context(|| format!("failed to force stop pid {pid}"))?;
+    }
+    if wait_for_exit(pid).await {
+        println!("daemon: stopped pid={pid}");
+    } else {
         print_log_tail("clashtui log", &paths.log_file, LOG_TAIL_LINES);
         print_mihomo_log_tails(paths, config);
+        anyhow::bail!("daemon pid {pid} did not exit after stop");
     }
+    remove_stale_pid(paths).await?;
+    if verbose {
+        println!(
+            "runtime cleanup: system_proxy={} tun={} dns={}",
+            config.system_proxy.enabled, config.tun.enable, config.dns.enable
+        );
+    }
+    cleanup_owned_runtimes(paths, config, client, verbose).await?;
+    print_process_summary(paths, config).await?;
     Ok(())
+}
+
+pub async fn restart(
+    paths: &Paths,
+    config: &mut AppConfig,
+    cli_controller: Option<&str>,
+    cli_secret: Option<&str>,
+    verbose: bool,
+) -> Result<()> {
+    println!("clashtui restart");
+    let client = MihomoClient::new(&config.controller);
+    stop(paths, config, &client, verbose).await?;
+    match start(paths, config, cli_controller, cli_secret, verbose).await {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            if restart_recovered(paths, config).await {
+                println!("restart: runtime healthy after transient start error");
+                Ok(())
+            } else {
+                Err(err)
+            }
+        }
+    }
 }
 
 async fn cleanup_owned_runtimes(
     paths: &Paths,
     config: &AppConfig,
     client: &MihomoClient,
+    verbose: bool,
 ) -> Result<()> {
     if config.system_proxy.enabled
         && let Err(err) = system_proxy::clear()
@@ -341,25 +367,26 @@ async fn cleanup_owned_runtimes(
         eprintln!("failed to clear system proxy: {err:#}");
     }
 
-    if core::owned_core_running(paths).await? {
+    if core::owned_core_running_for(paths, config).await? {
         cleanup_runtime(config, client).await;
-    } else {
+    } else if verbose {
         println!(
             "runtime cleanup: skipped global mihomo cleanup because no clashtui-owned global core is running"
         );
     }
-    println!("mihomo core: stopping all instances owned by clashtui");
-    let stop_result = core::stop_all(paths, config).await;
-    #[cfg(target_os = "macos")]
-    if config.tun.enable
-        && let Err(err) = privilege::teardown_tun()
-    {
-        eprintln!("failed to teardown macOS TUN helper state: {err:#}");
+    if verbose {
+        println!("mihomo core: stopping all instances owned by clashtui");
     }
+    let stop_result = core::stop_all(paths, config).await;
     stop_result
 }
 
-pub async fn status(paths: &Paths, config: &AppConfig, client: &MihomoClient) -> Result<()> {
+pub async fn status(
+    paths: &Paths,
+    config: &AppConfig,
+    client: &MihomoClient,
+    verbose: bool,
+) -> Result<()> {
     println!("clashtui status");
     let pid = read_pid(paths).await?;
     let running = pid.is_some_and(is_process_running);
@@ -373,29 +400,50 @@ pub async fn status(paths: &Paths, config: &AppConfig, client: &MihomoClient) ->
     } else {
         println!("daemon: stopped");
     }
-    print_process_summary(paths, config).await?;
+    if verbose {
+        print_process_summary(paths, config).await?;
+    }
 
-    print_static_summary(paths, config);
-    print_tun_permission_summary(config);
+    if verbose {
+        print_static_summary(paths, config);
+    } else {
+        println!("proxy: {}", config.proxy_port_summary());
+        println!(
+            "configured: backend={} mode={} system_proxy={} tun={} dns={}",
+            config.runtime_backend,
+            config.runtime_mode,
+            config.system_proxy.enabled,
+            config.tun.enable,
+            config.dns.enable
+        );
+    }
+    print_service_summary(config, verbose);
+    print_autostart_summary(paths, config, verbose);
     println!(
         "subscriptions: count={} active={}",
         config.subscriptions.len(),
         config.active_profile.as_deref().unwrap_or("-")
     );
 
-    let runtime_healthy = print_runtime_summary(config, client).await;
+    let runtime_healthy = print_runtime_summary(config, client, verbose).await;
     match system_proxy::status() {
-        Ok(status) => println!(
+        Ok(status) if verbose => println!(
             "system-proxy: enabled={} server={} bypass={}",
             status.enabled, status.server, status.bypass
         ),
+        Ok(status) => println!(
+            "system-proxy: enabled={} server={}",
+            status.enabled, status.server
+        ),
         Err(err) => println!("system-proxy: unavailable error={err}"),
     }
-    print_network_summary(config, running);
+    if verbose {
+        print_network_summary(config, running);
+    }
     if running && !runtime_healthy {
         print_log_tail("clashtui log", &paths.log_file, LOG_TAIL_LINES);
         print_mihomo_log_tails(paths, config);
-    } else {
+    } else if verbose {
         println!(
             "logs: daemon={} mihomo={}",
             paths.log_file.display(),
@@ -412,14 +460,15 @@ fn print_static_summary(paths: &Paths, config: &AppConfig) {
     println!("mihomo-log: {}", paths.core_log_file.display());
     println!(
         "core: {}",
-        core::resolve_core_path(config)
+        core::resolve_core_path(paths, config)
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "not found; set core_path or MIHOMO_CORE".into())
     );
     println!("controller: {}", config.controller.url);
     println!("proxy: {}", config.proxy_port_summary());
     println!(
-        "configured: mode={} system_proxy={} tun={} dns={} allow_lan={} proxy_selections={}",
+        "configured: backend={} mode={} system_proxy={} tun={} dns={} allow_lan={} proxy_selections={}",
+        config.runtime_backend,
         config.runtime_mode,
         config.system_proxy.enabled,
         config.tun.enable,
@@ -429,140 +478,126 @@ fn print_static_summary(paths: &Paths, config: &AppConfig) {
     );
 }
 
-fn print_tun_permission_summary(config: &AppConfig) {
-    if !config.tun.enable {
-        println!("tun-permission: skipped because tun=false");
+fn print_service_summary(config: &AppConfig, verbose: bool) {
+    if !config.use_service_runtime() {
+        println!(
+            "service: skipped because runtime_backend={}",
+            config.runtime_backend
+        );
         return;
     }
 
-    match privilege::current_tun_permission_status() {
+    match service::status() {
+        Ok(status) if verbose => {
+            println!(
+                "service: installed={} reachable={} core_running={} core_pid={} version={} message={}",
+                status.installed,
+                status.reachable,
+                status.core_running,
+                status
+                    .core_pid
+                    .map_or_else(|| "-".into(), |pid| pid.to_string()),
+                status.version.as_deref().unwrap_or("-"),
+                status.message.as_deref().unwrap_or("-")
+            )
+        }
         Ok(status) => {
+            let state = if status.reachable && status.core_running {
+                "ok"
+            } else if status.reachable {
+                "ready"
+            } else {
+                "unavailable"
+            };
             println!(
-                "tun-permission: target={} can_start_tun={} legacy_file_capabilities_detected={} is_root={} tun_device={}",
-                status.target.display(),
-                status.can_start_tun(),
-                status.legacy_file_capabilities_detected,
-                status.is_root,
-                status.tun_device_exists
+                "service: {state} installed={} reachable={} core_running={} core_pid={}",
+                status.installed,
+                status.reachable,
+                status.core_running,
+                status
+                    .core_pid
+                    .map_or_else(|| "-".into(), |pid| pid.to_string())
             );
-            println!(
-                "tun-permission: legacy_capabilities={}",
-                normalize_inline(status.capabilities.trim())
-            );
-            println!(
-                "tun-permission: {}={} exists={} matches_user={}",
-                tun_permission_rule_label(),
-                status.polkit_rule_path,
-                status.polkit_rule_exists,
-                status.polkit_rule_matches_user
-            );
-            #[cfg(target_os = "linux")]
-            println!(
-                "tun-permission: helper installed={} reachable={} binary={} service={} socket={}",
-                status.helper_installed,
-                status.helper_reachable,
-                status.helper_binary_path,
-                status.helper_service_path,
-                status.helper_socket_path
-            );
-            #[cfg(target_os = "linux")]
-            if status.helper_reachable && !linux_tun_experimental_routes_enabled() {
-                println!(
-                    "tun-permission: linux helper route activation=guarded reason=cgroup/fwmark-policy-pending"
-                );
-            }
-            if !status.can_start_tun() {
-                print_tun_permission_hint(&status);
-            }
         }
-        Err(err) => println!("tun-permission: check failed: {err:#}"),
+        Err(err) => println!("service: check failed: {err:#}"),
     }
 }
 
-#[cfg(target_os = "macos")]
-fn print_tun_permission_hint(status: &privilege::TunPermissionStatus) {
-    println!(
-        "tun-permission: macOS TUN needs the clashtui root helper; current process is_root={}",
-        status.is_root
-    );
-    println!(
-        "tun-permission: run {} tun-install to install or repair the helper",
-        status.target.display()
-    );
-    println!("tun-permission: mihomo remains user-mode; the helper owns utun/routes only.");
-}
-
-#[cfg(target_os = "linux")]
-fn print_tun_permission_hint(status: &privilege::TunPermissionStatus) {
-    println!(
-        "tun-permission: run {} tun-install to install or repair the Linux TUN helper",
-        status.target.display()
-    );
-    println!("tun-permission: Linux TUN requires the helper; mihomo stays user-mode.");
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn print_tun_permission_hint(_status: &privilege::TunPermissionStatus) {
-    println!("tun-permission: TUN is not supported on this platform.");
-}
-
-fn validate_start_permissions(config: &AppConfig) -> Result<()> {
-    if !config.tun.enable {
-        return Ok(());
-    }
-
-    let status =
-        privilege::current_tun_permission_status().context("failed to inspect TUN permissions")?;
-    if !status.tun_device_exists {
-        anyhow::bail!(
-            "TUN is enabled but /dev/net/tun is missing; load the tun kernel module before starting"
+fn sync_autostart(paths: &Paths, config: &AppConfig, verbose: bool) -> Result<()> {
+    let status = autostart::sync(paths, config).context("failed to sync autostart")?;
+    if verbose {
+        println!(
+            "autostart: configured={} installed={} path={} message={}",
+            status.configured,
+            status.installed,
+            status
+                .path
+                .as_ref()
+                .map_or_else(|| "-".into(), |path| path.display().to_string()),
+            status.message.as_deref().unwrap_or("-")
         );
-    }
-    if !status.can_start_tun() {
-        #[cfg(target_os = "macos")]
-        {
-            println!(
-                "warning: TUN is enabled but the macOS TUN helper is missing or unreachable; run {} tun-install",
-                status.target.display()
-            );
-            println!("warning: Port Proxy/system proxy can still run without TUN.");
-            return Ok(());
-        }
-
-        #[cfg(not(target_os = "macos"))]
-        anyhow::bail!(
-            "TUN is enabled but the TUN helper is missing or unreachable: {}\nrun: {} tun-install",
-            status.target.display(),
-            status.target.display()
-        );
-    }
-    #[cfg(target_os = "linux")]
-    if status.helper_reachable && !linux_tun_experimental_routes_enabled() {
-        anyhow::bail!(
-            "Linux TUN helper route activation is guarded until cgroup/fwmark loop prevention is implemented; use scripts/tun_guarded_test.sh for validation or set CLASHTUI_LINUX_TUN_EXPERIMENTAL_ROUTES=1 for a guarded manual run"
+    } else {
+        println!(
+            "autostart: configured={} installed={}",
+            status.configured, status.installed
         );
     }
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
-fn linux_tun_experimental_routes_enabled() -> bool {
-    std::env::var("CLASHTUI_LINUX_TUN_EXPERIMENTAL_ROUTES").is_ok_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
+fn print_autostart_summary(paths: &Paths, config: &AppConfig, verbose: bool) {
+    let _ = paths;
+    let status = autostart::status(config);
+    if verbose {
+        println!(
+            "autostart: configured={} installed={} path={} message={}",
+            status.configured,
+            status.installed,
+            status
+                .path
+                .as_ref()
+                .map_or_else(|| "-".into(), |path| path.display().to_string()),
+            status.message.as_deref().unwrap_or("-")
+        );
+    } else {
+        println!(
+            "autostart: configured={} installed={}",
+            status.configured, status.installed
+        );
+    }
 }
 
-async fn print_runtime_summary(config: &AppConfig, client: &MihomoClient) -> bool {
-    match client.version().await {
-        Ok(version) => println!("mihomo: online version={version}"),
+fn validate_start_permissions(config: &AppConfig) -> Result<()> {
+    if !config.use_service_runtime() {
+        return Ok(());
+    }
+
+    let status = service::status().context("failed to inspect clashtui service")?;
+    if status.reachable {
+        return Ok(());
+    }
+
+    if config.tun.enable {
+        eprintln!(
+            "runtime warning: service is unavailable; TUN will be disabled for this user-mode runtime until `clashtui service-install` is run"
+        );
+    }
+    Ok(())
+}
+
+async fn print_runtime_summary(config: &AppConfig, client: &MihomoClient, verbose: bool) -> bool {
+    let version = match client.version().await {
+        Ok(version) => {
+            if verbose {
+                println!("mihomo: online version={version}");
+            }
+            version
+        }
         Err(err) => {
-            println!("mihomo: offline error={err}");
+            println!("runtime: offline error={err}");
             return false;
         }
-    }
+    };
 
     let config_healthy = match client.configs().await {
         Ok(configs) => {
@@ -588,52 +623,98 @@ async fn print_runtime_summary(config: &AppConfig, client: &MihomoClient) -> boo
             let tun_stack = nested_str(&configs, "tun", "stack").unwrap_or("unknown");
             let dns_enabled = nested_bool(&configs, "dns", "enable");
             let dns_listen = nested_str(&configs, "dns", "listen").unwrap_or("unknown");
-            println!(
-                "mihomo-config: mode={mode} mixed-port={mixed_port} port={http_port} socks-port={socks_port}"
-            );
-            println!(
-                "mihomo-config: tun.enable={} desired={} device={} stack={}",
-                bool_value(tun_enabled),
-                config.tun.enable,
-                tun_device,
-                tun_stack
-            );
-            println!(
-                "mihomo-config: dns.enable={} desired={} listen={}",
-                bool_value(dns_enabled),
-                config.dns.enable,
-                dns_listen
-            );
+            if verbose {
+                println!(
+                    "mihomo-config: mode={mode} mixed-port={mixed_port} port={http_port} socks-port={socks_port}"
+                );
+                println!(
+                    "mihomo-config: tun.enable={} desired={} device={} stack={}",
+                    bool_value(tun_enabled),
+                    config.tun.enable,
+                    tun_device,
+                    tun_stack
+                );
+                println!(
+                    "mihomo-config: dns.enable={} desired={} listen={}",
+                    bool_value(dns_enabled),
+                    config.dns.enable,
+                    dns_listen
+                );
+            }
             if Some(config.tun.enable) != tun_enabled {
                 healthy = false;
-                println!(
-                    "warning: TUN desired={} but mihomo reports {}; check permissions and mihomo log",
-                    config.tun.enable,
-                    bool_value(tun_enabled)
-                );
+                if verbose {
+                    println!(
+                        "warning: TUN desired={} but mihomo reports {}; check permissions and mihomo log",
+                        config.tun.enable,
+                        bool_value(tun_enabled)
+                    );
+                }
             }
             if dns_enabled.is_some() && Some(config.dns.enable) != dns_enabled {
                 healthy = false;
+                if verbose {
+                    println!(
+                        "warning: DNS desired={} but mihomo reports {}; check mihomo log",
+                        config.dns.enable,
+                        bool_value(dns_enabled)
+                    );
+                }
+            }
+            if !verbose {
+                let state = if healthy { "ok" } else { "degraded" };
                 println!(
-                    "warning: DNS desired={} but mihomo reports {}; check mihomo log",
-                    config.dns.enable,
-                    bool_value(dns_enabled)
+                    "runtime: {state} version={version} mode={mode} mixed-port={mixed_port} tun={} dns={}",
+                    feature_match(config.tun.enable, tun_enabled),
+                    feature_match(config.dns.enable, dns_enabled)
                 );
             }
             healthy
         }
         Err(err) => {
-            println!("mihomo-config: unavailable error={err}");
+            println!("runtime: degraded config_error={err}");
             false
         }
     };
 
-    print_mihomo_metrics_summary(client).await;
+    print_mihomo_metrics_summary(client, verbose).await;
     config_healthy
 }
 
-async fn print_mihomo_metrics_summary(client: &MihomoClient) {
-    match client.traffic().await {
+async fn print_mihomo_metrics_summary(client: &MihomoClient, verbose: bool) {
+    let traffic_result = client.traffic().await;
+    let connections_result = client.connections().await;
+
+    if !verbose {
+        let traffic = traffic_result
+            .as_ref()
+            .ok()
+            .map(|traffic| {
+                let up = json_u64(traffic, "up").unwrap_or_default();
+                let down = json_u64(traffic, "down").unwrap_or_default();
+                format!(
+                    "up={}/s down={}/s",
+                    format_bytes_short(up),
+                    format_bytes_short(down)
+                )
+            })
+            .unwrap_or_else(|| "traffic=unavailable".into());
+        let connections = connections_result
+            .as_ref()
+            .ok()
+            .map(|connections| {
+                let active = connections
+                    .get("connections")
+                    .and_then(Value::as_array)
+                    .map_or(0, Vec::len);
+                format!("connections={active}")
+            })
+            .unwrap_or_else(|| "connections=unavailable".into());
+        println!("metrics: {traffic} {connections}");
+        return;
+    }
+
+    match traffic_result {
         Ok(traffic) => {
             let up = json_u64(&traffic, "up").unwrap_or_default();
             let down = json_u64(&traffic, "down").unwrap_or_default();
@@ -650,7 +731,7 @@ async fn print_mihomo_metrics_summary(client: &MihomoClient) {
         Err(err) => println!("mihomo-traffic: unavailable error={err}"),
     }
 
-    match client.connections().await {
+    match connections_result {
         Ok(connections) => {
             let active = connections
                 .get("connections")
@@ -666,6 +747,14 @@ async fn print_mihomo_metrics_summary(client: &MihomoClient) {
             );
         }
         Err(err) => println!("mihomo-connections: unavailable error={err}"),
+    }
+}
+
+fn feature_match(desired: bool, actual: Option<bool>) -> String {
+    match actual {
+        Some(actual) if actual == desired => format!("ok({actual})"),
+        Some(actual) => format!("mismatch(desired={desired},actual={actual})"),
+        None => "unknown".into(),
     }
 }
 
@@ -697,9 +786,14 @@ fn format_bytes_short(bytes: u64) -> String {
 }
 
 async fn apply_runtime(paths: &Paths, config: &mut AppConfig) -> Result<()> {
+    if config.use_single_runtime() {
+        return apply_single_runtime(paths, config).await;
+    }
+
     let mut errors = Vec::new();
     eprintln!(
-        "runtime apply: desired mode={} proxy={} system_proxy={} tun={} dns={} active_profile={} port_proxies={}",
+        "runtime apply: backend={} desired mode={} proxy={} system_proxy={} tun={} dns={} active_profile={} port_proxies={}",
+        config.runtime_backend,
         config.runtime_mode,
         config.proxy_port_summary(),
         config.system_proxy.enabled,
@@ -728,19 +822,193 @@ async fn apply_runtime(paths: &Paths, config: &mut AppConfig) -> Result<()> {
     }
 }
 
+async fn apply_single_runtime(paths: &Paths, config: &mut AppConfig) -> Result<()> {
+    let client = MihomoClient::new(&config.controller);
+    let mut runtime_config = effective_single_runtime_config(config);
+    let mut errors = Vec::new();
+    eprintln!(
+        "runtime apply: backend={} desired mode={} proxy={} system_proxy={} tun={} dns={} active_profile={} port_proxies={}",
+        config.runtime_backend,
+        config.runtime_mode,
+        config.proxy_port_summary(),
+        config.system_proxy.enabled,
+        config.tun.enable,
+        config.dns.enable,
+        config.active_profile.as_deref().unwrap_or("-"),
+        config
+            .proxy_ports
+            .services
+            .iter()
+            .filter(|service| service.enabled)
+            .count()
+    );
+
+    core::stop_removed_services(paths, 0)
+        .await
+        .context("legacy port proxy cleanup")?;
+    ensure_active_runtime_profile(paths, config)
+        .await
+        .context("profile prepare")?;
+
+    if runtime_config.use_service_runtime()
+        && !service::core_running()?
+        && core::owned_core_running(paths).await?
+    {
+        eprintln!("runtime apply: stopping user-mode single mihomo before switching to service");
+        core::stop_legacy_global(paths).await?;
+    }
+
+    if core::owned_core_running_for(paths, &runtime_config).await? {
+        if client.version().await.is_err() {
+            eprintln!("runtime apply: single mihomo controller unhealthy; restarting core");
+            core::stop(paths, &runtime_config).await?;
+            core::ensure_running(paths, &mut runtime_config).await?;
+            wait_for_mihomo(&client).await?;
+        }
+    } else if client.version().await.is_ok() {
+        anyhow::bail!(
+            "mihomo controller {} is online but is not owned by clashtui; refusing to modify external mihomo",
+            config.controller.url
+        );
+    } else {
+        eprintln!("runtime apply: single mihomo is not running; ensuring core is running");
+        core::ensure_running(paths, &mut runtime_config).await?;
+        if let Err(err) = wait_for_mihomo(&client).await {
+            eprintln!(
+                "runtime apply: single mihomo controller still unhealthy after wait: {err:#}"
+            );
+            eprintln!("runtime apply: restarting single mihomo core");
+            core::stop(paths, &runtime_config).await?;
+            core::ensure_running(paths, &mut runtime_config).await?;
+            wait_for_mihomo(&client).await?;
+        }
+    }
+
+    if let Err(err) = load_single_runtime_profile(paths, &mut runtime_config, &client).await {
+        errors.push(format!("profile: {err:#}"));
+    } else {
+        eprintln!("runtime apply: single runtime profile loaded");
+    }
+
+    if let Err(err) = client.set_mode(&runtime_config.runtime_mode).await {
+        errors.push(format!("mode: {err:#}"));
+    } else {
+        eprintln!("runtime apply: single mode={}", runtime_config.runtime_mode);
+    }
+
+    if let Err(err) = apply_proxy_selections(
+        &client,
+        "Global Proxy",
+        desired_global_proxy_selections(config),
+    )
+    .await
+    {
+        errors.push(format!("global proxy selection: {err:#}"));
+    }
+
+    if let Err(err) = apply_single_runtime_service_selections(&client, config).await {
+        errors.push(format!("port proxy selection: {err:#}"));
+    }
+
+    if config.system_proxy.enabled
+        && let Err(err) = system_proxy::apply(&config.system_proxy_target())
+    {
+        errors.push(format!("system proxy: {err:#}"));
+    } else if config.system_proxy.enabled {
+        eprintln!(
+            "runtime apply: system proxy -> {}:{}",
+            config.proxy_host, config.mixed_port
+        );
+    }
+
+    if let Err(err) = tun::apply(&client, &runtime_config.tun).await {
+        errors.push(format!("tun: {err:#}"));
+    } else {
+        eprintln!("runtime apply: tun requested={}", runtime_config.tun.enable);
+    }
+
+    if let Err(err) = dns::apply(&client, &runtime_config.dns).await {
+        errors.push(format!("dns: {err:#}"));
+    } else {
+        eprintln!(
+            "runtime apply: dns requested={} listen={}",
+            runtime_config.dns.enable, runtime_config.dns.listen
+        );
+    }
+
+    if let Err(err) = verify_runtime_state(&runtime_config, &client).await {
+        errors.push(format!("runtime verify: {err:#}"));
+    }
+
+    for service in config
+        .proxy_ports
+        .services
+        .iter()
+        .filter(|service| service.enabled)
+    {
+        eprintln!(
+            "runtime apply: listener ready name={} listen={}:{} kind={} proxy={} rule={}",
+            service.name,
+            if service.listen.trim().is_empty() {
+                "127.0.0.1"
+            } else {
+                service.listen.trim()
+            },
+            service.port,
+            service.kind,
+            service.proxy.as_deref().unwrap_or("-"),
+            service.rule.as_deref().unwrap_or("-")
+        );
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("{}", errors.join("; "))
+    }
+}
+
+fn effective_single_runtime_config(config: &AppConfig) -> AppConfig {
+    let mut runtime_config = config.clone();
+    if !config.use_service_runtime() {
+        return runtime_config;
+    }
+
+    match service::status() {
+        Ok(status) if status.reachable => runtime_config,
+        Ok(status) => {
+            runtime_config.runtime_backend = "single".into();
+            if runtime_config.tun.enable {
+                runtime_config.tun.enable = false;
+                eprintln!(
+                    "runtime apply: service unavailable (installed={} message={}); using user-mode single runtime without TUN",
+                    status.installed,
+                    status.message.as_deref().unwrap_or("-")
+                );
+            }
+            runtime_config
+        }
+        Err(err) => {
+            runtime_config.runtime_backend = "single".into();
+            if runtime_config.tun.enable {
+                runtime_config.tun.enable = false;
+                eprintln!(
+                    "runtime apply: service status failed ({err:#}); using user-mode single runtime without TUN"
+                );
+            }
+            runtime_config
+        }
+    }
+}
+
 async fn apply_global_runtime(paths: &Paths, config: &mut AppConfig) -> Result<()> {
     let client = MihomoClient::new(&config.controller);
     let mut errors = Vec::new();
 
-    if core::owned_core_running(paths).await? {
-        if macos_tun_needs_core_restart(config) {
-            eprintln!("runtime apply: macOS TUN needs inherited helper fd; restarting core");
-            core::stop(paths).await?;
-            core::ensure_running(paths, config).await?;
-            wait_for_mihomo(&client).await?;
-        } else if client.version().await.is_err() {
+    if core::owned_core_running_for(paths, config).await? {
+        if client.version().await.is_err() {
             eprintln!("runtime apply: owned global mihomo controller unhealthy; restarting core");
-            core::stop(paths).await?;
+            core::stop(paths, config).await?;
             core::ensure_running(paths, config).await?;
             wait_for_mihomo(&client).await?;
         }
@@ -757,7 +1025,7 @@ async fn apply_global_runtime(paths: &Paths, config: &mut AppConfig) -> Result<(
                 "runtime apply: global mihomo controller still unhealthy after wait: {err:#}"
             );
             eprintln!("runtime apply: restarting owned global mihomo core");
-            core::stop(paths).await?;
+            core::stop(paths, config).await?;
             core::ensure_running(paths, config).await?;
             wait_for_mihomo(&client).await?;
         }
@@ -807,7 +1075,6 @@ async fn apply_global_runtime(paths: &Paths, config: &mut AppConfig) -> Result<(
     } else {
         eprintln!("runtime apply: tun requested={}", config.tun.enable);
     }
-    teardown_inactive_macos_tun(config);
 
     if let Err(err) = dns::apply(&client, &config.dns).await {
         errors.push(format!("dns: {err:#}"));
@@ -1009,6 +1276,23 @@ async fn load_runtime_profile(
     client.reload_config(&runtime_config).await
 }
 
+async fn load_single_runtime_profile(
+    paths: &Paths,
+    config: &mut AppConfig,
+    client: &MihomoClient,
+) -> Result<()> {
+    ensure_active_runtime_profile(paths, config).await?;
+    let runtime_config = runtime_profile::write_single_runtime_config(paths, config).await?;
+    client.reload_config(&runtime_config).await
+}
+
+async fn ensure_active_runtime_profile(paths: &Paths, config: &mut AppConfig) -> Result<()> {
+    if let Some(active_profile) = config.active_profile.clone() {
+        ensure_subscription_profile(paths, config, &active_profile).await?;
+    }
+    Ok(())
+}
+
 async fn ensure_subscription_profile(
     paths: &Paths,
     config: &mut AppConfig,
@@ -1037,6 +1321,11 @@ async fn runtime_health(paths: &Paths, config: &AppConfig) -> Result<()> {
         .await
         .context("global mihomo offline")?;
 
+    if config.use_single_runtime() {
+        let _ = paths;
+        return Ok(());
+    }
+
     for (index, service) in config
         .proxy_ports
         .services
@@ -1058,6 +1347,30 @@ fn mihomo_client_for_instance(config: &AppConfig, instance: &RuntimePaths) -> Mi
         url: instance.controller_url.clone(),
         secret: config.controller.secret.clone(),
     })
+}
+
+async fn apply_single_runtime_service_selections(
+    client: &MihomoClient,
+    config: &AppConfig,
+) -> Result<()> {
+    for (index, service) in config
+        .proxy_ports
+        .services
+        .iter()
+        .enumerate()
+        .filter(|(_, service)| service.enabled)
+    {
+        if !service.mode.eq_ignore_ascii_case("rule") {
+            continue;
+        }
+        let selections = service
+            .rule_selections
+            .iter()
+            .map(|(group, proxy)| (group.as_str(), proxy.as_str()))
+            .collect::<Vec<_>>();
+        apply_proxy_selections(client, &service_name(index, service), selections).await?;
+    }
+    Ok(())
 }
 
 fn service_name(index: usize, service: &PortProxyService) -> String {
@@ -1125,9 +1438,59 @@ async fn wait_for_mihomo(client: &MihomoClient) -> Result<()> {
     Ok(())
 }
 
+async fn wait_for_required_ports_available(config: &AppConfig) -> Result<()> {
+    let mut last_error = None;
+    for _ in 0..PORT_RELEASE_RETRIES {
+        match port_allocator::validate_required_ports_available(config) {
+            Ok(()) => return Ok(()),
+            Err(err) if err.to_string().contains("already in use") => {
+                last_error = Some(err);
+                sleep(STOP_WAIT).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    match last_error {
+        Some(err) => Err(err).context("required ports did not become available after cleanup"),
+        None => Ok(()),
+    }
+}
+
+async fn restart_recovered(paths: &Paths, config: &AppConfig) -> bool {
+    let client = MihomoClient::new(&config.controller);
+    for _ in 0..PORT_RELEASE_RETRIES {
+        let daemon_running = read_pid(paths)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(is_process_running);
+        if daemon_running && client.version().await.is_ok() {
+            return true;
+        }
+        sleep(STOP_WAIT).await;
+    }
+    false
+}
+
 async fn print_process_summary(paths: &Paths, config: &AppConfig) -> Result<()> {
     print_pid_state("daemon-pid", &paths.pid_file).await?;
+    if config.use_service_runtime() {
+        match service::status() {
+            Ok(status) if status.core_running => {
+                let pid = status
+                    .core_pid
+                    .map_or_else(|| "-".into(), |pid| pid.to_string());
+                println!("service-mihomo-pid: running pid={pid}");
+            }
+            Ok(_) => println!("service-mihomo-pid: stopped"),
+            Err(err) => println!("service-mihomo-pid: unavailable error={err:#}"),
+        }
+        return Ok(());
+    }
     print_pid_state("global-mihomo-pid", &paths.core_pid_file).await?;
+    if config.use_single_runtime() {
+        return Ok(());
+    }
     for (index, service) in config.proxy_ports.services.iter().enumerate() {
         let instance = core::service_instance(paths, config, index, service);
         print_pid_state(&format!("{}-pid", instance.id), &instance.pid_file).await?;
@@ -1235,6 +1598,9 @@ fn print_log_tail(label: &str, path: &Path, lines: usize) {
 
 fn print_mihomo_log_tails(paths: &Paths, config: &AppConfig) {
     print_log_tail("global mihomo log", &paths.core_log_file, LOG_TAIL_LINES);
+    if config.use_single_runtime() {
+        return;
+    }
     for (index, service) in config.proxy_ports.services.iter().enumerate() {
         let instance = core::service_instance(paths, config, index, service);
         print_log_tail(
@@ -1261,29 +1627,6 @@ fn nested_str<'a>(value: &'a Value, section: &str, key: &str) -> Option<&'a str>
 
 fn bool_value(value: Option<bool>) -> String {
     value.map_or_else(|| "unknown".into(), |value| value.to_string())
-}
-
-fn normalize_inline(value: &str) -> String {
-    if value.is_empty() {
-        "none".into()
-    } else {
-        value.replace('\n', " | ")
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn tun_permission_rule_label() -> &'static str {
-    "launchdaemon"
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn tun_permission_rule_label() -> &'static str {
-    "polkit_rule"
-}
-
-#[cfg(target_os = "linux")]
-fn tun_permission_rule_label() -> &'static str {
-    "systemd_service"
 }
 
 async fn read_pid(paths: &Paths) -> Result<Option<u32>> {
@@ -1323,13 +1666,14 @@ fn serialize_config(config: &AppConfig) -> Result<String> {
     serde_yaml_ng::to_string(config).context("failed to serialize config")
 }
 
-async fn wait_for_exit(pid: u32) {
+async fn wait_for_exit(pid: u32) -> bool {
     for _ in 0..STOP_RETRIES {
         if !is_process_running(pid) {
-            return;
+            return true;
         }
         sleep(STOP_WAIT).await;
     }
+    !is_process_running(pid)
 }
 
 struct PidFileGuard {
@@ -1367,12 +1711,11 @@ fn prepare_background_command(_command: &mut Command) {}
 
 #[cfg(unix)]
 fn is_process_running(pid: u32) -> bool {
-    Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+    let status = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if status == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 #[cfg(windows)]
@@ -1393,12 +1736,7 @@ fn is_process_running(_pid: u32) -> bool {
 
 #[cfg(unix)]
 fn terminate_process(pid: u32) -> Result<()> {
-    let status = Command::new("kill").arg(pid.to_string()).status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        anyhow::bail!("kill exited with {status}");
-    }
+    signal_process(pid, libc::SIGTERM)
 }
 
 #[cfg(windows)]
@@ -1416,4 +1754,32 @@ fn terminate_process(pid: u32) -> Result<()> {
 #[cfg(not(any(unix, windows)))]
 fn terminate_process(_pid: u32) -> Result<()> {
     anyhow::bail!("stop is not supported on this platform");
+}
+
+#[cfg(unix)]
+fn force_terminate_process(pid: u32) -> Result<()> {
+    signal_process(pid, libc::SIGKILL)
+}
+
+#[cfg(windows)]
+fn force_terminate_process(pid: u32) -> Result<()> {
+    terminate_process(pid)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn force_terminate_process(_pid: u32) -> Result<()> {
+    anyhow::bail!("stop is not supported on this platform");
+}
+
+#[cfg(unix)]
+fn signal_process(pid: u32, signal: libc::c_int) -> Result<()> {
+    let status = unsafe { libc::kill(pid as libc::pid_t, signal) };
+    if status == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(err).with_context(|| format!("failed to signal pid {pid}"))
 }

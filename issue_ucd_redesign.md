@@ -102,9 +102,7 @@ Advanced/scriptable commands may still exist:
 clashtui service-install
 clashtui service-uninstall
 clashtui service-status
-clashtui tun-install
-clashtui tun-uninstall
-clashtui tun-status
+clashtui restart
 ```
 
 But regular users should be guided through `config`.
@@ -126,7 +124,7 @@ The primary page is `Main`. It should show current runtime status and the list o
 Top navigation tabs:
 
 ```text
-Main    Subscription    Runtime    Chat    Help
+Main    Subscription    Runtime    Chat    Exit
 ```
 
 Responsibilities:
@@ -152,9 +150,14 @@ Responsibilities:
   - ask user intent in plain language
   - propose config changes
   - apply validated changes through the same config spec used by the TUI
-- Help
-  - glossary and page-specific help
-  - visible action reference
+- Exit
+  - start, stop, reload, restart
+  - save
+  - save and restart
+  - save, restart, and exit
+  - exit without saving
+  - load defaults
+  - immediate exit
 
 Main should show:
 
@@ -194,9 +197,9 @@ Proxies
 
 Right side:
   Selected proxy config, especially System Proxy, PAC, and TUN.
-  Help appears near the lower right side.
+  Details and key hints appear in the right pane.
 
-F9 Defaults  F10 Save & Restart  F11 Save, Restart & Exit  Esc Back/Exit
+F9 Defaults  F10 Save & Restart  Esc Back/Exit
 ```
 
 Navigation rules:
@@ -213,8 +216,12 @@ Function keys:
 
 - `F9`: Load setup defaults, after confirmation.
 - `F10`: Save and restart runtime, after confirmation.
-- `F11`: Save, restart runtime, and exit, after confirmation.
 - `Esc`: Back; on Main, open exit confirmation.
+
+The `Exit` section is the visible command surface for runtime and save/close
+actions. It includes `Start`, `Stop`, `Reload`, `Restart`, `Save`, `Save &
+Restart`, `Save, Restart & Exit`, `Exit Without Saving`, `Load Defaults`, and a
+final `Exit` action that closes the config UI immediately without a popup.
 
 Exit confirmation:
 
@@ -523,7 +530,12 @@ A proxy config exposes or captures traffic:
 
 Each proxy config can bind to a traffic profile. System Proxy/TUN still belongs only to the default System Proxy; user-created Port Proxies only expose local/LAN listeners.
 
-The current runtime implementation has started moving to this model: Global Proxy and each enabled Port Proxy run separate mihomo processes, so Port Proxies can use their own subscription, mode, and selected proxy without being forced through the Global Proxy profile. The remaining design gap is the higher-level traffic profile/spec layer for Chat and advanced reuse.
+The current default runtime implementation has moved to the single-runtime
+model: Global Proxy and enabled Port Proxy services are generated into one
+mihomo config. Global Proxy is the top-level mixed listener and each Port Proxy
+is a mihomo `listener` with its own subscription/mode/proxy intent. Legacy
+multi-process backends remain only for compatibility. The remaining design gap
+is the higher-level traffic profile/spec layer for Chat and advanced reuse.
 
 ## Subscription TUI Design
 
@@ -680,24 +692,32 @@ This should become a first-class concept in UI and service installation. Service
 
 ## Capability Model
 
-There are two privileged capabilities:
+There are three operational capability levels:
 
-- macOS TUN requires the Global Proxy mihomo runtime to run through a privileged service/helper. User-mode start can still provide Port Proxy and system proxy behavior, but it cannot create `utun` or install transparent routes.
+- macOS TUN requires mihomo to run through the privileged service. User-mode
+  start can still provide Global Proxy and Port Proxy listeners, but it cannot
+  create `utun` or install transparent routes.
 
-1. Service registration
+1. User-mode runtime
+   - Starts the daemon and single mihomo runtime as the current user.
+   - Provides Global Proxy and Port Proxy listeners.
+   - Does not provide TUN route ownership.
+
+2. Login autostart
    - Used for login/startup auto-run.
-   - Should install/uninstall/status a platform service.
+   - On macOS this is a user LaunchAgent.
+   - It should be driven by config, not more CLI commands.
 
-2. TUN/system networking permission
+3. Privileged service
    - Used for TUN device, route changes, and DNS/system integration.
-   - Optional. Without it, port proxy mode remains available.
+   - Optional. Without it, proxy listener mode remains available.
 
 The product should degrade cleanly:
 
 ```text
 no privilege        -> port proxy works
-service privilege   -> background/startup works
-tun privilege       -> transparent proxy works
+login autostart     -> user daemon can start after login
+service privilege   -> root/service mihomo can own TUN and routes
 ```
 
 ## Elevation From TUI
@@ -732,13 +752,19 @@ For GUI/no-TTY cases:
 
 ## Service Design
 
-The service should run the daemon entrypoint directly:
+The user login autostart path should run the daemon entrypoint directly:
 
 ```text
 clashtui --daemon-run
 ```
 
-It should not run `clashtui start`, because the service manager already owns process lifecycle.
+It should not run `clashtui start`, because the service manager already owns
+process lifecycle.
+
+The privileged service path is separate. It installs a root-owned
+`clashtui-service`/PrivilegedHelperTools copy that runs `__service-run`, listens
+on a Unix socket, authenticates the configured user uid, and starts/stops the
+single service-owned mihomo child on request.
 
 The generated service must pin:
 
@@ -789,30 +815,26 @@ LaunchDaemon:
 
 ## TUN Permission Design
 
-Keep Linux `tun-install` for now, but define it clearly as Linux privilege setup, not cross-platform TUN device creation.
+The old `tun-install` helper/capability path is removed. Both macOS and Linux
+now align on `service-install` / `service-uninstall` / `service-status`.
 
-Current Linux behavior:
+Current behavior:
 
-- set `cap_net_admin,cap_net_bind_service+ep` on the `clashtui` binary
-- install a systemd-resolved polkit rule
-- `clashtui` then raises ambient capabilities before spawning mihomo
-
-macOS has no equivalent to Linux capability install:
-
-- TUN uses `utun`
-- privileged route/TUN operations should be handled by running the core with sufficient privileges, a LaunchDaemon, or a future privileged helper
+- macOS installs `/Library/PrivilegedHelperTools/com.clashtui.service` and
+  `/Library/LaunchDaemons/com.clashtui.service.plist`.
+- Linux installs `/usr/local/libexec/clashtui-service` and
+  `/etc/systemd/system/clashtui.service`.
+- The service owns the privileged mihomo child and root-owned work directory.
+- User-mode fallback still runs the same single-runtime config without TUN.
 
 ## Implementation Tasks
 
 - Add platform service abstraction, for example `src/platform/service.rs`.
 - Add platform elevation helper, for example `src/platform/elevation.rs`.
-- Add service commands in CLI:
+- Service commands in CLI:
   - `service-install`
   - `service-uninstall`
   - `service-status`
-- Add TUN status command:
-  - Linux checks capabilities, polkit rule, `/dev/net/tun`
-  - macOS reports `utun` support and whether running as root/effective privileges if needed
 - Add setup items in TUI/config:
   - Service: installed/running/not installed
   - TUN permissions: installed/missing/not applicable
@@ -831,16 +853,18 @@ macOS has no equivalent to Linux capability install:
   - Enter opens selected proxy config
   - Esc backs out through the actual page visit history and confirms before exit/discard
   - Proxy subscription selection stays in the Proxy page as an inline dropdown instead of jumping to the Subscription page
-  - F9/F10/F11 BIOS-like defaults/save-restart actions with confirmation
+  - F9/F10 BIOS-like defaults/save-restart actions with confirmation
 - When privileged action is selected in TUI, pause terminal UI and execute the privileged command with inherited stdio.
 - Ensure `start/stop/status` never surprise-prompt for sudo.
 
 ## Open Questions
 
 - Should `config` be renamed or aliased as `setup`?
-- Should `tun-install` eventually become `privilege-install` or remain Linux-specific for compatibility?
-- Should macOS default service be LaunchAgent or ask the user to choose LaunchAgent vs LaunchDaemon?
-- Should Linux default service be user service or system service when TUN is enabled?
+- Should service install/uninstall be exposed only as config actions after the
+  current CLI surface stabilizes?
+- Should macOS user autostart remain LaunchAgent-only while privileged TUN uses
+  LaunchDaemon?
+- Should Linux also support a non-root user service for non-TUN autostart?
 - Should initial launch automatically enter a setup wizard when no config exists?
 - Should port proxy be the explicit default mode in the UI?
 - How much of system service/TUN setup should be available as first-run prompts vs advanced settings?
