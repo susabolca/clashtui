@@ -2688,6 +2688,10 @@ async fn handle_chat_key(
     match key.code {
         KeyCode::Esc if app.chat.task.is_some() => app.cancel_chat(),
         KeyCode::Esc => app.back_or_exit_screen(),
+        KeyCode::Tab => app.next_page(),
+        KeyCode::BackTab => app.prev_page(),
+        KeyCode::Right => app.move_right(config),
+        KeyCode::Left => app.move_left(config),
         KeyCode::PageUp => {
             app.chat.scroll = app.chat.scroll.saturating_add(6);
         }
@@ -5696,8 +5700,11 @@ fn chat_rows(config: &AppConfig, app: &ConfigApp) -> Vec<SettingRow> {
     vec![
         SettingRow {
             label: "Assistant".into(),
-            value: config.llm.model.clone(),
-            help: "Native chat assistant with bundled clashtui/mihomo knowledge.".into(),
+            value: chat_session_status(app).into(),
+            help: format!(
+                "Native chat assistant using {} with bundled clashtui/mihomo knowledge.",
+                config.llm.model
+            ),
             kind: RowKind::Info,
         },
         SettingRow {
@@ -5715,6 +5722,18 @@ fn chat_rows(config: &AppConfig, app: &ConfigApp) -> Vec<SettingRow> {
             kind: RowKind::Info,
         },
     ]
+}
+
+fn chat_session_status(app: &ConfigApp) -> &'static str {
+    if app.chat.task.is_some() {
+        "running"
+    } else if app.chat.pending_patch.is_some() {
+        "patch ready"
+    } else if app.chat.entries.is_empty() {
+        "idle"
+    } else {
+        "done"
+    }
 }
 
 fn exit_rows() -> Vec<SettingRow> {
@@ -10727,6 +10746,45 @@ mod tests {
         assert_eq!(Page::Runtime.next(), Page::Dns);
         assert_eq!(Page::Chat.prev(), Page::Dns);
         assert_eq!(Page::Dns.title(), "DNS");
+    }
+
+    #[tokio::test]
+    async fn chat_page_keeps_section_navigation_keys() -> Result<()> {
+        let paths = test_paths("chat-section-navigation")?;
+        let mut config = AppConfig::default();
+        let mut app = ConfigApp::new(&config);
+
+        app.switch_section(Page::Chat);
+        handle_chat_key(
+            &paths,
+            &mut config,
+            &mut app,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::empty()),
+        )
+        .await?;
+        assert_eq!(app.page, Page::Dns);
+
+        app.switch_section(Page::Chat);
+        handle_chat_key(
+            &paths,
+            &mut config,
+            &mut app,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::empty()),
+        )
+        .await?;
+        assert_eq!(app.page, Page::Exit);
+
+        app.switch_section(Page::Chat);
+        handle_chat_key(
+            &paths,
+            &mut config,
+            &mut app,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
+        )
+        .await?;
+        assert_eq!(app.page, Page::Exit);
+
+        Ok(())
     }
 
     #[test]
