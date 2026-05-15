@@ -42,7 +42,7 @@ struct Cli {
     verbose: bool,
 
     /// UI and assistant language.
-    #[arg(long, global = true, value_enum, default_value = "en")]
+    #[arg(short = 'l', long, global = true, value_enum, default_value = "en")]
     language: Language,
 
     #[arg(long, hide = true)]
@@ -65,7 +65,23 @@ mod tests {
     }
 
     #[test]
-    fn cli_accepts_zh_cn_language() -> Result<()> {
+    fn cli_accepts_short_zh_language() -> Result<()> {
+        let cli = Cli::try_parse_from(["clashtui", "-l", "zh", "config"])?;
+
+        assert_eq!(cli.language, Language::ZhCn);
+        Ok(())
+    }
+
+    #[test]
+    fn cli_accepts_cn_language_alias() -> Result<()> {
+        let cli = Cli::try_parse_from(["clashtui", "--language", "cn", "config"])?;
+
+        assert_eq!(cli.language, Language::ZhCn);
+        Ok(())
+    }
+
+    #[test]
+    fn cli_accepts_legacy_zh_cn_language_alias() -> Result<()> {
         let cli = Cli::try_parse_from(["clashtui", "--language", "zh-CN", "config"])?;
 
         assert_eq!(cli.language, Language::ZhCn);

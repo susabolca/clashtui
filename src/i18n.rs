@@ -5,7 +5,7 @@ pub enum Language {
     #[value(name = "en", alias = "english")]
     #[default]
     En,
-    #[value(name = "zh-CN", alias = "zh-cn", alias = "zh", alias = "cn")]
+    #[value(name = "zh", alias = "cn", alias = "zh-CN", alias = "zh-cn")]
     ZhCn,
 }
 
