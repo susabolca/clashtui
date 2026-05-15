@@ -29,9 +29,9 @@ libc = "0.2"
 panic = "unwind"
 codegen-units = 1
 lto = "thin"
-opt-level = 3
-debug = 1
-strip = "none"
+opt-level = "z"
+debug = 0
+strip = "debuginfo"
 
 [lints.clippy]
 correctness = { level = "deny", priority = -1 }
