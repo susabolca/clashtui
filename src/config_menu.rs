@@ -8,7 +8,10 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -53,6 +56,8 @@ const DEFAULT_INPUT_WIDTH: u16 = 58;
 const DEFAULT_INPUT_ROWS: usize = 1;
 const URL_INPUT_WIDTH: u16 = 96;
 const URL_INPUT_ROWS: usize = 4;
+const DNS_TEXT_INPUT_WIDTH: u16 = 96;
+const DNS_TEXT_INPUT_ROWS: usize = 8;
 const PAGE_JUMP_FALLBACK: usize = 8;
 const PAGE_JUMP_MAX: usize = 24;
 const H_LINE: char = '─';
@@ -84,11 +89,16 @@ pub async fn run(paths: &Paths, config: &mut AppConfig) -> Result<()> {
         terminal
             .terminal
             .draw(|frame| draw(frame, paths, &draft, &app))?;
-        if event::poll(TICK_RATE)?
-            && let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-        {
-            handle_key(paths, &mut draft, &mut app, key).await?;
+        if event::poll(TICK_RATE)? {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    handle_key(paths, &mut draft, &mut app, key).await?;
+                }
+                Event::Paste(value) => {
+                    handle_paste(paths, &mut draft, &mut app, &value).await?;
+                }
+                _ => {}
+            }
         }
         if last_refresh.elapsed() >= REFRESH_INTERVAL && app.runtime_command.is_none() {
             app.start_runtime_refresh(paths, &draft);
@@ -128,10 +138,11 @@ enum Page {
 }
 
 impl Page {
-    const SECTION_ROOTS: [Self; 5] = [
+    const SECTION_ROOTS: [Self; 6] = [
         Self::Main,
         Self::Subscription,
         Self::Runtime,
+        Self::Dns,
         Self::Chat,
         Self::Exit,
     ];
@@ -182,8 +193,7 @@ impl Page {
             | Self::ProxyConnections
             | Self::ProxyLogs
             | Self::ProxyGroups
-            | Self::Mode
-            | Self::Dns => 0,
+            | Self::Mode => 0,
             Self::Subscription
             | Self::SubscriptionDetail
             | Self::SubscriptionRuleGroups
@@ -191,8 +201,9 @@ impl Page {
             | Self::SubscriptionRules
             | Self::AddSubscription => 1,
             Self::Runtime => 2,
-            Self::Chat => 3,
-            Self::Exit => 4,
+            Self::Dns => 3,
+            Self::Chat => 4,
+            Self::Exit => 5,
         }
     }
 }
@@ -205,19 +216,17 @@ enum RuntimeItem {
     CorePath,
     CoreUpdate,
     Controller,
-    Dns,
     Refresh,
 }
 
 impl RuntimeItem {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 7] = [
         Self::Service,
         Self::Autostart,
         Self::Logs,
         Self::CorePath,
         Self::CoreUpdate,
         Self::Controller,
-        Self::Dns,
         Self::Refresh,
     ];
 
@@ -229,7 +238,6 @@ impl RuntimeItem {
             Self::CorePath => "Mihomo Core",
             Self::CoreUpdate => "Update Core",
             Self::Controller => "Controller",
-            Self::Dns => "DNS",
             Self::Refresh => "Refresh Runtime",
         }
     }
@@ -343,12 +351,11 @@ enum ProxyConfigField {
     OsProxy,
     Pac,
     Tun,
-    Dns,
     Logs,
 }
 
 impl ProxyConfigField {
-    const SYSTEM_ALL: [Self; 13] = [
+    const SYSTEM_ALL: [Self; 12] = [
         Self::ServiceStatus,
         Self::TrafficStatus,
         Self::Connections,
@@ -360,7 +367,6 @@ impl ProxyConfigField {
         Self::OsProxy,
         Self::Pac,
         Self::Tun,
-        Self::Dns,
         Self::Logs,
     ];
 
@@ -391,7 +397,6 @@ impl ProxyConfigField {
             Self::OsProxy => "Sys Proxy",
             Self::Pac => "PAC",
             Self::Tun => "TUN",
-            Self::Dns => "DNS",
             Self::Logs => "Logs",
         }
     }
@@ -430,6 +435,7 @@ enum DnsItem {
     Listen,
     LanDomains,
     LanNameserver,
+    NameserverPolicy,
     DirectNameserver,
     DirectFollowPolicy,
     Nameserver,
@@ -438,11 +444,12 @@ enum DnsItem {
 }
 
 impl DnsItem {
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 10] = [
         Self::Enabled,
         Self::Listen,
         Self::LanDomains,
         Self::LanNameserver,
+        Self::NameserverPolicy,
         Self::DirectNameserver,
         Self::DirectFollowPolicy,
         Self::Nameserver,
@@ -456,6 +463,7 @@ impl DnsItem {
             Self::Listen => "Listen",
             Self::LanDomains => "LAN Domains",
             Self::LanNameserver => "LAN DNS",
+            Self::NameserverPolicy => "DNS Policy",
             Self::DirectNameserver => "Direct DNS",
             Self::DirectFollowPolicy => "Direct follows policy",
             Self::Nameserver => "Default DNS",
@@ -494,10 +502,18 @@ enum InputMode {
     DnsListen,
     DnsLanDomains,
     DnsLanNameserver,
+    DnsNameserverPolicy,
     DnsDirectNameserver,
     DnsNameserver,
     DnsFallback,
     DnsFakeIpFilter,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputFocus {
+    Editor,
+    Save,
+    Cancel,
 }
 
 impl InputMode {
@@ -515,6 +531,7 @@ impl InputMode {
             Self::DnsListen => "DNS Listen",
             Self::DnsLanDomains => "LAN Domains",
             Self::DnsLanNameserver => "LAN DNS",
+            Self::DnsNameserverPolicy => "DNS Policy",
             Self::DnsDirectNameserver => "Direct DNS",
             Self::DnsNameserver => "Default DNS",
             Self::DnsFallback => "Fallback DNS",
@@ -950,8 +967,11 @@ struct ConfigApp {
     selected_dns: usize,
     selected_exit: usize,
     input_mode: InputMode,
+    input_focus: InputFocus,
     dropdown: Option<Dropdown>,
     input: String,
+    input_cursor: usize,
+    input_desired_column: Option<usize>,
     subscription_form: SubscriptionForm,
     runtime: RuntimeState,
     runtime_checked: bool,
@@ -999,8 +1019,11 @@ impl ConfigApp {
             selected_dns: 0,
             selected_exit: first_selectable_exit_index(),
             input_mode: InputMode::Normal,
+            input_focus: InputFocus::Editor,
             dropdown: None,
             input: String::new(),
+            input_cursor: 0,
+            input_desired_column: None,
             subscription_form: SubscriptionForm::default(),
             runtime: RuntimeState::default(),
             runtime_checked: false,
@@ -2202,8 +2225,49 @@ impl ConfigApp {
 
     fn cancel_input(&mut self) {
         self.input_mode = InputMode::Normal;
+        self.input_focus = InputFocus::Editor;
         self.input.clear();
+        self.input_cursor = 0;
+        self.input_desired_column = None;
         self.status = "Canceled".into();
+    }
+
+    fn begin_input(
+        &mut self,
+        mode: InputMode,
+        value: impl Into<String>,
+        status: impl Into<String>,
+    ) {
+        self.input_mode = mode;
+        self.input_focus = InputFocus::Editor;
+        self.input = value.into();
+        self.input_cursor = self.input.len();
+        self.input_desired_column = None;
+        self.status = status.into();
+    }
+
+    fn finish_input(&mut self) {
+        self.input.clear();
+        self.input_cursor = 0;
+        self.input_desired_column = None;
+        self.input_mode = InputMode::Normal;
+        self.input_focus = InputFocus::Editor;
+    }
+
+    fn next_input_focus(&mut self) {
+        self.input_focus = match self.input_focus {
+            InputFocus::Editor => InputFocus::Save,
+            InputFocus::Save => InputFocus::Cancel,
+            InputFocus::Cancel => InputFocus::Editor,
+        };
+    }
+
+    fn prev_input_focus(&mut self) {
+        self.input_focus = match self.input_focus {
+            InputFocus::Editor => InputFocus::Cancel,
+            InputFocus::Save => InputFocus::Editor,
+            InputFocus::Cancel => InputFocus::Save,
+        };
     }
 
     fn open_confirm(&mut self, action: ConfirmAction) {
@@ -2326,25 +2390,102 @@ async fn handle_dropdown_key(
     Ok(())
 }
 
+async fn handle_paste(
+    paths: &Paths,
+    config: &mut AppConfig,
+    app: &mut ConfigApp,
+    value: &str,
+) -> Result<()> {
+    if app.runtime_command.is_some() || app.alert.is_some() || app.confirm.is_some() {
+        return Ok(());
+    }
+    let value = normalize_pasted_text(value);
+    if app.is_input() {
+        insert_input_text(app, &value);
+    } else if app.page == Page::AddSubscription {
+        handle_subscription_form_paste(paths, config, app, &value).await?;
+    }
+    Ok(())
+}
+
+fn normalize_pasted_text(value: &str) -> String {
+    value.replace("\r\n", "\n").replace('\r', "\n")
+}
+
 async fn handle_input_key(
     paths: &Paths,
     config: &mut AppConfig,
     app: &mut ConfigApp,
     key: KeyEvent,
 ) -> Result<()> {
+    if app.input_focus != InputFocus::Editor {
+        match key.code {
+            KeyCode::Esc => app.cancel_input(),
+            KeyCode::Tab | KeyCode::Right | KeyCode::Down => app.next_input_focus(),
+            KeyCode::BackTab | KeyCode::Left | KeyCode::Up => app.prev_input_focus(),
+            KeyCode::Enter | KeyCode::Char(' ') => match app.input_focus {
+                InputFocus::Save => submit_input(paths, config, app).await?,
+                InputFocus::Cancel => app.cancel_input(),
+                InputFocus::Editor => {}
+            },
+            _ => {}
+        }
+        return Ok(());
+    }
+
     match key.code {
         KeyCode::Esc => app.cancel_input(),
-        KeyCode::Backspace => {
-            app.input.pop();
+        KeyCode::Tab => app.next_input_focus(),
+        KeyCode::BackTab => app.prev_input_focus(),
+        KeyCode::Char('s') | KeyCode::Char('S')
+            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            submit_input(paths, config, app).await?
         }
-        KeyCode::Enter => submit_input(paths, config, app).await?,
-        KeyCode::Up if is_number_input(app.input_mode) => adjust_number_input(&mut app.input, 1),
-        KeyCode::Down if is_number_input(app.input_mode) => adjust_number_input(&mut app.input, -1),
+        KeyCode::Backspace => delete_input_char_before_cursor(app),
+        KeyCode::Delete => delete_input_char_at_cursor(app),
+        KeyCode::Left => move_input_cursor_left(app),
+        KeyCode::Right => move_input_cursor_right(app),
+        KeyCode::Home => move_input_cursor_line_start(app),
+        KeyCode::End => move_input_cursor_line_end(app),
+        KeyCode::Up if is_multiline_input(app.input_mode) => move_input_cursor_line(app, -1),
+        KeyCode::Down if is_multiline_input(app.input_mode) => move_input_cursor_line(app, 1),
+        KeyCode::Enter if should_insert_input_newline(app.input_mode, key.modifiers) => {
+            insert_input_text(app, "\n");
+        }
+        KeyCode::Char('j')
+            if is_multiline_input(app.input_mode)
+                && key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            insert_input_text(app, "\n");
+        }
+        KeyCode::Enter if is_multiline_input(app.input_mode) => insert_input_text(app, "\n"),
+        KeyCode::Enter => {}
+        KeyCode::Up if is_number_input(app.input_mode) => {
+            adjust_number_input(&mut app.input, &mut app.input_cursor, 1);
+        }
+        KeyCode::Down if is_number_input(app.input_mode) => {
+            adjust_number_input(&mut app.input, &mut app.input_cursor, -1);
+        }
         KeyCode::Char(value) if is_number_input(app.input_mode) && value.is_ascii_digit() => {
-            push_number_digit(&mut app.input, value);
+            push_number_digit(&mut app.input, &mut app.input_cursor, value);
         }
-        KeyCode::Char(value) => app.input.push(value),
+        KeyCode::Char(value) => insert_input_char(app, value),
         _ => {}
+    }
+    Ok(())
+}
+
+async fn handle_subscription_form_paste(
+    _paths: &Paths,
+    _config: &mut AppConfig,
+    app: &mut ConfigApp,
+    value: &str,
+) -> Result<()> {
+    match app.subscription_form.selected_field() {
+        SubscriptionFormField::Name => app.subscription_form.name.push_str(value),
+        SubscriptionFormField::Url => app.subscription_form.url.push_str(value),
+        SubscriptionFormField::Refresh | SubscriptionFormField::Ok => {}
     }
     Ok(())
 }
@@ -2798,9 +2939,6 @@ async fn submit_runtime_item(
             false,
         ),
         RuntimeItem::Controller => begin_controller_input(config, app),
-        RuntimeItem::Dns => {
-            app.enter_page(Page::Dns, "DNS settings");
-        }
         RuntimeItem::Refresh => refresh_runtime(paths, config, app),
     }
     Ok(())
@@ -2856,9 +2994,6 @@ async fn submit_proxy_config_item(
             app.status = "PAC configuration is not implemented in this preview".into()
         }
         ProxyConfigField::Tun => toggle_tun(paths, config, app).await?,
-        ProxyConfigField::Dns => {
-            app.enter_page(Page::Dns, "DNS settings");
-        }
         ProxyConfigField::Logs => {
             app.selected_proxy_log = 0;
             app.enter_page(Page::ProxyLogs, "Runtime logs");
@@ -2873,6 +3008,7 @@ async fn submit_dns_item(paths: &Paths, config: &mut AppConfig, app: &mut Config
         DnsItem::Listen => begin_dns_listen_input(config, app),
         DnsItem::LanDomains => begin_dns_lan_domains_input(config, app),
         DnsItem::LanNameserver => begin_dns_lan_nameserver_input(config, app),
+        DnsItem::NameserverPolicy => begin_dns_nameserver_policy_input(config, app),
         DnsItem::DirectNameserver => begin_dns_direct_nameserver_input(config, app),
         DnsItem::DirectFollowPolicy => {
             config.dns.direct_nameserver_follow_policy =
@@ -2892,8 +3028,7 @@ async fn submit_input(paths: &Paths, config: &mut AppConfig, app: &mut ConfigApp
         InputMode::Normal => {}
         InputMode::SubscriptionName => {
             app.subscription_form.name = value;
-            app.input.clear();
-            app.input_mode = InputMode::Normal;
+            app.finish_input();
             app.status = "Name pending save".into();
         }
         InputMode::SubscriptionUrl => {
@@ -2904,8 +3039,7 @@ async fn submit_input(paths: &Paths, config: &mut AppConfig, app: &mut ConfigApp
                 }
                 let Some(subscription) = config.subscriptions.get_mut(app.selected_subscription)
                 else {
-                    app.input.clear();
-                    app.input_mode = InputMode::Normal;
+                    app.finish_input();
                     app.alert("No Subscription", "Select a subscription first.");
                     return Ok(());
                 };
@@ -2914,16 +3048,14 @@ async fn submit_input(paths: &Paths, config: &mut AppConfig, app: &mut ConfigApp
             } else {
                 app.subscription_form.url = value;
             }
-            app.input.clear();
-            app.input_mode = InputMode::Normal;
+            app.finish_input();
             app.status = "URL pending save".into();
         }
         InputMode::CorePath => {
             config.core_path = if value.is_empty() { None } else { Some(value) };
             config.mihomo.core = core::CORE_SOURCE_CUSTOM.into();
             app.mark_dirty();
-            app.input.clear();
-            app.input_mode = InputMode::Normal;
+            app.finish_input();
             app.status = "Core path pending save".into();
         }
         InputMode::Controller => {
@@ -2933,8 +3065,7 @@ async fn submit_input(paths: &Paths, config: &mut AppConfig, app: &mut ConfigApp
                 app.mark_dirty();
                 app.status = "Controller pending save".into();
             }
-            app.input.clear();
-            app.input_mode = InputMode::Normal;
+            app.finish_input();
         }
         InputMode::MixedPort => {
             let Some((host, port)) =
@@ -2950,8 +3081,7 @@ async fn submit_input(paths: &Paths, config: &mut AppConfig, app: &mut ConfigApp
                 "MIX={}:{} pending save",
                 config.proxy_host, config.mixed_port
             );
-            app.input.clear();
-            app.input_mode = InputMode::Normal;
+            app.finish_input();
         }
         InputMode::HttpPort => {
             let Some(port) = parse_optional_port_or_alert(app, &value, "HTTP port") else {
@@ -2963,8 +3093,7 @@ async fn submit_input(paths: &Paths, config: &mut AppConfig, app: &mut ConfigApp
                 "HTTP port={} pending save",
                 optional_port_value(config.proxy_ports.http)
             );
-            app.input.clear();
-            app.input_mode = InputMode::Normal;
+            app.finish_input();
         }
         InputMode::SocksPort => {
             let Some(port) = parse_optional_port_or_alert(app, &value, "SOCKS port") else {
@@ -2976,14 +3105,12 @@ async fn submit_input(paths: &Paths, config: &mut AppConfig, app: &mut ConfigApp
                 "SOCKS port={} pending save",
                 optional_port_value(config.proxy_ports.socks)
             );
-            app.input.clear();
-            app.input_mode = InputMode::Normal;
+            app.finish_input();
         }
         InputMode::ServicePort => {
             let Some(service_index) = service_index_for_main_proxy(config, app.selected_main)
             else {
-                app.input.clear();
-                app.input_mode = InputMode::Normal;
+                app.finish_input();
                 app.alert("Invalid Proxy", "Select a port proxy first.");
                 return Ok(());
             };
@@ -2999,8 +3126,7 @@ async fn submit_input(paths: &Paths, config: &mut AppConfig, app: &mut ConfigApp
                 return Ok(());
             };
             let Some(service) = config.proxy_ports.services.get_mut(service_index) else {
-                app.input.clear();
-                app.input_mode = InputMode::Normal;
+                app.finish_input();
                 app.alert("Invalid Proxy", "Select a port proxy first.");
                 return Ok(());
             };
@@ -3009,8 +3135,7 @@ async fn submit_input(paths: &Paths, config: &mut AppConfig, app: &mut ConfigApp
             let listen = service_listen(service);
             app.mark_dirty();
             app.status = format!("Port proxy={listen} pending save");
-            app.input.clear();
-            app.input_mode = InputMode::Normal;
+            app.finish_input();
         }
         InputMode::DnsListen => {
             if !value.is_empty() {
@@ -3018,44 +3143,45 @@ async fn submit_input(paths: &Paths, config: &mut AppConfig, app: &mut ConfigApp
                 config.port_allocation.auto_dns = false;
                 save_dns_config(paths, config, app, "DNS listen").await?;
             }
-            app.input.clear();
-            app.input_mode = InputMode::Normal;
+            app.finish_input();
         }
         InputMode::DnsLanDomains => {
             config.dns.lan_domains = split_list(&value);
             save_dns_config(paths, config, app, "LAN domains").await?;
-            app.input.clear();
-            app.input_mode = InputMode::Normal;
+            app.finish_input();
         }
         InputMode::DnsLanNameserver => {
             config.dns.lan_nameserver = split_list(&value);
             save_dns_config(paths, config, app, "LAN DNS").await?;
-            app.input.clear();
-            app.input_mode = InputMode::Normal;
+            app.finish_input();
+        }
+        InputMode::DnsNameserverPolicy => {
+            let Some(policy) = parse_nameserver_policy_or_alert(app, &value) else {
+                return Ok(());
+            };
+            config.dns.nameserver_policy = policy;
+            save_dns_config(paths, config, app, "DNS policy").await?;
+            app.finish_input();
         }
         InputMode::DnsDirectNameserver => {
             config.dns.direct_nameserver = split_list(&value);
             save_dns_config(paths, config, app, "Direct DNS").await?;
-            app.input.clear();
-            app.input_mode = InputMode::Normal;
+            app.finish_input();
         }
         InputMode::DnsNameserver => {
             config.dns.nameserver = split_list(&value);
             save_dns_config(paths, config, app, "Default DNS").await?;
-            app.input.clear();
-            app.input_mode = InputMode::Normal;
+            app.finish_input();
         }
         InputMode::DnsFallback => {
             config.dns.fallback = split_list(&value);
             save_dns_config(paths, config, app, "Fallback DNS").await?;
-            app.input.clear();
-            app.input_mode = InputMode::Normal;
+            app.finish_input();
         }
         InputMode::DnsFakeIpFilter => {
             config.dns.fake_ip_filter = split_list(&value);
             save_dns_config(paths, config, app, "Fake-IP filter").await?;
-            app.input.clear();
-            app.input_mode = InputMode::Normal;
+            app.finish_input();
         }
     }
     Ok(())
@@ -3070,15 +3196,19 @@ fn begin_add_subscription(app: &mut ConfigApp) {
 }
 
 fn begin_subscription_name_input(app: &mut ConfigApp) {
-    app.input_mode = InputMode::SubscriptionName;
-    app.input.clone_from(&app.subscription_form.name);
-    app.status = "Edit subscription name".into();
+    app.begin_input(
+        InputMode::SubscriptionName,
+        app.subscription_form.name.clone(),
+        "Edit subscription name",
+    );
 }
 
 fn begin_subscription_url_input(app: &mut ConfigApp) {
-    app.input_mode = InputMode::SubscriptionUrl;
-    app.input.clone_from(&app.subscription_form.url);
-    app.status = "Edit subscription URL".into();
+    app.begin_input(
+        InputMode::SubscriptionUrl,
+        app.subscription_form.url.clone(),
+        "Edit subscription URL",
+    );
 }
 
 fn begin_selected_subscription_url_input(config: &AppConfig, app: &mut ConfigApp) {
@@ -3086,97 +3216,135 @@ fn begin_selected_subscription_url_input(config: &AppConfig, app: &mut ConfigApp
         app.alert("No Subscription", "Select a subscription first.");
         return;
     };
-    app.input_mode = InputMode::SubscriptionUrl;
-    app.input.clone_from(&subscription.url);
-    app.status = "Edit subscription URL".into();
+    app.begin_input(
+        InputMode::SubscriptionUrl,
+        subscription.url.clone(),
+        "Edit subscription URL",
+    );
 }
 
 fn begin_core_path_input(config: &AppConfig, app: &mut ConfigApp) {
-    app.input_mode = InputMode::CorePath;
-    app.input = config.core_path.clone().unwrap_or_default();
-    app.status = "Edit mihomo core path".into();
+    app.begin_input(
+        InputMode::CorePath,
+        config.core_path.clone().unwrap_or_default(),
+        "Edit mihomo core path",
+    );
 }
 
 fn begin_controller_input(config: &AppConfig, app: &mut ConfigApp) {
-    app.input_mode = InputMode::Controller;
-    app.input.clone_from(&config.controller.url);
-    app.status = "Edit controller URL".into();
+    app.begin_input(
+        InputMode::Controller,
+        config.controller.url.clone(),
+        "Edit controller URL",
+    );
 }
 
 fn begin_mixed_port_input(config: &AppConfig, app: &mut ConfigApp) {
-    app.input_mode = InputMode::MixedPort;
-    app.input = format!("{}:{}", config.proxy_host, config.mixed_port);
-    app.status = "Edit mixed listen address; use 0.0.0.0:7070 for LAN".into();
+    app.begin_input(
+        InputMode::MixedPort,
+        format!("{}:{}", config.proxy_host, config.mixed_port),
+        "Edit mixed listen address; use 0.0.0.0:7070 for LAN",
+    );
 }
 
 fn begin_http_port_input(config: &AppConfig, app: &mut ConfigApp) {
-    app.input_mode = InputMode::HttpPort;
-    app.input = optional_port_value(config.proxy_ports.http);
-    app.status = "Edit HTTP port; empty/off disables it".into();
+    app.begin_input(
+        InputMode::HttpPort,
+        optional_port_value(config.proxy_ports.http),
+        "Edit HTTP port; empty/off disables it",
+    );
 }
 
 fn begin_socks_port_input(config: &AppConfig, app: &mut ConfigApp) {
-    app.input_mode = InputMode::SocksPort;
-    app.input = optional_port_value(config.proxy_ports.socks);
-    app.status = "Edit SOCKS port; empty/off disables it".into();
+    app.begin_input(
+        InputMode::SocksPort,
+        optional_port_value(config.proxy_ports.socks),
+        "Edit SOCKS port; empty/off disables it",
+    );
 }
 
 fn begin_service_port_input(config: &AppConfig, app: &mut ConfigApp) {
-    app.input_mode = InputMode::ServicePort;
-    app.input = service_index_for_main_proxy(config, app.selected_main)
+    let value = service_index_for_main_proxy(config, app.selected_main)
         .and_then(|index| config.proxy_ports.services.get(index))
         .map(service_listen)
         .unwrap_or_else(|| "auto".into());
-    app.status = "Edit port proxy listen address; empty/auto uses allocator".into();
+    app.begin_input(
+        InputMode::ServicePort,
+        value,
+        "Edit port proxy listen address; empty/auto uses allocator",
+    );
 }
 
 fn begin_dns_listen_input(config: &AppConfig, app: &mut ConfigApp) {
     app.page = Page::Dns;
-    app.input_mode = InputMode::DnsListen;
-    app.input.clone_from(&config.dns.listen);
-    app.status = "Edit DNS listen address".into();
+    app.begin_input(
+        InputMode::DnsListen,
+        config.dns.listen.clone(),
+        "Edit DNS listen address",
+    );
 }
 
 fn begin_dns_lan_domains_input(config: &AppConfig, app: &mut ConfigApp) {
     app.page = Page::Dns;
-    app.input_mode = InputMode::DnsLanDomains;
-    app.input = join_list(&config.dns.lan_domains);
-    app.status = "Edit LAN domain suffixes".into();
+    app.begin_input(
+        InputMode::DnsLanDomains,
+        join_multiline_list(&config.dns.lan_domains),
+        "Edit LAN domain suffixes",
+    );
 }
 
 fn begin_dns_lan_nameserver_input(config: &AppConfig, app: &mut ConfigApp) {
     app.page = Page::Dns;
-    app.input_mode = InputMode::DnsLanNameserver;
-    app.input = join_list(&config.dns.lan_nameserver);
-    app.status = "Edit LAN DNS servers".into();
+    app.begin_input(
+        InputMode::DnsLanNameserver,
+        join_multiline_list(&config.dns.lan_nameserver),
+        "Edit LAN DNS servers",
+    );
+}
+
+fn begin_dns_nameserver_policy_input(config: &AppConfig, app: &mut ConfigApp) {
+    app.page = Page::Dns;
+    app.begin_input(
+        InputMode::DnsNameserverPolicy,
+        format_multiline_nameserver_policy(&config.dns.nameserver_policy),
+        "Edit DNS policy entries",
+    );
 }
 
 fn begin_dns_direct_nameserver_input(config: &AppConfig, app: &mut ConfigApp) {
     app.page = Page::Dns;
-    app.input_mode = InputMode::DnsDirectNameserver;
-    app.input = join_list(&config.dns.direct_nameserver);
-    app.status = "Edit DIRECT DNS servers".into();
+    app.begin_input(
+        InputMode::DnsDirectNameserver,
+        join_multiline_list(&config.dns.direct_nameserver),
+        "Edit DIRECT DNS servers",
+    );
 }
 
 fn begin_dns_nameserver_input(config: &AppConfig, app: &mut ConfigApp) {
     app.page = Page::Dns;
-    app.input_mode = InputMode::DnsNameserver;
-    app.input = join_list(&config.dns.nameserver);
-    app.status = "Edit default DNS servers".into();
+    app.begin_input(
+        InputMode::DnsNameserver,
+        join_multiline_list(&config.dns.nameserver),
+        "Edit default DNS servers",
+    );
 }
 
 fn begin_dns_fallback_input(config: &AppConfig, app: &mut ConfigApp) {
     app.page = Page::Dns;
-    app.input_mode = InputMode::DnsFallback;
-    app.input = join_list(&config.dns.fallback);
-    app.status = "Edit fallback DNS servers".into();
+    app.begin_input(
+        InputMode::DnsFallback,
+        join_multiline_list(&config.dns.fallback),
+        "Edit fallback DNS servers",
+    );
 }
 
 fn begin_dns_fake_ip_filter_input(config: &AppConfig, app: &mut ConfigApp) {
     app.page = Page::Dns;
-    app.input_mode = InputMode::DnsFakeIpFilter;
-    app.input = join_list(&config.dns.fake_ip_filter);
-    app.status = "Edit fake-IP filter".into();
+    app.begin_input(
+        InputMode::DnsFakeIpFilter,
+        join_multiline_list(&config.dns.fake_ip_filter),
+        "Edit fake-IP filter",
+    );
 }
 
 fn refresh_runtime(paths: &Paths, config: &AppConfig, app: &mut ConfigApp) {
@@ -3389,8 +3557,7 @@ async fn add_subscription(
         rule_selections: Default::default(),
     });
     app.selected_subscription = config.subscriptions.len() - 1;
-    app.input.clear();
-    app.input_mode = InputMode::Normal;
+    app.finish_input();
     app.subscription_form.clear();
 
     match subscription::update_preserving_last_good(paths, config, app.selected_subscription).await
@@ -4885,7 +5052,6 @@ fn proxy_config_rows(config: &AppConfig, app: &ConfigApp) -> Vec<SettingRow> {
                 ProxyConfigField::OsProxy => RowKind::Toggle(ToggleAction::SystemProxy),
                 ProxyConfigField::Pac => RowKind::Info,
                 ProxyConfigField::Tun => RowKind::Toggle(ToggleAction::Tun),
-                ProxyConfigField::Dns => RowKind::Submenu(Page::Dns),
                 ProxyConfigField::Logs => RowKind::Action(ActionKind::Logs),
             };
             SettingRow {
@@ -5031,7 +5197,6 @@ fn runtime_rows(config: &AppConfig, app: &ConfigApp) -> Vec<SettingRow> {
                 RuntimeItem::CorePath => RowKind::Choice(ChoiceAction::CoreSource),
                 RuntimeItem::CoreUpdate => RowKind::Action(ActionKind::UpdateCore),
                 RuntimeItem::Controller => RowKind::Input(InputMode::Controller),
-                RuntimeItem::Dns => RowKind::Submenu(Page::Dns),
                 RuntimeItem::Refresh => RowKind::Action(ActionKind::RefreshRuntime),
             };
             SettingRow {
@@ -5053,6 +5218,7 @@ fn dns_rows(config: &AppConfig) -> Vec<SettingRow> {
                 DnsItem::Listen => RowKind::Input(InputMode::DnsListen),
                 DnsItem::LanDomains => RowKind::Input(InputMode::DnsLanDomains),
                 DnsItem::LanNameserver => RowKind::Input(InputMode::DnsLanNameserver),
+                DnsItem::NameserverPolicy => RowKind::Input(InputMode::DnsNameserverPolicy),
                 DnsItem::DirectNameserver => RowKind::Input(InputMode::DnsDirectNameserver),
                 DnsItem::DirectFollowPolicy => RowKind::Toggle(ToggleAction::DnsDirectFollowPolicy),
                 DnsItem::Nameserver => RowKind::Input(InputMode::DnsNameserver),
@@ -5318,7 +5484,6 @@ const fn runtime_item_help(item: RuntimeItem) -> &'static str {
             "Download the latest selected managed Mihomo core; restart to use it."
         }
         RuntimeItem::Controller => "Mihomo external controller URL used by clashtui.",
-        RuntimeItem::Dns => "Open DNS settings shared by the runtime.",
         RuntimeItem::Refresh => "Refresh runtime information from mihomo.",
     }
 }
@@ -5898,9 +6063,14 @@ fn draw_dns_help(frame: &mut Frame, config: &AppConfig, app: &ConfigApp, area: R
         Line::from(dns_item_help(item)),
         Line::from(""),
         Line::from("List values are comma separated."),
+        Line::from("Policy format: +.example.com=1.1.1.1, 8.8.8.8"),
         Line::from("Use system for the OS resolver, or IP/DoH/DoT servers."),
         Line::from(""),
         Line::from(format!("Effective policy entries: {}", policy.len())),
+        Line::from(format!(
+            "Configured policy: {}",
+            compact_nameserver_policy(&config.dns.nameserver_policy)
+        )),
         Line::from(format!(
             "LAN domains: {}",
             compact_list(&config.dns.lan_domains)
@@ -5942,35 +6112,64 @@ fn draw_input(frame: &mut Frame, app: &ConfigApp) {
     ];
     body.extend(input_box_lines(
         &app.input,
+        app.input_cursor,
         area.width.saturating_sub(6) as usize,
         rows,
     ));
     body.extend([
         Line::from(""),
+        input_action_line(app),
         Line::from(Span::styled(
-            if is_number_input(app.input_mode) {
-                "Up/Down change | Enter OK | Esc cancel"
-            } else if app.input_mode == InputMode::SubscriptionUrl {
-                "Paste URL | Enter OK | Esc cancel"
-            } else {
-                "Type value | Enter OK | Esc cancel"
-            },
+            input_help_text(app),
             Style::default().fg(Color::Gray),
-        )),
+        ))
+        .alignment(Alignment::Center),
     ]);
 
     frame.render_widget(dialog_panel(body), area);
 }
 
+fn input_action_line(app: &ConfigApp) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(" Save ", button_style(app.input_focus == InputFocus::Save)),
+        Span::raw("  "),
+        Span::styled(
+            " Cancel ",
+            button_style(app.input_focus == InputFocus::Cancel),
+        ),
+    ])
+    .alignment(Alignment::Center)
+}
+
+fn input_help_text(app: &ConfigApp) -> &'static str {
+    if app.input_focus != InputFocus::Editor {
+        return "Enter/Space activate | Tab switch | Esc cancel";
+    }
+    if is_number_input(app.input_mode) {
+        "Edit value | Up/Down change | Tab buttons | Ctrl+S save | Esc cancel"
+    } else if is_multiline_input(app.input_mode) {
+        "Enter newline | Tab buttons | Ctrl+S save | Esc cancel"
+    } else {
+        "Edit value | Tab buttons | Ctrl+S save | Esc cancel"
+    }
+}
+
 const fn input_dialog_spec(input_mode: InputMode) -> (u16, usize) {
     match input_mode {
         InputMode::SubscriptionUrl => (URL_INPUT_WIDTH, URL_INPUT_ROWS),
+        InputMode::DnsLanDomains
+        | InputMode::DnsLanNameserver
+        | InputMode::DnsNameserverPolicy
+        | InputMode::DnsDirectNameserver
+        | InputMode::DnsNameserver
+        | InputMode::DnsFallback
+        | InputMode::DnsFakeIpFilter => (DNS_TEXT_INPUT_WIDTH, DNS_TEXT_INPUT_ROWS),
         _ => (DEFAULT_INPUT_WIDTH, DEFAULT_INPUT_ROWS),
     }
 }
 
 fn input_dialog_height(rows: usize) -> u16 {
-    rows.saturating_add(8).try_into().unwrap_or(12)
+    rows.saturating_add(9).try_into().unwrap_or(13)
 }
 
 fn draw_subscription_form(frame: &mut Frame, app: &ConfigApp) {
@@ -6417,16 +6616,203 @@ fn popup_title_line(title: &str, width: u16) -> Line<'static> {
     ))
 }
 
-fn input_box_lines(value: &str, width: usize, rows: usize) -> Vec<Line<'_>> {
+fn input_box_lines(value: &str, cursor: usize, width: usize, rows: usize) -> Vec<Line<'static>> {
     let rows = rows.max(1);
     let inner_width = width.saturating_sub(4).max(8);
-    let wrapped = wrapped_input_lines(value, inner_width, rows);
+    let wrapped = input_editor_lines(value, cursor, inner_width, rows);
     let mut lines = vec![Line::from(format!("  ┌{}┐", "─".repeat(inner_width)))];
     for line in wrapped {
-        lines.push(Line::from(format!("  │{line:<inner_width$}│")));
+        let line_width = line_width(&line);
+        let padding = inner_width.saturating_sub(line_width);
+        let mut spans = vec![Span::raw("  │")];
+        spans.extend(line.spans);
+        spans.push(Span::raw(" ".repeat(padding)));
+        spans.push(Span::raw("│"));
+        lines.push(Line::from(spans));
     }
     lines.push(Line::from(format!("  └{}┘", "─".repeat(inner_width))));
     lines
+}
+
+fn input_editor_lines(value: &str, cursor: usize, width: usize, rows: usize) -> Vec<Line<'static>> {
+    let rows = rows.max(1);
+    let width = width.max(1);
+    let cursor = normalize_cursor(value, cursor);
+    let segments = wrapped_input_segments(value, width);
+    let cursor_line_index = segments
+        .iter()
+        .position(|segment| segment.contains_cursor(cursor))
+        .unwrap_or_else(|| segments.len().saturating_sub(1));
+    let start = if cursor_line_index >= rows {
+        cursor_line_index + 1 - rows
+    } else {
+        0
+    };
+    let mut visible = segments
+        .iter()
+        .skip(start)
+        .take(rows)
+        .enumerate()
+        .map(|(visible_index, segment)| {
+            segment.to_line(
+                value,
+                cursor,
+                width,
+                start > 0 && visible_index == 0,
+                segment.contains_cursor(cursor),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    while visible.len() < rows {
+        let show_cursor = value.is_empty() && cursor == 0 && visible.is_empty();
+        visible.push(empty_input_line(show_cursor));
+    }
+    visible
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InputSegment {
+    start: usize,
+    end: usize,
+    line_end: usize,
+}
+
+impl InputSegment {
+    const fn contains_cursor(self, cursor: usize) -> bool {
+        if self.start == self.end {
+            return cursor == self.start;
+        }
+        if cursor < self.start || cursor > self.end {
+            return false;
+        }
+        cursor < self.end || self.end == self.line_end
+    }
+
+    fn to_line(
+        self,
+        value: &str,
+        cursor: usize,
+        width: usize,
+        truncated: bool,
+        selected: bool,
+    ) -> Line<'static> {
+        let mut spans = Vec::new();
+        let mut remaining_width = width;
+        if truncated {
+            spans.push(Span::styled("…", Style::default().fg(Color::DarkGray)));
+            remaining_width = remaining_width.saturating_sub(1);
+        }
+
+        let mut rendered_cursor = false;
+        for (offset, ch) in value[self.start..self.end].char_indices() {
+            if remaining_width == 0 {
+                break;
+            }
+            let index = self.start + offset;
+            if selected && index == cursor {
+                spans.push(Span::styled(ch.to_string(), selected_style()));
+                rendered_cursor = true;
+            } else {
+                spans.push(Span::raw(ch.to_string()));
+            }
+            remaining_width = remaining_width.saturating_sub(1);
+        }
+
+        if selected && !rendered_cursor && cursor == self.end {
+            if remaining_width > 0 {
+                spans.push(cursor_span());
+            } else if let Some(last) = spans.last_mut() {
+                last.style = selected_style();
+            }
+        }
+
+        Line::from(spans)
+    }
+}
+
+fn empty_input_line(show_cursor: bool) -> Line<'static> {
+    if show_cursor {
+        Line::from(cursor_span())
+    } else {
+        Line::from("")
+    }
+}
+
+fn cursor_span() -> Span<'static> {
+    Span::styled(" ", selected_style())
+}
+
+fn line_width(line: &Line<'_>) -> usize {
+    line.spans
+        .iter()
+        .map(|span| span.content.chars().count())
+        .sum()
+}
+
+fn wrapped_input_segments(value: &str, width: usize) -> Vec<InputSegment> {
+    let width = width.max(1);
+    if value.is_empty() {
+        return vec![InputSegment {
+            start: 0,
+            end: 0,
+            line_end: 0,
+        }];
+    }
+
+    let mut segments = Vec::new();
+    let mut line_start = 0;
+    for line in value.split('\n') {
+        let line_end = line_start + line.len();
+        push_wrapped_line_segments(&mut segments, line, line_start, line_end, width);
+        line_start = line_end.saturating_add(1);
+    }
+
+    if segments.is_empty() {
+        segments.push(InputSegment {
+            start: value.len(),
+            end: value.len(),
+            line_end: value.len(),
+        });
+    }
+    segments
+}
+
+fn push_wrapped_line_segments(
+    segments: &mut Vec<InputSegment>,
+    content: &str,
+    line_start: usize,
+    line_end: usize,
+    width: usize,
+) {
+    if content.is_empty() {
+        segments.push(InputSegment {
+            start: line_start,
+            end: line_start,
+            line_end,
+        });
+        return;
+    }
+
+    let mut start = line_start;
+    let mut count = 0;
+    for (offset, _) in content.char_indices() {
+        if count == width {
+            segments.push(InputSegment {
+                start,
+                end: line_start + offset,
+                line_end,
+            });
+            start = line_start + offset;
+            count = 0;
+        }
+        count += 1;
+    }
+    segments.push(InputSegment {
+        start,
+        end: line_end,
+        line_end,
+    });
 }
 
 fn wrapped_input_lines(value: &str, width: usize, rows: usize) -> Vec<String> {
@@ -6436,15 +6822,17 @@ fn wrapped_input_lines(value: &str, width: usize, rows: usize) -> Vec<String> {
     }
 
     let mut lines = Vec::new();
-    let mut current = String::new();
-    for ch in value.chars() {
-        if current.chars().count() >= width {
-            lines.push(current);
-            current = String::new();
+    for segment in value.split('\n') {
+        let mut current = String::new();
+        for ch in segment.chars() {
+            if current.chars().count() >= width {
+                lines.push(current);
+                current = String::new();
+            }
+            current.push(ch);
         }
-        current.push(ch);
+        lines.push(current);
     }
-    lines.push(current);
 
     if lines.len() > rows {
         lines = lines[lines.len() - rows..].to_vec();
@@ -7235,7 +7623,6 @@ fn proxy_config_field_value(
         ProxyConfigField::OsProxy => on_off(config.system_proxy.enabled).into(),
         ProxyConfigField::Pac => "off".into(),
         ProxyConfigField::Tun => on_off(config.tun.enable).into(),
-        ProxyConfigField::Dns => on_off(config.dns.enable).into(),
         ProxyConfigField::Logs => "open".into(),
     }
 }
@@ -7262,7 +7649,6 @@ const fn proxy_config_field_help(field: ProxyConfigField) -> &'static str {
         ProxyConfigField::Tun => {
             "TUN is transparent system traffic and belongs only to Global Proxy."
         }
-        ProxyConfigField::Dns => "Open DNS settings used by mihomo runtime.",
         ProxyConfigField::Logs => "Open the selected Mihomo runtime log tail.",
     }
 }
@@ -7291,7 +7677,6 @@ fn runtime_item_value(config: &AppConfig, app: &ConfigApp, item: RuntimeItem) ->
         RuntimeItem::CorePath => core_source_value(config),
         RuntimeItem::CoreUpdate => config.mihomo.update.clone(),
         RuntimeItem::Controller => config.controller.url.clone(),
-        RuntimeItem::Dns => on_off(config.dns.enable).into(),
         RuntimeItem::Refresh => app.runtime.error.as_deref().unwrap_or("online").to_string(),
     }
 }
@@ -7318,6 +7703,7 @@ fn dns_item_value(config: &AppConfig, item: DnsItem) -> String {
         DnsItem::Listen => config.dns.listen.clone(),
         DnsItem::LanDomains => compact_list(&config.dns.lan_domains),
         DnsItem::LanNameserver => compact_list(&config.dns.lan_nameserver),
+        DnsItem::NameserverPolicy => compact_nameserver_policy(&config.dns.nameserver_policy),
         DnsItem::DirectNameserver => compact_list(&config.dns.direct_nameserver),
         DnsItem::DirectFollowPolicy => on_off(config.dns.direct_nameserver_follow_policy).into(),
         DnsItem::Nameserver => compact_list(&config.dns.nameserver),
@@ -7333,6 +7719,9 @@ const fn dns_item_help(item: DnsItem) -> &'static str {
         DnsItem::LanDomains => "Domain patterns that should resolve with LAN DNS and skip fake IP.",
         DnsItem::LanNameserver => {
             "DNS servers for LAN domains. Use system or router DNS addresses."
+        }
+        DnsItem::NameserverPolicy => {
+            "Domain-specific DNS policy entries, for example +.taobao.net=30.30.30.30."
         }
         DnsItem::DirectNameserver => "DNS servers used when traffic exits through DIRECT.",
         DnsItem::DirectFollowPolicy => "When on, DIRECT DNS also follows nameserver-policy.",
@@ -9099,6 +9488,50 @@ fn split_list(value: &str) -> Vec<String> {
         .collect()
 }
 
+fn parse_nameserver_policy(value: &str) -> Result<BTreeMap<String, Vec<String>>> {
+    let mut policy = BTreeMap::new();
+    for entry in value.split([';', '\n']).map(str::trim) {
+        if entry.is_empty() {
+            continue;
+        }
+        let (domain, servers) = split_nameserver_policy_entry(entry)
+            .with_context(|| format!("invalid DNS policy entry: {entry}"))?;
+        let domain = domain.trim();
+        if domain.is_empty() {
+            anyhow::bail!("DNS policy domain is empty");
+        }
+        let servers = split_list(servers);
+        if servers.is_empty() {
+            anyhow::bail!("DNS policy nameserver list is empty for {domain}");
+        }
+        policy.insert(domain.to_string(), servers);
+    }
+    Ok(policy)
+}
+
+fn split_nameserver_policy_entry(entry: &str) -> Option<(&str, &str)> {
+    entry
+        .split_once('=')
+        .or_else(|| entry.split_once(": "))
+        .or_else(|| entry.split_once(":\t"))
+}
+
+fn parse_nameserver_policy_or_alert(
+    app: &mut ConfigApp,
+    value: &str,
+) -> Option<BTreeMap<String, Vec<String>>> {
+    match parse_nameserver_policy(value) {
+        Ok(policy) => Some(policy),
+        Err(_) => {
+            app.alert(
+                "Invalid DNS Policy",
+                "Use entries like +.taobao.net=30.30.30.30; +.example.com=1.1.1.1, 8.8.8.8.",
+            );
+            None
+        }
+    }
+}
+
 fn parse_port(value: &str, label: &str) -> Result<u16> {
     let port = value
         .parse::<u16>()
@@ -9190,25 +9623,238 @@ fn is_number_input(input_mode: InputMode) -> bool {
     matches!(input_mode, InputMode::HttpPort | InputMode::SocksPort)
 }
 
-fn adjust_number_input(value: &mut String, delta: i32) {
+fn is_multiline_input(input_mode: InputMode) -> bool {
+    matches!(
+        input_mode,
+        InputMode::DnsLanDomains
+            | InputMode::DnsLanNameserver
+            | InputMode::DnsNameserverPolicy
+            | InputMode::DnsDirectNameserver
+            | InputMode::DnsNameserver
+            | InputMode::DnsFallback
+            | InputMode::DnsFakeIpFilter
+    )
+}
+
+fn should_insert_input_newline(input_mode: InputMode, modifiers: KeyModifiers) -> bool {
+    is_multiline_input(input_mode)
+        && modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL)
+}
+
+fn adjust_number_input(value: &mut String, cursor: &mut usize, delta: i32) {
     let current = value.parse::<i32>().unwrap_or_default();
     let next = (current + delta).clamp(1, u16::MAX as i32);
     *value = next.to_string();
+    *cursor = value.len();
 }
 
-fn push_number_digit(value: &mut String, digit: char) {
-    if value == "0" {
-        value.clear();
-    }
+fn push_number_digit(value: &mut String, cursor: &mut usize, digit: char) {
+    let cursor_index = normalize_cursor(value, *cursor);
     let mut next = value.clone();
-    next.push(digit);
+    if next == "0" && cursor_index == next.len() {
+        next.clear();
+    } else {
+        next.insert(cursor_index, digit);
+    }
     if matches!(next.parse::<u32>(), Ok(number) if number <= u16::MAX as u32) {
         *value = next;
+        *cursor = if value == "0" {
+            value.len()
+        } else {
+            next_char_boundary(value, cursor_index)
+        };
     }
+}
+
+fn clamp_input_cursor(app: &mut ConfigApp) {
+    app.input_cursor = normalize_cursor(&app.input, app.input_cursor);
+}
+
+fn normalize_cursor(value: &str, index: usize) -> usize {
+    prev_char_boundary(value, index.min(value.len()))
+}
+
+fn prev_char_boundary(value: &str, index: usize) -> usize {
+    let mut index = index.min(value.len());
+    while index > 0 && !value.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn next_char_boundary(value: &str, index: usize) -> usize {
+    let mut index = index.min(value.len());
+    if index >= value.len() {
+        return value.len();
+    }
+    index += 1;
+    while index < value.len() && !value.is_char_boundary(index) {
+        index += 1;
+    }
+    index
+}
+
+fn insert_input_text(app: &mut ConfigApp, text: &str) {
+    clamp_input_cursor(app);
+    app.input.insert_str(app.input_cursor, text);
+    app.input_cursor += text.len();
+    app.input_desired_column = None;
+}
+
+fn insert_input_char(app: &mut ConfigApp, ch: char) {
+    clamp_input_cursor(app);
+    app.input.insert(app.input_cursor, ch);
+    app.input_cursor += ch.len_utf8();
+    app.input_desired_column = None;
+}
+
+fn delete_input_char_before_cursor(app: &mut ConfigApp) {
+    clamp_input_cursor(app);
+    if app.input_cursor == 0 {
+        return;
+    }
+    let previous = prev_char_boundary(&app.input, app.input_cursor.saturating_sub(1));
+    app.input.drain(previous..app.input_cursor);
+    app.input_cursor = previous;
+    app.input_desired_column = None;
+}
+
+fn delete_input_char_at_cursor(app: &mut ConfigApp) {
+    clamp_input_cursor(app);
+    if app.input_cursor >= app.input.len() {
+        return;
+    }
+    let next = next_char_boundary(&app.input, app.input_cursor);
+    app.input.drain(app.input_cursor..next);
+    app.input_desired_column = None;
+}
+
+fn move_input_cursor_left(app: &mut ConfigApp) {
+    clamp_input_cursor(app);
+    if app.input_cursor == 0 {
+        return;
+    }
+    app.input_cursor = prev_char_boundary(&app.input, app.input_cursor.saturating_sub(1));
+    app.input_desired_column = None;
+}
+
+fn move_input_cursor_right(app: &mut ConfigApp) {
+    clamp_input_cursor(app);
+    app.input_cursor = next_char_boundary(&app.input, app.input_cursor);
+    app.input_desired_column = None;
+}
+
+fn move_input_cursor_line_start(app: &mut ConfigApp) {
+    clamp_input_cursor(app);
+    app.input_cursor = line_start(&app.input, app.input_cursor);
+    app.input_desired_column = None;
+}
+
+fn move_input_cursor_line_end(app: &mut ConfigApp) {
+    clamp_input_cursor(app);
+    app.input_cursor = line_end(&app.input, app.input_cursor);
+    app.input_desired_column = None;
+}
+
+fn move_input_cursor_line(app: &mut ConfigApp, delta: i32) {
+    clamp_input_cursor(app);
+    let current_column = app
+        .input_desired_column
+        .unwrap_or_else(|| cursor_column(&app.input, app.input_cursor));
+    let target = if delta < 0 {
+        previous_line_bounds(&app.input, app.input_cursor)
+    } else {
+        next_line_bounds(&app.input, app.input_cursor)
+    };
+    let Some((start, end)) = target else {
+        return;
+    };
+    app.input_cursor = cursor_at_column(&app.input, start, end, current_column);
+    app.input_desired_column = Some(current_column);
+}
+
+fn line_start(value: &str, index: usize) -> usize {
+    let index = normalize_cursor(value, index);
+    value[..index]
+        .rfind('\n')
+        .map_or(0, |position| position + 1)
+}
+
+fn line_end(value: &str, index: usize) -> usize {
+    let index = normalize_cursor(value, index);
+    value[index..]
+        .find('\n')
+        .map_or(value.len(), |position| index + position)
+}
+
+fn cursor_column(value: &str, index: usize) -> usize {
+    let index = normalize_cursor(value, index);
+    value[line_start(value, index)..index].chars().count()
+}
+
+fn cursor_at_column(value: &str, start: usize, end: usize, column: usize) -> usize {
+    value[start..end]
+        .char_indices()
+        .nth(column)
+        .map_or(end, |(offset, _)| start + offset)
+}
+
+fn previous_line_bounds(value: &str, index: usize) -> Option<(usize, usize)> {
+    let current_start = line_start(value, index);
+    if current_start == 0 {
+        return None;
+    }
+    let previous_end = current_start.saturating_sub(1);
+    let previous_start = line_start(value, previous_end);
+    Some((previous_start, previous_end))
+}
+
+fn next_line_bounds(value: &str, index: usize) -> Option<(usize, usize)> {
+    let current_end = line_end(value, index);
+    if current_end >= value.len() {
+        return None;
+    }
+    let next_start = current_end + 1;
+    Some((next_start, line_end(value, next_start)))
 }
 
 fn join_list(values: &[String]) -> String {
     values.join(", ")
+}
+
+fn join_multiline_list(values: &[String]) -> String {
+    values.join("\n")
+}
+
+fn format_nameserver_policy(policy: &BTreeMap<String, Vec<String>>) -> String {
+    policy
+        .iter()
+        .map(|(domain, servers)| format!("{domain}={}", join_list(servers)))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn format_multiline_nameserver_policy(policy: &BTreeMap<String, Vec<String>>) -> String {
+    policy
+        .iter()
+        .map(|(domain, servers)| format!("{domain}={}", join_list(servers)))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn compact_nameserver_policy(policy: &BTreeMap<String, Vec<String>>) -> String {
+    let formatted = format_nameserver_policy(policy);
+    if formatted.is_empty() {
+        return "-".into();
+    }
+    const MAX: usize = 44;
+    if formatted.chars().count() <= MAX {
+        formatted
+    } else {
+        let mut value = formatted.chars().take(MAX).collect::<String>();
+        value.push_str("...");
+        value
+    }
 }
 
 const fn on_off(value: bool) -> &'static str {
@@ -9273,7 +9919,7 @@ impl TerminalGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
+        execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend)?;
         Ok(Self { terminal })
@@ -9283,7 +9929,11 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        let _ = execute!(
+            self.terminal.backend_mut(),
+            DisableBracketedPaste,
+            LeaveAlternateScreen
+        );
         let _ = self.terminal.show_cursor();
     }
 }
@@ -9312,6 +9962,59 @@ mod tests {
                 "https://dns.alidns.com/dns-query".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn nameserver_policy_accepts_domain_server_mappings() -> Result<()> {
+        let policy = parse_nameserver_policy(
+            "+.taobao.net=30.30.30.30; +.example.com=1.1.1.1, https://dns.example/dns-query",
+        )?;
+
+        assert_eq!(
+            policy.get("+.taobao.net"),
+            Some(&vec!["30.30.30.30".to_string()])
+        );
+        assert_eq!(
+            policy.get("+.example.com"),
+            Some(&vec![
+                "1.1.1.1".to_string(),
+                "https://dns.example/dns-query".to_string()
+            ])
+        );
+        assert_eq!(
+            format_nameserver_policy(&policy),
+            "+.example.com=1.1.1.1, https://dns.example/dns-query; +.taobao.net=30.30.30.30"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dns_rows_show_nameserver_policy() {
+        let mut config = AppConfig::default();
+        config
+            .dns
+            .nameserver_policy
+            .insert("+.taobao.net".into(), vec!["30.30.30.30".into()]);
+
+        let rows = dns_rows(&config);
+        let policy_row = rows
+            .iter()
+            .find(|row| row.label == "DNS Policy")
+            .expect("DNS policy row");
+
+        assert_eq!(policy_row.value, "+.taobao.net=30.30.30.30");
+        assert!(matches!(
+            policy_row.kind,
+            RowKind::Input(InputMode::DnsNameserverPolicy)
+        ));
+    }
+
+    #[test]
+    fn dns_is_top_level_section() {
+        assert!(Page::Dns.is_section());
+        assert_eq!(Page::Runtime.next(), Page::Dns);
+        assert_eq!(Page::Chat.prev(), Page::Dns);
+        assert_eq!(Page::Dns.title(), "DNS");
     }
 
     #[test]
@@ -9476,6 +10179,187 @@ mod tests {
     }
 
     #[test]
+    fn dns_text_inputs_use_multiline_box() {
+        for mode in [
+            InputMode::DnsLanDomains,
+            InputMode::DnsLanNameserver,
+            InputMode::DnsNameserverPolicy,
+            InputMode::DnsDirectNameserver,
+            InputMode::DnsNameserver,
+            InputMode::DnsFallback,
+            InputMode::DnsFakeIpFilter,
+        ] {
+            assert_eq!(
+                input_dialog_spec(mode),
+                (DNS_TEXT_INPUT_WIDTH, DNS_TEXT_INPUT_ROWS)
+            );
+            assert!(is_multiline_input(mode));
+        }
+        assert_eq!(
+            input_dialog_spec(InputMode::DnsListen),
+            (DEFAULT_INPUT_WIDTH, DEFAULT_INPUT_ROWS)
+        );
+        assert!(!is_multiline_input(InputMode::DnsListen));
+    }
+
+    #[test]
+    fn wrapped_input_lines_preserve_explicit_newlines() {
+        let lines = wrapped_input_lines("one\ntwo\n\nthree", 8, 5);
+        assert_eq!(
+            lines,
+            vec![
+                "one".to_string(),
+                "two".to_string(),
+                String::new(),
+                "three".to_string(),
+                String::new()
+            ]
+        );
+    }
+
+    #[test]
+    fn input_editor_inserts_and_deletes_at_cursor() {
+        let config = AppConfig::default();
+        let mut app = ConfigApp::new(&config);
+        app.begin_input(InputMode::DnsNameserver, "one\nthree", "edit");
+        app.input_cursor = 4;
+
+        insert_input_text(&mut app, "two\n");
+        assert_eq!(app.input, "one\ntwo\nthree");
+        assert_eq!(app.input_cursor, "one\ntwo\n".len());
+
+        move_input_cursor_left(&mut app);
+        assert_eq!(app.input_cursor, "one\ntwo".len());
+        delete_input_char_before_cursor(&mut app);
+        assert_eq!(app.input, "one\ntw\nthree");
+
+        delete_input_char_at_cursor(&mut app);
+        assert_eq!(app.input, "one\ntwthree");
+    }
+
+    #[test]
+    fn input_editor_moves_between_lines_by_column() {
+        let config = AppConfig::default();
+        let mut app = ConfigApp::new(&config);
+        app.begin_input(InputMode::DnsNameserver, "abcd\nef\nxyz", "edit");
+        app.input_cursor = 3;
+
+        move_input_cursor_line(&mut app, 1);
+        assert_eq!(app.input_cursor, "abcd\nef".len());
+
+        move_input_cursor_line(&mut app, 1);
+        assert_eq!(app.input_cursor, "abcd\nef\nxyz".len());
+
+        move_input_cursor_line(&mut app, -1);
+        assert_eq!(app.input_cursor, "abcd\nef".len());
+    }
+
+    #[test]
+    fn number_input_inserts_digits_at_cursor() {
+        let mut value = "80".to_string();
+        let mut cursor = 1;
+
+        push_number_digit(&mut value, &mut cursor, '8');
+        assert_eq!(value, "880");
+        assert_eq!(cursor, 2);
+
+        push_number_digit(&mut value, &mut cursor, '8');
+        assert_eq!(value, "8880");
+        assert_eq!(cursor, 3);
+
+        push_number_digit(&mut value, &mut cursor, '8');
+        assert_eq!(value, "8880");
+        assert_eq!(cursor, 3);
+
+        adjust_number_input(&mut value, &mut cursor, 1);
+        assert_eq!(value, "8881");
+        assert_eq!(cursor, 4);
+    }
+
+    #[tokio::test]
+    async fn input_enter_edits_multiline_and_save_button_submits() -> Result<()> {
+        let paths = test_paths("input-editor-save-button")?;
+        let mut config = AppConfig::default();
+        let mut app = ConfigApp::new(&config);
+        app.begin_input(InputMode::DnsLanDomains, "one", "edit");
+
+        handle_input_key(
+            &paths,
+            &mut config,
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        )
+        .await?;
+        assert_eq!(app.input, "one\n");
+        assert_eq!(app.input_mode, InputMode::DnsLanDomains);
+
+        handle_input_key(
+            &paths,
+            &mut config,
+            &mut app,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::empty()),
+        )
+        .await?;
+        handle_input_key(
+            &paths,
+            &mut config,
+            &mut app,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
+        )
+        .await?;
+        assert_eq!(app.input_focus, InputFocus::Save);
+
+        handle_input_key(
+            &paths,
+            &mut config,
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        )
+        .await?;
+
+        assert_eq!(
+            config.dns.lan_domains,
+            vec!["one".to_string(), "t".to_string()]
+        );
+        assert_eq!(app.input_mode, InputMode::Normal);
+        Ok(())
+    }
+
+    #[test]
+    fn input_editor_lines_keep_cursor_visible() {
+        let lines = input_editor_lines("one\ntwo\nthree", "one\ntwo\nthr".len(), 8, 2);
+        let rendered = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(rendered, vec!["…two".to_string(), "three".to_string()]);
+        assert!(
+            lines[1]
+                .spans
+                .iter()
+                .any(|span| span.style.bg == Some(Color::White))
+        );
+    }
+
+    #[test]
+    fn dns_policy_formats_for_multiline_editing() {
+        let mut policy = BTreeMap::new();
+        policy.insert("+.example.com".into(), vec!["1.1.1.1".into()]);
+        policy.insert("+.taobao.net".into(), vec!["30.30.30.30".into()]);
+
+        assert_eq!(
+            format_multiline_nameserver_policy(&policy),
+            "+.example.com=1.1.1.1\n+.taobao.net=30.30.30.30"
+        );
+    }
+
+    #[test]
     fn traffic_speed_uses_traffic_endpoint_not_connection_totals() -> Result<()> {
         let connections = serde_json::json!({
             "uploadTotal": 1024,
@@ -9602,9 +10486,11 @@ mod tests {
 
         let system_rows = proxy_config_rows(&config, &app);
         assert!(!system_rows.iter().any(|row| row.label == "Delete"));
+        assert!(!system_rows.iter().any(|row| row.label == "DNS"));
 
         app.selected_main = 1;
         let rows = proxy_config_rows(&config, &app);
+        assert!(!rows.iter().any(|row| row.label == "DNS"));
         let delete = rows
             .iter()
             .find(|row| row.label == "Delete")
@@ -9615,6 +10501,15 @@ mod tests {
             RowKind::Action(ActionKind::DeletePortProxy)
         ));
         Ok(())
+    }
+
+    #[test]
+    fn runtime_rows_do_not_include_dns_shortcut() {
+        let config = AppConfig::default();
+        let app = ConfigApp::new(&config);
+        let rows = runtime_rows(&config, &app);
+
+        assert!(!rows.iter().any(|row| row.label == "DNS"));
     }
 
     #[tokio::test]

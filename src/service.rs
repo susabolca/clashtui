@@ -250,6 +250,7 @@ mod imp {
         Ok(())
     }
 
+    #[allow(clippy::unnecessary_wraps)]
     pub fn status() -> Result<ServiceStatus> {
         let installed =
             Path::new(SERVICE_BINARY_PATH).exists() && Path::new(SERVICE_PLIST_PATH).exists();
@@ -861,7 +862,7 @@ mod imp {
     #[cfg(target_os = "linux")]
     fn service_definition(user: &str, uid: u32) -> String {
         format!(
-            r#"[Unit]
+            r"[Unit]
 Description=clashtui privileged service
 After=network-online.target
 Wants=network-online.target
@@ -878,7 +879,7 @@ StandardError=append:{log}
 
 [Install]
 WantedBy=multi-user.target
-"#,
+",
             binary = SERVICE_BINARY_PATH,
             user = systemd_escape_value(user),
             uid = uid,
@@ -1090,6 +1091,7 @@ WantedBy=multi-user.target
             .with_context(|| format!("path is not valid UTF-8: {}", path.display()))
     }
 
+    #[cfg(target_os = "macos")]
     fn xml_escape(value: &str) -> String {
         value
             .replace('&', "&amp;")
@@ -1106,6 +1108,8 @@ WantedBy=multi-user.target
 
     #[cfg(test)]
     mod tests {
+        use std::ffi::OsStr;
+
         use super::*;
 
         #[test]
@@ -1132,9 +1136,12 @@ WantedBy=multi-user.target
             let work_dir = paths.work_dir.to_string_lossy();
             assert!(work_dir.contains("501"));
             assert!(work_dir.starts_with(SERVICE_RUNTIME_BASE_PATH));
-            assert_eq!(paths.config_file.file_name().unwrap(), "mihomo-run.yaml");
-            assert_eq!(paths.log_file.file_name().unwrap(), "mihomo.log");
-            assert_eq!(paths.pid_file.file_name().unwrap(), "mihomo.pid");
+            assert_eq!(
+                paths.config_file.file_name(),
+                Some(OsStr::new("mihomo-run.yaml"))
+            );
+            assert_eq!(paths.log_file.file_name(), Some(OsStr::new("mihomo.log")));
+            assert_eq!(paths.pid_file.file_name(), Some(OsStr::new("mihomo.pid")));
         }
     }
 }

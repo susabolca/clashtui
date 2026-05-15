@@ -377,8 +377,7 @@ async fn cleanup_owned_runtimes(
     if verbose {
         println!("mihomo core: stopping all instances owned by clashtui");
     }
-    let stop_result = core::stop_all(paths, config).await;
-    stop_result
+    core::stop_all(paths, config).await
 }
 
 pub async fn status(

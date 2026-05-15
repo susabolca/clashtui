@@ -436,7 +436,7 @@ async fn ensure_auto_core_path(paths: &Paths, config: &AppConfig) -> Result<Path
     }
 
     match ensure_managed_core(paths, ManagedCore::Release, false).await {
-        Ok(install) => return Ok(install.path),
+        Ok(install) => Ok(install.path),
         Err(err) => {
             if let Some(path) = resolve_unmanaged_core_path() {
                 eprintln!("mihomo core: managed download failed, using discovered core: {err:#}");

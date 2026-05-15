@@ -181,6 +181,7 @@ mod imp {
     use crate::config::{AppConfig, Paths};
     use anyhow::Result;
 
+    #[allow(clippy::unnecessary_wraps)]
     pub fn sync(_paths: &Paths, config: &AppConfig) -> Result<AutostartStatus> {
         Ok(status(config))
     }
