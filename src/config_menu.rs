@@ -150,8 +150,8 @@ impl Page {
     const SECTION_ROOTS: [Self; 6] = [
         Self::Main,
         Self::Subscription,
-        Self::Runtime,
         Self::Dns,
+        Self::Runtime,
         Self::Chat,
         Self::Exit,
     ];
@@ -209,8 +209,8 @@ impl Page {
             | Self::SubscriptionProxies
             | Self::SubscriptionRules
             | Self::AddSubscription => 1,
-            Self::Runtime => 2,
-            Self::Dns => 3,
+            Self::Dns => 2,
+            Self::Runtime => 3,
             Self::Chat => 4,
             Self::Exit => 5,
         }
@@ -225,30 +225,32 @@ enum RuntimeItem {
     CorePath,
     CoreUpdate,
     Controller,
+    Refresh,
+    LlmSection,
     LlmProvider,
     LlmBaseUrl,
     LlmModel,
     LlmApiKey,
     LlmProvidersUpdate,
     TestAssistant,
-    Refresh,
 }
 
 impl RuntimeItem {
-    const ALL: [Self; 13] = [
+    const ALL: [Self; 14] = [
         Self::Service,
         Self::Autostart,
         Self::Logs,
         Self::CorePath,
         Self::CoreUpdate,
         Self::Controller,
+        Self::Refresh,
+        Self::LlmSection,
         Self::LlmProvider,
         Self::LlmBaseUrl,
         Self::LlmModel,
         Self::LlmApiKey,
         Self::LlmProvidersUpdate,
         Self::TestAssistant,
-        Self::Refresh,
     ];
 
     const fn label(self) -> &'static str {
@@ -259,14 +261,19 @@ impl RuntimeItem {
             Self::CorePath => "Mihomo Core",
             Self::CoreUpdate => "Update Core",
             Self::Controller => "Controller",
+            Self::Refresh => "Refresh Runtime",
+            Self::LlmSection => "LLM",
             Self::LlmProvider => "LLM Provider",
             Self::LlmBaseUrl => "LLM Base URL",
             Self::LlmModel => "LLM Model",
             Self::LlmApiKey => "LLM API Key",
             Self::LlmProvidersUpdate => "Update LLM Providers",
             Self::TestAssistant => "Test Assistant",
-            Self::Refresh => "Refresh Runtime",
         }
+    }
+
+    const fn is_section(self) -> bool {
+        matches!(self, Self::LlmSection)
     }
 }
 
@@ -779,6 +786,7 @@ struct SettingRow {
 #[derive(Debug, Clone, Copy)]
 enum RowKind {
     Section,
+    SoftSection,
     Submenu(Page),
     StatusSubmenu(Page),
     Toggle(ToggleAction),
@@ -1656,8 +1664,9 @@ impl ConfigApp {
     }
 
     fn selected_runtime_item(&self) -> RuntimeItem {
+        let index = nearest_selectable_runtime_index(self.selected_runtime);
         RuntimeItem::ALL
-            .get(self.selected_runtime)
+            .get(index)
             .copied()
             .unwrap_or(RuntimeItem::Service)
     }
@@ -1720,7 +1729,9 @@ impl ConfigApp {
                 &mut self.subscription_form.selected,
                 SubscriptionFormField::ALL.len(),
             ),
-            Page::Runtime => clamp_index(&mut self.selected_runtime, RuntimeItem::ALL.len()),
+            Page::Runtime => {
+                self.selected_runtime = nearest_selectable_runtime_index(self.selected_runtime);
+            }
             Page::Exit => {
                 self.selected_exit = nearest_selectable_exit_index(self.selected_exit);
             }
@@ -1922,7 +1933,7 @@ impl ConfigApp {
             Page::SubscriptionProxies => self.selected_subscription_proxy = selected,
             Page::SubscriptionRules => self.selected_subscription_rule = selected,
             Page::AddSubscription => self.subscription_form.selected = selected,
-            Page::Runtime => self.selected_runtime = selected,
+            Page::Runtime => self.selected_runtime = nearest_selectable_runtime_index(selected),
             Page::Exit => self.selected_exit = nearest_selectable_exit_index(selected),
             Page::ProxyConfig => self.selected_proxy_field = selected,
             Page::ProxyConnections => self.selected_proxy_connection = selected,
@@ -2174,7 +2185,7 @@ impl ConfigApp {
             Page::Mode => self.selected_mode = next_index(self.selected_mode, ModeItem::ALL.len()),
             Page::Dns => self.selected_dns = next_index(self.selected_dns, DnsItem::ALL.len()),
             Page::Runtime => {
-                self.selected_runtime = next_index(self.selected_runtime, RuntimeItem::ALL.len())
+                self.selected_runtime = next_selectable_runtime_index(self.selected_runtime)
             }
             Page::Exit => {
                 self.selected_exit = next_selectable_exit_index(self.selected_exit);
@@ -2249,7 +2260,7 @@ impl ConfigApp {
             Page::Mode => self.selected_mode = prev_index(self.selected_mode, ModeItem::ALL.len()),
             Page::Dns => self.selected_dns = prev_index(self.selected_dns, DnsItem::ALL.len()),
             Page::Runtime => {
-                self.selected_runtime = prev_index(self.selected_runtime, RuntimeItem::ALL.len())
+                self.selected_runtime = prev_selectable_runtime_index(self.selected_runtime)
             }
             Page::Exit => {
                 self.selected_exit = prev_selectable_exit_index(self.selected_exit);
@@ -3289,6 +3300,8 @@ async fn submit_runtime_item(
             false,
         ),
         RuntimeItem::Controller => begin_controller_input(config, app),
+        RuntimeItem::Refresh => refresh_runtime(paths, config, app),
+        RuntimeItem::LlmSection => app.status = "LLM assistant settings".into(),
         RuntimeItem::LlmProvider => app.open_llm_provider_dropdown(config),
         RuntimeItem::LlmBaseUrl => begin_llm_base_url_input(config, app),
         RuntimeItem::LlmModel => app.open_llm_model_dropdown(config),
@@ -3303,7 +3316,6 @@ async fn submit_runtime_item(
             });
             app.start_chat_agent(paths, config, message);
         }
-        RuntimeItem::Refresh => refresh_runtime(paths, config, app),
     }
     Ok(())
 }
@@ -5652,13 +5664,14 @@ fn runtime_rows(paths: &Paths, config: &AppConfig, app: &ConfigApp) -> Vec<Setti
                 RuntimeItem::CorePath => RowKind::Choice(ChoiceAction::CoreSource),
                 RuntimeItem::CoreUpdate => RowKind::Action(ActionKind::UpdateCore),
                 RuntimeItem::Controller => RowKind::Input(InputMode::Controller),
+                RuntimeItem::Refresh => RowKind::Action(ActionKind::RefreshRuntime),
+                RuntimeItem::LlmSection => RowKind::SoftSection,
                 RuntimeItem::LlmProvider => RowKind::Choice(ChoiceAction::LlmProvider),
                 RuntimeItem::LlmBaseUrl => RowKind::Input(InputMode::LlmBaseUrl),
                 RuntimeItem::LlmModel => RowKind::Choice(ChoiceAction::LlmModel),
                 RuntimeItem::LlmApiKey => RowKind::Input(InputMode::LlmApiKey),
                 RuntimeItem::LlmProvidersUpdate => RowKind::Action(ActionKind::UpdateLlmProviders),
                 RuntimeItem::TestAssistant => RowKind::Action(ActionKind::RefreshRuntime),
-                RuntimeItem::Refresh => RowKind::Action(ActionKind::RefreshRuntime),
             };
             SettingRow {
                 label: item.label().into(),
@@ -5832,6 +5845,9 @@ fn row_style(row: &SettingRow, selected: bool) -> Style {
     if matches!(row.kind, RowKind::Section) {
         return Style::default().fg(Color::DarkGray);
     }
+    if matches!(row.kind, RowKind::SoftSection) {
+        return Style::default().fg(Color::Gray).add_modifier(Modifier::DIM);
+    }
     if selected {
         return selected_style();
     }
@@ -5961,6 +5977,8 @@ const fn runtime_item_help(item: RuntimeItem) -> &'static str {
             "Download the latest selected managed Mihomo core; restart to use it."
         }
         RuntimeItem::Controller => "Mihomo external controller URL used by clashtui.",
+        RuntimeItem::Refresh => "Refresh runtime information from mihomo.",
+        RuntimeItem::LlmSection => "LLM assistant endpoint, model, key, and provider catalog.",
         RuntimeItem::LlmProvider => "Choose the OpenAI-compatible assistant endpoint preset.",
         RuntimeItem::LlmBaseUrl => "Base URL for the assistant chat/completions endpoint.",
         RuntimeItem::LlmModel => "Model name sent to the configured OpenAI-compatible endpoint.",
@@ -5969,7 +5987,6 @@ const fn runtime_item_help(item: RuntimeItem) -> &'static str {
             "Manually merge bundled provider updates while preserving local API keys and models."
         }
         RuntimeItem::TestAssistant => "Open Chat and run a short assistant connection test.",
-        RuntimeItem::Refresh => "Refresh runtime information from mihomo.",
     }
 }
 
@@ -6495,22 +6512,15 @@ fn draw_chat_page(
     }
     frame.render_widget(bios_panel("Assistant", transcript), left[0]);
 
-    let input_lines = vec![
-        Line::from(Span::styled(
-            ">",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(fit_width(
-            app.chat.input.as_str(),
-            left[1].width.saturating_sub(4) as usize,
-        )),
-        Line::from(Span::styled(
-            "Enter send | Ctrl+J newline | Esc cancel/back | Ctrl+S apply patch",
-            Style::default().fg(Color::Gray),
-        )),
-    ];
+    let mut input_lines = chat_input_lines(
+        app.chat.input.as_str(),
+        left[1].width.saturating_sub(4) as usize,
+        2,
+    );
+    input_lines.push(Line::from(Span::styled(
+        "Enter send | Ctrl+J newline | Esc cancel/back | Ctrl+S apply patch",
+        Style::default().fg(Color::Gray),
+    )));
     frame.render_widget(panel("Input", input_lines), left[1]);
 
     let mut inspector = vec![
@@ -7297,6 +7307,39 @@ fn input_box_lines(value: &str, cursor: usize, width: usize, rows: usize) -> Vec
     }
     lines.push(Line::from(format!("  └{}┘", "─".repeat(inner_width))));
     lines
+}
+
+fn chat_input_lines(value: &str, width: usize, rows: usize) -> Vec<Line<'static>> {
+    let rows = rows.max(1);
+    let width = width.max(1);
+    let prompt = if width > 1 { "> " } else { ">" };
+    let body_width = width.saturating_sub(prompt.chars().count()).max(1);
+    let visible_rows = wrapped_input_segments(value, body_width)
+        .len()
+        .min(rows)
+        .max(1);
+    let wrapped = wrapped_input_lines(value, body_width, rows);
+
+    wrapped
+        .into_iter()
+        .take(visible_rows)
+        .enumerate()
+        .map(|(index, line)| {
+            if index == 0 {
+                Line::from(vec![
+                    Span::styled(
+                        prompt.to_string(),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(line),
+                ])
+            } else {
+                Line::from(vec![Span::raw("  "), Span::raw(line)])
+            }
+        })
+        .collect()
 }
 
 fn input_editor_lines(value: &str, cursor: usize, width: usize, rows: usize) -> Vec<Line<'static>> {
@@ -8347,6 +8390,8 @@ fn runtime_item_value(
         RuntimeItem::CorePath => core_source_value(config),
         RuntimeItem::CoreUpdate => config.mihomo.update.clone(),
         RuntimeItem::Controller => config.controller.url.clone(),
+        RuntimeItem::Refresh => app.runtime.error.as_deref().unwrap_or("online").to_string(),
+        RuntimeItem::LlmSection => String::new(),
         RuntimeItem::LlmProvider => llm_provider_label(&config.llm.provider),
         RuntimeItem::LlmBaseUrl => config.llm.base_url.clone(),
         RuntimeItem::LlmModel => {
@@ -8359,7 +8404,6 @@ fn runtime_item_value(
         RuntimeItem::LlmApiKey => agent::api_key_status(paths, config),
         RuntimeItem::LlmProvidersUpdate => "manual".into(),
         RuntimeItem::TestAssistant => "run".into(),
-        RuntimeItem::Refresh => app.runtime.error.as_deref().unwrap_or("online").to_string(),
     }
 }
 
@@ -10068,6 +10112,96 @@ const fn prev_index(current: usize, len: usize) -> usize {
     }
 }
 
+fn nearest_selectable_runtime_index(index: usize) -> usize {
+    let len = RuntimeItem::ALL.len();
+    if len == 0 {
+        return 0;
+    }
+    let index = index.min(len - 1);
+    if runtime_index_is_selectable(index) {
+        return index;
+    }
+    selectable_runtime_index_from(index, true)
+}
+
+fn next_selectable_runtime_index(current: usize) -> usize {
+    let len = RuntimeItem::ALL.len();
+    if len == 0 {
+        return 0;
+    }
+    let current = current.min(len - 1);
+    for offset in 1..=len {
+        let index = (current + offset) % len;
+        if runtime_index_is_selectable(index) {
+            return index;
+        }
+    }
+    current
+}
+
+fn prev_selectable_runtime_index(current: usize) -> usize {
+    let len = RuntimeItem::ALL.len();
+    if len == 0 {
+        return 0;
+    }
+    let current = current.min(len - 1);
+    for offset in 1..=len {
+        let index = (current + len - (offset % len)) % len;
+        if runtime_index_is_selectable(index) {
+            return index;
+        }
+    }
+    current
+}
+
+fn selectable_runtime_index_from(index: usize, forward: bool) -> usize {
+    let len = RuntimeItem::ALL.len();
+    if len == 0 {
+        return 0;
+    }
+    let index = index.min(len - 1);
+    if runtime_index_is_selectable(index) {
+        return index;
+    }
+    if forward {
+        for next in index + 1..len {
+            if runtime_index_is_selectable(next) {
+                return next;
+            }
+        }
+        for next in 0..index {
+            if runtime_index_is_selectable(next) {
+                return next;
+            }
+        }
+    } else {
+        if index == 0 {
+            for next in 1..len {
+                if runtime_index_is_selectable(next) {
+                    return next;
+                }
+            }
+        }
+        for prev in (0..index).rev() {
+            if runtime_index_is_selectable(prev) {
+                return prev;
+            }
+        }
+        for prev in (index + 1..len).rev() {
+            if runtime_index_is_selectable(prev) {
+                return prev;
+            }
+        }
+    }
+    index
+}
+
+fn runtime_index_is_selectable(index: usize) -> bool {
+    RuntimeItem::ALL
+        .get(index)
+        .is_some_and(|item| !item.is_section())
+}
+
 fn first_selectable_exit_index() -> usize {
     nearest_selectable_exit_index(0)
 }
@@ -10743,8 +10877,11 @@ mod tests {
     #[test]
     fn dns_is_top_level_section() {
         assert!(Page::Dns.is_section());
-        assert_eq!(Page::Runtime.next(), Page::Dns);
-        assert_eq!(Page::Chat.prev(), Page::Dns);
+        assert_eq!(Page::Subscription.next(), Page::Dns);
+        assert_eq!(Page::Dns.prev(), Page::Subscription);
+        assert_eq!(Page::Dns.next(), Page::Runtime);
+        assert_eq!(Page::Runtime.prev(), Page::Dns);
+        assert_eq!(Page::Chat.prev(), Page::Runtime);
         assert_eq!(Page::Dns.title(), "DNS");
     }
 
@@ -10762,7 +10899,7 @@ mod tests {
             KeyEvent::new(KeyCode::Left, KeyModifiers::empty()),
         )
         .await?;
-        assert_eq!(app.page, Page::Dns);
+        assert_eq!(app.page, Page::Runtime);
 
         app.switch_section(Page::Chat);
         handle_chat_key(
@@ -10785,6 +10922,22 @@ mod tests {
         assert_eq!(app.page, Page::Exit);
 
         Ok(())
+    }
+
+    #[test]
+    fn chat_input_renders_prompt_and_text_on_same_line() {
+        let lines = chat_input_lines("hello", 20, 2);
+        let rendered = lines.iter().map(line_text).collect::<Vec<_>>();
+
+        assert_eq!(rendered, vec!["> hello".to_string()]);
+    }
+
+    #[test]
+    fn chat_input_indents_continuation_lines() {
+        let lines = chat_input_lines("one\ntwo", 20, 2);
+        let rendered = lines.iter().map(line_text).collect::<Vec<_>>();
+
+        assert_eq!(rendered, vec!["> one".to_string(), "  two".to_string()]);
     }
 
     #[test]
@@ -11281,6 +11434,42 @@ mod tests {
         let rows = runtime_rows(&paths, &config, &app);
 
         assert!(!rows.iter().any(|row| row.label == "DNS"));
+        let llm_index = rows
+            .iter()
+            .position(|row| row.label == "LLM")
+            .context("LLM section row")?;
+        let refresh_index = rows
+            .iter()
+            .position(|row| row.label == "Refresh Runtime")
+            .context("Refresh Runtime row")?;
+        let provider_index = rows
+            .iter()
+            .position(|row| row.label == "LLM Provider")
+            .context("LLM Provider row")?;
+
+        assert!(refresh_index < llm_index);
+        assert!(llm_index < provider_index);
+        assert!(matches!(rows[llm_index].kind, RowKind::SoftSection));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_navigation_skips_llm_section_header() -> Result<()> {
+        let paths = test_paths("runtime-skip-llm-section")?;
+        let config = AppConfig::default();
+        let mut app = ConfigApp::new(&config);
+        app.page = Page::Runtime;
+        app.selected_runtime = RuntimeItem::ALL
+            .iter()
+            .position(|item| *item == RuntimeItem::Refresh)
+            .context("Refresh Runtime item")?;
+
+        app.move_next(&paths, &config);
+        assert_eq!(app.selected_runtime_item(), RuntimeItem::LlmProvider);
+        assert_ne!(app.selected_runtime_item(), RuntimeItem::LlmSection);
+
+        app.move_prev(&paths, &config);
+        assert_eq!(app.selected_runtime_item(), RuntimeItem::Refresh);
         Ok(())
     }
 
@@ -12024,5 +12213,12 @@ proxies:
             profiles_dir,
             cores_dir: root.join("cores"),
         })
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
     }
 }
