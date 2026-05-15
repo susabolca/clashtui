@@ -16,6 +16,10 @@ Windows: %APPDATA%\clashtui\config.yaml
 
 `CLASHTUI_CONFIG_DIR=/path/to/dir` overrides the directory.
 
+LLM provider metadata and API keys live in the same directory as
+`llm-providers.yaml`. This file is user-maintained local state, not a generated
+runtime file.
+
 Do not edit generated runtime files:
 
 ```text
@@ -121,6 +125,12 @@ dns:
     - localhost.ptlogin2.qq.com
     - "*.msftncsi.com"
     - www.msftconnecttest.com
+llm:
+  provider: deepseek
+  base_url: https://api.deepseek.com
+  model: deepseek-v4-flash
+  api_key_env: DEEPSEEK_API_KEY
+  api_key_file: null
 autostart:
   enabled: false
 port_allocation:
@@ -290,6 +300,63 @@ dns:
 
 DNS fields are rendered into mihomo DNS config. LAN DNS settings are merged into
 `nameserver-policy`, `direct-nameserver`, and `fake-ip-filter`.
+
+### LLM Assistant
+
+```yaml
+llm:
+  provider: deepseek
+  base_url: https://api.deepseek.com
+  model: deepseek-v4-flash
+  api_key_env: DEEPSEEK_API_KEY
+  api_key_file: null
+```
+
+The Chat page uses an OpenAI-compatible `/chat/completions` endpoint. `base_url`
+is the API root, not the full endpoint path. Runtime settings let users choose a
+provider preset, edit the base URL and model, and paste an API key.
+
+Provider metadata is maintained in a separate local file:
+
+```yaml
+# ${CLASHTUI_CONFIG_DIR:-~/.config/clashtui}/llm-providers.yaml
+providers:
+  - id: deepseek
+    label: DeepSeek
+    base_url: https://api.deepseek.com
+    api_key: sk-...
+    api_key_env: DEEPSEEK_API_KEY
+    default_model: deepseek-v4-flash
+    models:
+      - deepseek-v4-flash
+      - deepseek-v4-pro
+    note: DeepSeek official OpenAI-compatible endpoint.
+```
+
+`api_key` is stored in `llm-providers.yaml`, not in `config.yaml`. The local
+provider file is created from the bundled catalog if missing. It is not
+automatically overwritten or merged on clashtui upgrades.
+
+The Runtime page action `Update LLM Providers` manually merges the bundled
+catalog into the local file. Merge keeps local API keys, keeps local custom
+model ids, keeps local custom providers, and refreshes bundled provider fields.
+Choosing `Custom...` in the LLM model dropdown saves the model id into the
+current provider's local `models` list.
+
+China-region provider presets intentionally keep normal API endpoints separate
+from Coding Plan or Token Plan endpoints. For example, Kimi Platform uses
+`https://api.moonshot.cn/v1`, while Kimi Code uses
+`https://api.kimi.com/coding/v1`; Baidu Qianfan uses
+`https://qianfan.baidubce.com/v2`, while Qianfan Coding Plan uses
+`https://qianfan.baidubce.com/v2/coding`. Use the matching API key for the
+selected endpoint.
+
+The assistant first checks the selected provider's local `api_key`. If that is
+empty, it falls back to `api_key_env`, then the legacy `api_key_file` setting.
+
+The native agent uses bundled clashtui/mihomo knowledge and controlled tools. It
+must propose structured patches to the TUI draft; it must not edit generated
+mihomo runtime files or save/restart automatically.
 
 ### Autostart
 

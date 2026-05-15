@@ -27,6 +27,7 @@ use time::{OffsetDateTime, UtcOffset};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
+use crate::agent::{self, AgentEvent, ConfigPatch};
 use crate::autostart;
 use crate::config::{
     AppConfig, ControllerConfig, Paths, PortProxyService, RuntimePaths, Subscription,
@@ -34,6 +35,7 @@ use crate::config::{
 };
 use crate::core;
 use crate::dns;
+use crate::llm_providers;
 use crate::mihomo::{MihomoClient, ProxyGroup};
 use crate::port_allocator;
 use crate::runtime_profile;
@@ -64,9 +66,11 @@ const H_LINE: char = '─';
 const V_LINE: char = '│';
 const TOP_JOINT: char = '┬';
 const BOTTOM_JOINT: char = '┴';
+const CHAT_INPUT_WIDTH: usize = 6_000;
 
 pub async fn run(paths: &Paths, config: &mut AppConfig) -> Result<()> {
     paths.ensure().await?;
+    let provider_warning = llm_providers::init_from_file(&paths.llm_providers_file);
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         print_config(paths, config)?;
         return Ok(());
@@ -75,6 +79,9 @@ pub async fn run(paths: &Paths, config: &mut AppConfig) -> Result<()> {
     let mut draft = config.clone();
     let mut terminal = TerminalGuard::enter()?;
     let mut app = ConfigApp::new(&draft);
+    if let Some(warning) = provider_warning {
+        app.status = warning;
+    }
     app.start_runtime_refresh(paths, &draft);
     app.start_subscription_profile_refresh(paths, &draft);
     let mut last_refresh = Instant::now();
@@ -84,6 +91,7 @@ pub async fn run(paths: &Paths, config: &mut AppConfig) -> Result<()> {
         app.poll_runtime_refresh(&draft);
         app.poll_subscription_profile_refresh();
         app.poll_proxy_log_refresh();
+        app.poll_chat();
         app.start_proxy_log_refresh(paths, &draft);
         app.poll_runtime_command(paths, &draft).await;
         terminal
@@ -108,6 +116,7 @@ pub async fn run(paths: &Paths, config: &mut AppConfig) -> Result<()> {
         app.poll_runtime_refresh(&draft);
         app.poll_subscription_profile_refresh();
         app.poll_proxy_log_refresh();
+        app.poll_chat();
         app.poll_runtime_command(paths, &draft).await;
     }
 
@@ -216,17 +225,29 @@ enum RuntimeItem {
     CorePath,
     CoreUpdate,
     Controller,
+    LlmProvider,
+    LlmBaseUrl,
+    LlmModel,
+    LlmApiKey,
+    LlmProvidersUpdate,
+    TestAssistant,
     Refresh,
 }
 
 impl RuntimeItem {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 13] = [
         Self::Service,
         Self::Autostart,
         Self::Logs,
         Self::CorePath,
         Self::CoreUpdate,
         Self::Controller,
+        Self::LlmProvider,
+        Self::LlmBaseUrl,
+        Self::LlmModel,
+        Self::LlmApiKey,
+        Self::LlmProvidersUpdate,
+        Self::TestAssistant,
         Self::Refresh,
     ];
 
@@ -238,6 +259,12 @@ impl RuntimeItem {
             Self::CorePath => "Mihomo Core",
             Self::CoreUpdate => "Update Core",
             Self::Controller => "Controller",
+            Self::LlmProvider => "LLM Provider",
+            Self::LlmBaseUrl => "LLM Base URL",
+            Self::LlmModel => "LLM Model",
+            Self::LlmApiKey => "LLM API Key",
+            Self::LlmProvidersUpdate => "Update LLM Providers",
+            Self::TestAssistant => "Test Assistant",
             Self::Refresh => "Refresh Runtime",
         }
     }
@@ -495,6 +522,9 @@ enum InputMode {
     SubscriptionUrl,
     CorePath,
     Controller,
+    LlmBaseUrl,
+    LlmModel,
+    LlmApiKey,
     MixedPort,
     HttpPort,
     SocksPort,
@@ -524,6 +554,9 @@ impl InputMode {
             Self::SubscriptionUrl => "Subscription URL",
             Self::CorePath => "Mihomo Core Path",
             Self::Controller => "Controller URL",
+            Self::LlmBaseUrl => "LLM Base URL",
+            Self::LlmModel => "LLM Model",
+            Self::LlmApiKey => "LLM API Key",
             Self::MixedPort => "Mixed Port",
             Self::HttpPort => "HTTP Port",
             Self::SocksPort => "SOCKS Port",
@@ -724,6 +757,8 @@ enum Dropdown {
     Mode,
     SubscriptionRefresh,
     CoreSource,
+    LlmProvider,
+    LlmModel,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -770,6 +805,8 @@ enum ChoiceAction {
     Mode,
     SubscriptionRefresh,
     CoreSource,
+    LlmProvider,
+    LlmModel,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -786,6 +823,7 @@ enum ActionKind {
     Service,
     Logs,
     RefreshRuntime,
+    UpdateLlmProviders,
     UpdateCore,
     StartRuntime,
     StopRuntime,
@@ -894,6 +932,35 @@ struct RuntimeCommandTask {
     exit_after: bool,
 }
 
+struct ChatTask {
+    receiver: Receiver<AgentEvent>,
+    handle: JoinHandle<()>,
+}
+
+#[derive(Default)]
+struct ChatState {
+    entries: Vec<ChatEntry>,
+    input: String,
+    scroll: usize,
+    pending_patch: Option<ConfigPatch>,
+    task: Option<ChatTask>,
+}
+
+#[derive(Clone)]
+struct ChatEntry {
+    kind: ChatEntryKind,
+    content: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChatEntryKind {
+    User,
+    Assistant,
+    Tool,
+    Patch,
+    Error,
+}
+
 struct RuntimeRefreshResult {
     runtime: RuntimeState,
     proxy_runtimes: BTreeMap<String, RuntimeState>,
@@ -987,6 +1054,7 @@ struct ConfigApp {
     runtime_command: Option<RuntimeCommandTask>,
     rule_group_selection: Option<RuleGroupSelection>,
     last_ip_info_refresh: Option<Instant>,
+    chat: ChatState,
     status: String,
     should_quit: bool,
     dirty: bool,
@@ -1039,6 +1107,7 @@ impl ConfigApp {
             runtime_command: None,
             rule_group_selection: None,
             last_ip_info_refresh: None,
+            chat: ChatState::default(),
             status: String::new(),
             should_quit: false,
             dirty: false,
@@ -1279,6 +1348,120 @@ impl ConfigApp {
             task.success,
             first_output_line(&message).unwrap_or("see restart output")
         );
+    }
+
+    fn start_chat_agent(&mut self, paths: &Paths, config: &AppConfig, message: String) {
+        if self.chat.task.is_some() {
+            self.status = "Assistant is already running".into();
+            return;
+        }
+        let paths = paths.clone();
+        let config = config.clone();
+        let (sender, receiver) = mpsc::channel();
+        let handle = tokio::spawn(async move {
+            agent::run_agent(paths, config, message, sender).await;
+        });
+        self.chat.task = Some(ChatTask { receiver, handle });
+        self.chat.entries.push(ChatEntry {
+            kind: ChatEntryKind::Assistant,
+            content: String::new(),
+        });
+        self.status = "Assistant thinking".into();
+    }
+
+    fn poll_chat(&mut self) {
+        let mut events = Vec::new();
+        let mut disconnected = false;
+        if let Some(task) = self.chat.task.as_mut() {
+            loop {
+                match task.receiver.try_recv() {
+                    Ok(event) => events.push(event),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        for event in events {
+            self.apply_chat_event(event);
+        }
+
+        if disconnected {
+            self.chat.task = None;
+        }
+    }
+
+    fn apply_chat_event(&mut self, event: AgentEvent) {
+        match event {
+            AgentEvent::Content(part) => {
+                if !matches!(
+                    self.chat.entries.last().map(|entry| entry.kind),
+                    Some(ChatEntryKind::Assistant)
+                ) {
+                    self.chat.entries.push(ChatEntry {
+                        kind: ChatEntryKind::Assistant,
+                        content: String::new(),
+                    });
+                }
+                if let Some(entry) = self.chat.entries.last_mut() {
+                    entry.content.push_str(&part);
+                }
+                self.status = "Assistant streaming".into();
+            }
+            AgentEvent::Tool(message) => {
+                self.chat.entries.push(ChatEntry {
+                    kind: ChatEntryKind::Tool,
+                    content: message.clone(),
+                });
+                self.status = message;
+            }
+            AgentEvent::PatchReady(patch) => {
+                self.chat.pending_patch = Some(patch.clone());
+                self.chat.entries.push(ChatEntry {
+                    kind: ChatEntryKind::Patch,
+                    content: format!(
+                        "{}{}",
+                        patch.summary,
+                        if patch.restart_required {
+                            "\nSave & Restart required."
+                        } else {
+                            "\nSave required."
+                        }
+                    ),
+                });
+                self.status = "Patch ready; Ctrl+S applies to draft".into();
+            }
+            AgentEvent::Error(message) => {
+                self.chat.entries.push(ChatEntry {
+                    kind: ChatEntryKind::Error,
+                    content: message.clone(),
+                });
+                self.status = message;
+                self.chat.task = None;
+            }
+            AgentEvent::Done => {
+                self.chat.task = None;
+                self.status = if self.chat.pending_patch.is_some() {
+                    "Patch ready; Ctrl+S applies to draft".into()
+                } else {
+                    "Assistant done".into()
+                };
+            }
+        }
+    }
+
+    fn cancel_chat(&mut self) {
+        if let Some(task) = self.chat.task.take() {
+            task.handle.abort();
+            self.chat.entries.push(ChatEntry {
+                kind: ChatEntryKind::Tool,
+                content: "assistant canceled".into(),
+            });
+            self.status = "Assistant canceled".into();
+        }
     }
 
     fn apply_runtime_refresh(&mut self, config: &AppConfig, mut result: RuntimeRefreshResult) {
@@ -2152,6 +2335,18 @@ impl ConfigApp {
         self.status = "Choose mihomo core, then press Enter".into();
     }
 
+    fn open_llm_provider_dropdown(&mut self, config: &AppConfig) {
+        self.dropdown = Some(Dropdown::LlmProvider);
+        self.selected_dropdown = llm_provider_index(&config.llm.provider);
+        self.status = "Choose LLM provider, then press Enter".into();
+    }
+
+    fn open_llm_model_dropdown(&mut self, config: &AppConfig) {
+        self.dropdown = Some(Dropdown::LlmModel);
+        self.selected_dropdown = llm_model_index(config);
+        self.status = "Choose LLM model, then press Enter".into();
+    }
+
     fn open_subscription_refresh_dropdown(&mut self, config: &AppConfig) {
         self.dropdown = Some(Dropdown::SubscriptionRefresh);
         let refresh = if self.page == Page::SubscriptionDetail {
@@ -2175,6 +2370,8 @@ impl ConfigApp {
             Some(Dropdown::Mode) => ModeItem::ALL.len(),
             Some(Dropdown::SubscriptionRefresh) => SUBSCRIPTION_REFRESH_OPTIONS.len(),
             Some(Dropdown::CoreSource) => core::CoreSource::ALL.len(),
+            Some(Dropdown::LlmProvider) => llm_providers::presets().len(),
+            Some(Dropdown::LlmModel) => llm_model_dropdown_options(config).len(),
             None => 0,
         }
     }
@@ -2349,6 +2546,10 @@ async fn handle_key(
         return handle_input_key(paths, config, app, key).await;
     }
 
+    if app.page == Page::Chat {
+        return handle_chat_key(paths, config, app, key).await;
+    }
+
     match key.code {
         KeyCode::F(9) => app.open_confirm(ConfirmAction::LoadDefaults),
         KeyCode::F(10) => app.open_confirm(ConfirmAction::SaveRestart),
@@ -2402,6 +2603,8 @@ async fn handle_paste(
     let value = normalize_pasted_text(value);
     if app.is_input() {
         insert_input_text(app, &value);
+    } else if app.page == Page::Chat {
+        push_chat_input(app, &value);
     } else if app.page == Page::AddSubscription {
         handle_subscription_form_paste(paths, config, app, &value).await?;
     }
@@ -2473,6 +2676,103 @@ async fn handle_input_key(
         KeyCode::Char(value) => insert_input_char(app, value),
         _ => {}
     }
+    Ok(())
+}
+
+async fn handle_chat_key(
+    paths: &Paths,
+    config: &mut AppConfig,
+    app: &mut ConfigApp,
+    key: KeyEvent,
+) -> Result<()> {
+    match key.code {
+        KeyCode::Esc if app.chat.task.is_some() => app.cancel_chat(),
+        KeyCode::Esc => app.back_or_exit_screen(),
+        KeyCode::PageUp => {
+            app.chat.scroll = app.chat.scroll.saturating_add(6);
+        }
+        KeyCode::PageDown => {
+            app.chat.scroll = app.chat.scroll.saturating_sub(6);
+        }
+        KeyCode::Char('s') | KeyCode::Char('S')
+            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            apply_pending_chat_patch(config, app)?;
+        }
+        KeyCode::Char('d') | KeyCode::Char('D')
+            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            app.chat.pending_patch = None;
+            app.status = "Pending patch discarded".into();
+        }
+        KeyCode::Char('u') | KeyCode::Char('U')
+            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            app.chat.input.clear();
+        }
+        KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            push_chat_input(app, "\n");
+        }
+        KeyCode::Enter
+            if key
+                .modifiers
+                .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL | KeyModifiers::SHIFT) =>
+        {
+            push_chat_input(app, "\n");
+        }
+        KeyCode::Enter => send_chat_message(paths, config, app),
+        KeyCode::Backspace => {
+            app.chat.input.pop();
+        }
+        KeyCode::Char(value) if app.chat.input.len() < CHAT_INPUT_WIDTH => {
+            app.chat.input.push(value);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn push_chat_input(app: &mut ConfigApp, value: &str) {
+    if app.chat.input.len().saturating_add(value.len()) <= CHAT_INPUT_WIDTH {
+        app.chat.input.push_str(value);
+    }
+}
+
+fn send_chat_message(paths: &Paths, config: &AppConfig, app: &mut ConfigApp) {
+    if app.chat.task.is_some() {
+        app.status = "Assistant is still running".into();
+        return;
+    }
+    let message = app.chat.input.trim().to_string();
+    if message.is_empty() {
+        app.status = "Type a message first".into();
+        return;
+    }
+    app.chat.input.clear();
+    app.chat.entries.push(ChatEntry {
+        kind: ChatEntryKind::User,
+        content: message.clone(),
+    });
+    app.start_chat_agent(paths, config, message);
+}
+
+fn apply_pending_chat_patch(config: &mut AppConfig, app: &mut ConfigApp) -> Result<()> {
+    let Some(patch) = app.chat.pending_patch.take() else {
+        app.status = "No pending patch".into();
+        return Ok(());
+    };
+    let updated = agent::apply_config_patch(config, &patch)?;
+    *config = updated;
+    app.mark_dirty();
+    app.chat.entries.push(ChatEntry {
+        kind: ChatEntryKind::Patch,
+        content: format!("Applied to draft: {}", patch.summary),
+    });
+    app.status = if patch.restart_required {
+        "Patch applied to draft; Save & Restart required".into()
+    } else {
+        "Patch applied to draft; Save required".into()
+    };
     Ok(())
 }
 
@@ -2639,7 +2939,7 @@ async fn submit_selection(
         Page::Dns => submit_dns_item(paths, config, app).await?,
         Page::Runtime => submit_runtime_item(paths, config, app).await?,
         Page::Chat => {
-            app.status = "Chat assistant is a design preview; LLM integration is pending".into();
+            send_chat_message(paths, config, app);
         }
         Page::Exit => submit_exit_item(paths, config, app).await?,
     }
@@ -2814,6 +3114,12 @@ async fn submit_dropdown(paths: &Paths, config: &mut AppConfig, app: &mut Config
         Some(Dropdown::CoreSource) => {
             submit_core_source_dropdown(config, app);
         }
+        Some(Dropdown::LlmProvider) => {
+            submit_llm_provider_dropdown(config, app);
+        }
+        Some(Dropdown::LlmModel) => {
+            submit_llm_model_dropdown(config, app);
+        }
         None => {}
     }
     Ok(())
@@ -2898,6 +3204,46 @@ fn submit_core_source_dropdown(config: &mut AppConfig, app: &mut ConfigApp) {
     }
 }
 
+fn submit_llm_provider_dropdown(config: &mut AppConfig, app: &mut ConfigApp) {
+    app.dropdown = None;
+    let presets = llm_providers::presets();
+    if presets.is_empty() {
+        app.status = "No LLM providers configured".into();
+        return;
+    }
+    let index = app.selected_dropdown.min(presets.len().saturating_sub(1));
+    let Some(preset) = presets.get(index) else {
+        app.status = "No LLM providers configured".into();
+        return;
+    };
+    config.llm.provider.clone_from(&preset.id);
+    config.llm.api_key_env.clone_from(&preset.api_key_env);
+    if !preset.base_url.is_empty() {
+        config.llm.base_url.clone_from(&preset.base_url);
+    }
+    if !preset.default_model.is_empty() {
+        config.llm.model.clone_from(&preset.default_model);
+    }
+    app.mark_dirty();
+    app.status = format!("LLM provider={} pending save", preset.label);
+}
+
+fn submit_llm_model_dropdown(config: &mut AppConfig, app: &mut ConfigApp) {
+    app.dropdown = None;
+    let options = llm_model_options(config);
+    if options.is_empty() || app.selected_dropdown >= options.len() {
+        begin_llm_model_input(config, app);
+        return;
+    }
+    let index = app.selected_dropdown.min(options.len().saturating_sub(1));
+    let Some(model) = options.get(index) else {
+        return;
+    };
+    config.llm.model.clone_from(model);
+    app.mark_dirty();
+    app.status = format!("LLM model={model} pending save");
+}
+
 async fn submit_mode_selection(
     paths: &Paths,
     config: &mut AppConfig,
@@ -2939,6 +3285,20 @@ async fn submit_runtime_item(
             false,
         ),
         RuntimeItem::Controller => begin_controller_input(config, app),
+        RuntimeItem::LlmProvider => app.open_llm_provider_dropdown(config),
+        RuntimeItem::LlmBaseUrl => begin_llm_base_url_input(config, app),
+        RuntimeItem::LlmModel => app.open_llm_model_dropdown(config),
+        RuntimeItem::LlmApiKey => begin_llm_api_key_input(app),
+        RuntimeItem::LlmProvidersUpdate => update_llm_providers(paths, config, app)?,
+        RuntimeItem::TestAssistant => {
+            app.switch_section(Page::Chat);
+            let message = "Test the LLM connection briefly. Reply with one sentence and do not modify config.".to_string();
+            app.chat.entries.push(ChatEntry {
+                kind: ChatEntryKind::User,
+                content: message.clone(),
+            });
+            app.start_chat_agent(paths, config, message);
+        }
         RuntimeItem::Refresh => refresh_runtime(paths, config, app),
     }
     Ok(())
@@ -3064,6 +3424,39 @@ async fn submit_input(paths: &Paths, config: &mut AppConfig, app: &mut ConfigApp
                 config.port_allocation.auto_controller = false;
                 app.mark_dirty();
                 app.status = "Controller pending save".into();
+            }
+            app.finish_input();
+        }
+        InputMode::LlmBaseUrl => {
+            if !value.is_empty() {
+                config.llm.base_url = value.trim_end_matches('/').to_string();
+                app.mark_dirty();
+                app.status = "LLM base URL pending save".into();
+            }
+            app.finish_input();
+        }
+        InputMode::LlmModel => {
+            if !value.is_empty() {
+                let added = llm_providers::save_model(
+                    &paths.llm_providers_file,
+                    &config.llm.provider,
+                    &value,
+                )?;
+                llm_providers::reload_from_file(&paths.llm_providers_file)?;
+                config.llm.model = value;
+                app.mark_dirty();
+                app.status = if added {
+                    "LLM model added to providers and pending save".into()
+                } else {
+                    "LLM model pending save".into()
+                };
+            }
+            app.finish_input();
+        }
+        InputMode::LlmApiKey => {
+            if !value.is_empty() {
+                agent::save_api_key(paths, config, &value).await?;
+                app.status = "LLM API key saved to providers file".into();
             }
             app.finish_input();
         }
@@ -3239,6 +3632,30 @@ fn begin_controller_input(config: &AppConfig, app: &mut ConfigApp) {
     );
 }
 
+fn begin_llm_base_url_input(config: &AppConfig, app: &mut ConfigApp) {
+    app.begin_input(
+        InputMode::LlmBaseUrl,
+        config.llm.base_url.clone(),
+        "Edit OpenAI-compatible base URL",
+    );
+}
+
+fn begin_llm_model_input(config: &AppConfig, app: &mut ConfigApp) {
+    app.begin_input(
+        InputMode::LlmModel,
+        config.llm.model.clone(),
+        "Edit LLM model",
+    );
+}
+
+fn begin_llm_api_key_input(app: &mut ConfigApp) {
+    app.begin_input(
+        InputMode::LlmApiKey,
+        String::new(),
+        "Paste LLM API key; it will be saved in llm-providers.yaml",
+    );
+}
+
 fn begin_mixed_port_input(config: &AppConfig, app: &mut ConfigApp) {
     app.begin_input(
         InputMode::MixedPort,
@@ -3351,6 +3768,36 @@ fn refresh_runtime(paths: &Paths, config: &AppConfig, app: &mut ConfigApp) {
     app.refresh_runtime(paths, config);
     app.restart_subscription_profile_refresh(paths, config);
     app.status = "Refresh scheduled".into();
+}
+
+fn update_llm_providers(paths: &Paths, config: &mut AppConfig, app: &mut ConfigApp) -> Result<()> {
+    let report = llm_providers::update_local_from_bundled(&paths.llm_providers_file)?;
+    if let Some(provider) = llm_providers::provider(&config.llm.provider) {
+        let base_url_changed =
+            !provider.base_url.is_empty() && config.llm.base_url != provider.base_url;
+        let api_key_env_changed =
+            !provider.api_key_env.is_empty() && config.llm.api_key_env != provider.api_key_env;
+        let model_changed =
+            config.llm.model.trim().is_empty() && !provider.default_model.is_empty();
+
+        if base_url_changed {
+            config.llm.base_url = provider.base_url;
+        }
+        if api_key_env_changed {
+            config.llm.api_key_env = provider.api_key_env;
+        }
+        if model_changed {
+            config.llm.model = provider.default_model;
+        }
+        if base_url_changed || api_key_env_changed || model_changed {
+            app.mark_dirty();
+        }
+    }
+    app.status = format!(
+        "LLM providers updated: +{} providers, {} custom providers, {} custom models kept",
+        report.added_providers, report.preserved_custom_providers, report.preserved_custom_models
+    );
+    Ok(())
 }
 
 async fn toggle_system_proxy(
@@ -4221,6 +4668,10 @@ fn draw_header(frame: &mut Frame, app: &ConfigApp, area: Rect, separator_column:
 
 fn draw_body(frame: &mut Frame, paths: &Paths, config: &AppConfig, app: &ConfigApp, area: Rect) {
     frame.render_widget(Clear, area);
+    if app.page == Page::Chat {
+        draw_chat_page(frame, paths, config, app, area);
+        return;
+    }
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -4663,7 +5114,7 @@ fn setting_rows(paths: &Paths, config: &AppConfig, app: &ConfigApp) -> Vec<Setti
         Page::SubscriptionProxies => subscription_proxy_rows(paths, config, app),
         Page::SubscriptionRules => subscription_rule_rows(paths, config, app),
         Page::AddSubscription => add_subscription_rows(app),
-        Page::Runtime => runtime_rows(config, app),
+        Page::Runtime => runtime_rows(paths, config, app),
         Page::Chat => chat_rows(config, app),
         Page::Exit => exit_rows(),
         Page::ProxyConfig => proxy_config_rows(config, app),
@@ -5186,7 +5637,7 @@ fn subscription_rule_proxy_rows(
         .collect()
 }
 
-fn runtime_rows(config: &AppConfig, app: &ConfigApp) -> Vec<SettingRow> {
+fn runtime_rows(paths: &Paths, config: &AppConfig, app: &ConfigApp) -> Vec<SettingRow> {
     RuntimeItem::ALL
         .iter()
         .map(|item| {
@@ -5197,11 +5648,17 @@ fn runtime_rows(config: &AppConfig, app: &ConfigApp) -> Vec<SettingRow> {
                 RuntimeItem::CorePath => RowKind::Choice(ChoiceAction::CoreSource),
                 RuntimeItem::CoreUpdate => RowKind::Action(ActionKind::UpdateCore),
                 RuntimeItem::Controller => RowKind::Input(InputMode::Controller),
+                RuntimeItem::LlmProvider => RowKind::Choice(ChoiceAction::LlmProvider),
+                RuntimeItem::LlmBaseUrl => RowKind::Input(InputMode::LlmBaseUrl),
+                RuntimeItem::LlmModel => RowKind::Choice(ChoiceAction::LlmModel),
+                RuntimeItem::LlmApiKey => RowKind::Input(InputMode::LlmApiKey),
+                RuntimeItem::LlmProvidersUpdate => RowKind::Action(ActionKind::UpdateLlmProviders),
+                RuntimeItem::TestAssistant => RowKind::Action(ActionKind::RefreshRuntime),
                 RuntimeItem::Refresh => RowKind::Action(ActionKind::RefreshRuntime),
             };
             SettingRow {
                 label: item.label().into(),
-                value: runtime_item_value(config, app, *item),
+                value: runtime_item_value(paths, config, app, *item),
                 help: runtime_item_help(*item).into(),
                 kind,
             }
@@ -5238,9 +5695,9 @@ fn dns_rows(config: &AppConfig) -> Vec<SettingRow> {
 fn chat_rows(config: &AppConfig, app: &ConfigApp) -> Vec<SettingRow> {
     vec![
         SettingRow {
-            label: "Prompt Goal".into(),
-            value: "configure proxy".into(),
-            help: "Future AI-assisted configuration entry point.".into(),
+            label: "Assistant".into(),
+            value: config.llm.model.clone(),
+            help: "Native chat assistant with bundled clashtui/mihomo knowledge.".into(),
             kind: RowKind::Info,
         },
         SettingRow {
@@ -5430,6 +5887,7 @@ fn row_is_function_action(row: &SettingRow) -> bool {
                 | ActionKind::Service
                 | ActionKind::Logs
                 | ActionKind::RefreshRuntime
+                | ActionKind::UpdateLlmProviders
                 | ActionKind::UpdateCore
                 | ActionKind::StartRuntime
                 | ActionKind::StopRuntime
@@ -5484,6 +5942,14 @@ const fn runtime_item_help(item: RuntimeItem) -> &'static str {
             "Download the latest selected managed Mihomo core; restart to use it."
         }
         RuntimeItem::Controller => "Mihomo external controller URL used by clashtui.",
+        RuntimeItem::LlmProvider => "Choose the OpenAI-compatible assistant endpoint preset.",
+        RuntimeItem::LlmBaseUrl => "Base URL for the assistant chat/completions endpoint.",
+        RuntimeItem::LlmModel => "Model name sent to the configured OpenAI-compatible endpoint.",
+        RuntimeItem::LlmApiKey => "Paste an API key. It is saved in llm-providers.yaml.",
+        RuntimeItem::LlmProvidersUpdate => {
+            "Manually merge bundled provider updates while preserving local API keys and models."
+        }
+        RuntimeItem::TestAssistant => "Open Chat and run a short assistant connection test.",
         RuntimeItem::Refresh => "Refresh runtime information from mihomo.",
     }
 }
@@ -5897,23 +6363,35 @@ fn draw_mode_help(frame: &mut Frame, config: &AppConfig, app: &ConfigApp, area: 
     frame.render_widget(bios_panel("Mode Help", lines), area);
 }
 
-fn draw_runtime_page(frame: &mut Frame, config: &AppConfig, app: &ConfigApp, area: Rect) {
+fn draw_runtime_page(
+    frame: &mut Frame,
+    paths: &Paths,
+    config: &AppConfig,
+    app: &ConfigApp,
+    area: Rect,
+) {
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
         .split(area);
-    draw_runtime_menu(frame, config, app, columns[0]);
+    draw_runtime_menu(frame, paths, config, app, columns[0]);
     draw_runtime_help(frame, config, app, columns[1]);
 }
 
-fn draw_runtime_menu(frame: &mut Frame, config: &AppConfig, app: &ConfigApp, area: Rect) {
+fn draw_runtime_menu(
+    frame: &mut Frame,
+    paths: &Paths,
+    config: &AppConfig,
+    app: &ConfigApp,
+    area: Rect,
+) {
     let items = RuntimeItem::ALL
         .iter()
         .map(|item| {
             ListItem::new(Line::from(vec![
                 Span::raw(format!("{:<18}", item.label())),
                 Span::styled(
-                    runtime_item_value(config, app, *item),
+                    runtime_item_value(paths, config, app, *item),
                     Style::default().fg(Color::Gray),
                 ),
             ]))
@@ -5955,62 +6433,166 @@ fn draw_runtime_help(frame: &mut Frame, config: &AppConfig, app: &ConfigApp, are
     frame.render_widget(bios_panel("Runtime Help", lines), area);
 }
 
-fn draw_chat_page(frame: &mut Frame, config: &AppConfig, app: &ConfigApp, area: Rect) {
+fn draw_chat_page(
+    frame: &mut Frame,
+    paths: &Paths,
+    config: &AppConfig,
+    app: &ConfigApp,
+    area: Rect,
+) {
     let columns = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .constraints([Constraint::Percentage(64), Constraint::Percentage(36)])
         .split(area);
-    let chat_lines = vec![
-        Line::from(Span::styled(
-            "AI Configuration Assistant",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from("Preview page. LLM integration is not wired yet."),
-        Line::from("The intended flow is:"),
-        Line::from("1. Explain what you want in plain language."),
-        Line::from("2. Review the proposed config diff."),
-        Line::from("3. Confirm Save & Restart, Save Draft, or Cancel."),
-        Line::from(""),
-        Line::from("Examples:"),
-        Line::from("- Use system proxy but keep TUN off."),
-        Line::from("- Create a SOCKS5 LAN proxy on 7081 using HK."),
-        Line::from("- Explain why TUN is unavailable on macOS."),
-    ];
-    frame.render_widget(bios_panel("Chat", chat_lines), columns[0]);
+    let left = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(8), Constraint::Length(5)])
+        .split(columns[0]);
 
-    let spec_lines = vec![
+    let mut transcript = vec![
         Line::from(Span::styled(
-            "LLM Spec Preview",
+            "Chat",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from("version: 1"),
-        Line::from("proxies:"),
-        Line::from("  - id: system"),
-        Line::from("    kind: system"),
-        Line::from(format!("    mixed_port: {}", config.mixed_port)),
-        Line::from(format!("    os_proxy: {}", config.system_proxy.enabled)),
-        Line::from(format!("    tun: {}", config.tun.enable)),
-        Line::from(format!("    mode: {}", config.runtime_mode)),
-        Line::from(format!(
-            "    subscription: {}",
-            config.active_profile.as_deref().unwrap_or("none")
+    ];
+    let visible = left[0].height.saturating_sub(4) as usize;
+    let lines = chat_transcript_lines(app, visible);
+    if lines.is_empty() {
+        transcript.extend([
+            Line::from(
+                "Ask about proxy, DNS, TUN, subscriptions, runtime logs, or config changes.",
+            ),
+            Line::from(""),
+            Line::from("Examples:"),
+            Line::from("  Explain why TUN is unavailable"),
+            Line::from("  Add a SOCKS5 Port Proxy on 7081 using HK-01"),
+            Line::from("  Make +.taobao.net resolve through 30.30.30.30"),
+        ]);
+    } else {
+        transcript.extend(lines);
+    }
+    frame.render_widget(bios_panel("Assistant", transcript), left[0]);
+
+    let input_lines = vec![
+        Line::from(Span::styled(
+            ">",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(fit_width(
+            app.chat.input.as_str(),
+            left[1].width.saturating_sub(4) as usize,
+        )),
+        Line::from(Span::styled(
+            "Enter send | Ctrl+J newline | Esc cancel/back | Ctrl+S apply patch",
+            Style::default().fg(Color::Gray),
+        )),
+    ];
+    frame.render_widget(panel("Input", input_lines), left[1]);
+
+    let mut inspector = vec![
+        Line::from(Span::styled(
+            "Agent",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from(format!(
-            "runtime: {}",
+            "Status: {}",
+            if app.chat.task.is_some() {
+                "running"
+            } else if app.chat.pending_patch.is_some() {
+                "patch ready"
+            } else {
+                "idle"
+            }
+        )),
+        Line::from(format!(
+            "Provider: {}",
+            llm_provider_label(&config.llm.provider)
+        )),
+        Line::from(format!("Model: {}", config.llm.model)),
+        Line::from(format!("Key: {}", agent::api_key_status(paths, config))),
+        Line::from(format!("Base: {}", config.llm.base_url)),
+        Line::from(fit_width(
+            &llm_provider_note(&config.llm.provider),
+            columns[1].width.saturating_sub(4) as usize,
+        )),
+        Line::from(""),
+        Line::from(format!(
+            "Runtime: {}",
             app.runtime.error.as_deref().unwrap_or("online")
         )),
+        Line::from(format!(
+            "Mixed: {}:{}",
+            config.proxy_host, config.mixed_port
+        )),
+        Line::from(format!("TUN: {}", on_off(config.tun.enable))),
+        Line::from(format!(
+            "DNS: {} {}",
+            on_off(config.dns.enable),
+            config.dns.listen
+        )),
     ];
-    frame.render_widget(
-        bios_panel("Validated Config Surface", spec_lines),
-        columns[1],
-    );
+    if let Some(patch) = &app.chat.pending_patch {
+        inspector.extend([
+            Line::from(""),
+            Line::from(Span::styled(
+                "Pending Patch",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(fit_width(
+                &patch.summary,
+                columns[1].width.saturating_sub(4) as usize,
+            )),
+            Line::from(format!("Ops: {}", patch.operations.len())),
+            Line::from(if patch.restart_required {
+                "Apply: Ctrl+S then Save & Restart"
+            } else {
+                "Apply: Ctrl+S then Save"
+            }),
+            Line::from("Discard: Ctrl+D"),
+        ]);
+    }
+    frame.render_widget(bios_panel("Inspector", inspector), columns[1]);
+}
+
+fn chat_transcript_lines(app: &ConfigApp, visible: usize) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for entry in &app.chat.entries {
+        let (label, style) = match entry.kind {
+            ChatEntryKind::User => ("user", Style::default().fg(Color::Cyan)),
+            ChatEntryKind::Assistant => ("assistant", Style::default().fg(Color::White)),
+            ChatEntryKind::Tool => ("tool", Style::default().fg(Color::Gray)),
+            ChatEntryKind::Patch => ("patch", Style::default().fg(Color::Yellow)),
+            ChatEntryKind::Error => ("error", Style::default().fg(Color::Red)),
+        };
+        lines.push(Line::from(Span::styled(
+            label,
+            style.add_modifier(Modifier::BOLD),
+        )));
+        for raw in entry.content.lines() {
+            lines.push(Line::from(Span::styled(format!("  {raw}"), style)));
+        }
+        if entry.content.is_empty() {
+            lines.push(Line::from(Span::styled("  ...", style)));
+        }
+        lines.push(Line::from(""));
+    }
+    let end = lines.len().saturating_sub(app.chat.scroll);
+    let start = end.saturating_sub(visible);
+    lines
+        .into_iter()
+        .skip(start)
+        .take(end.saturating_sub(start))
+        .collect()
 }
 
 fn draw_dns_page(frame: &mut Frame, config: &AppConfig, app: &ConfigApp, area: Rect) {
@@ -6106,13 +6688,18 @@ fn draw_input(frame: &mut Frame, app: &ConfigApp) {
     let (width, rows) = input_dialog_spec(app.input_mode);
     let area = fixed_rect(width, input_dialog_height(rows), frame.area());
     frame.render_widget(Clear, area);
+    let display_input = if app.input_mode == InputMode::LlmApiKey {
+        "*".repeat(app.input.chars().count())
+    } else {
+        app.input.clone()
+    };
     let mut body = vec![
         popup_title_line(app.input_mode.title(), area.width.saturating_sub(2)),
         Line::from(""),
     ];
     body.extend(input_box_lines(
-        &app.input,
-        app.input_cursor,
+        &display_input,
+        display_input.len(),
         area.width.saturating_sub(6) as usize,
         rows,
     ));
@@ -6156,7 +6743,8 @@ fn input_help_text(app: &ConfigApp) -> &'static str {
 
 const fn input_dialog_spec(input_mode: InputMode) -> (u16, usize) {
     match input_mode {
-        InputMode::SubscriptionUrl => (URL_INPUT_WIDTH, URL_INPUT_ROWS),
+        InputMode::SubscriptionUrl | InputMode::LlmBaseUrl => (URL_INPUT_WIDTH, URL_INPUT_ROWS),
+        InputMode::LlmApiKey => (URL_INPUT_WIDTH, DEFAULT_INPUT_ROWS),
         InputMode::DnsLanDomains
         | InputMode::DnsLanNameserver
         | InputMode::DnsNameserverPolicy
@@ -6250,16 +6838,35 @@ fn draw_dropdown(frame: &mut Frame, config: &AppConfig, app: &ConfigApp) {
         return;
     };
     let options = dropdown_options(dropdown, config);
-    let height = (options.len() as u16 + 4).clamp(6, 12);
-    let area = fixed_rect(46, height, frame.area());
+    let is_llm_provider = dropdown == Dropdown::LlmProvider;
+    let is_llm_catalog_dropdown = matches!(dropdown, Dropdown::LlmProvider | Dropdown::LlmModel);
+    let height = if is_llm_catalog_dropdown {
+        (options.len() as u16 + 6).clamp(8, 18)
+    } else {
+        (options.len() as u16 + 4).clamp(6, 12)
+    };
+    let width = if is_llm_catalog_dropdown { 72 } else { 46 };
+    let area = fixed_rect(width, height, frame.area());
     frame.render_widget(Clear, area);
 
     let selected = app.selected_dropdown.min(options.len().saturating_sub(1));
+    let max_visible = area
+        .height
+        .saturating_sub(if is_llm_catalog_dropdown { 6 } else { 4 })
+        .max(1) as usize;
+    let start = dropdown_window_start(selected, options.len(), max_visible);
+    let end = (start + max_visible).min(options.len());
     let mut lines = vec![
         popup_title_line(dropdown_title(dropdown), area.width.saturating_sub(2)),
         Line::from(""),
     ];
-    for (index, option) in options.iter().enumerate() {
+    if start > 0 {
+        lines.push(Line::from(Span::styled(
+            "...",
+            Style::default().fg(Color::Gray),
+        )));
+    }
+    for (index, option) in options.iter().enumerate().skip(start).take(max_visible) {
         let style = if index == selected {
             selected_style()
         } else if dropdown == Dropdown::ProxySubscription
@@ -6273,7 +6880,39 @@ fn draw_dropdown(frame: &mut Frame, config: &AppConfig, app: &ConfigApp) {
         };
         lines.push(Line::from(Span::styled(option.as_str(), style)));
     }
+    if end < options.len() {
+        lines.push(Line::from(Span::styled(
+            "...",
+            Style::default().fg(Color::Gray),
+        )));
+    }
+    if is_llm_provider {
+        lines.push(Line::from(""));
+        let note = llm_provider_note_by_index(selected);
+        lines.push(Line::from(Span::styled(
+            fit_width(&note, area.width.saturating_sub(4) as usize),
+            Style::default().fg(Color::Gray),
+        )));
+    } else if dropdown == Dropdown::LlmModel {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Edit LLM Model manually to use a custom model id.",
+            Style::default().fg(Color::Gray),
+        )));
+    }
     frame.render_widget(dialog_panel(lines), area);
+}
+
+fn dropdown_window_start(selected: usize, count: usize, max_visible: usize) -> usize {
+    if count <= max_visible {
+        return 0;
+    }
+    let half = max_visible / 2;
+    let mut start = selected.saturating_sub(half);
+    if start + max_visible > count {
+        start = count - max_visible;
+    }
+    start
 }
 
 fn dropdown_title(dropdown: Dropdown) -> &'static str {
@@ -6282,6 +6921,8 @@ fn dropdown_title(dropdown: Dropdown) -> &'static str {
         Dropdown::Mode => "Mode",
         Dropdown::SubscriptionRefresh => "Refresh",
         Dropdown::CoreSource => "Mihomo Core",
+        Dropdown::LlmProvider => "LLM Provider",
+        Dropdown::LlmModel => "LLM Model",
     }
 }
 
@@ -6310,6 +6951,11 @@ fn dropdown_options(dropdown: Dropdown, config: &AppConfig) -> Vec<String> {
             .iter()
             .map(|source| source.label().to_string())
             .collect(),
+        Dropdown::LlmProvider => llm_providers::presets()
+            .iter()
+            .map(|preset| preset.label.clone())
+            .collect(),
+        Dropdown::LlmModel => llm_model_dropdown_options(config),
     }
 }
 
@@ -7653,7 +8299,12 @@ const fn proxy_config_field_help(field: ProxyConfigField) -> &'static str {
     }
 }
 
-fn runtime_item_value(config: &AppConfig, app: &ConfigApp, item: RuntimeItem) -> String {
+fn runtime_item_value(
+    paths: &Paths,
+    config: &AppConfig,
+    app: &ConfigApp,
+    item: RuntimeItem,
+) -> String {
     match item {
         RuntimeItem::Service => match service::status() {
             Ok(status) if status.reachable => "ready".into(),
@@ -7677,6 +8328,18 @@ fn runtime_item_value(config: &AppConfig, app: &ConfigApp, item: RuntimeItem) ->
         RuntimeItem::CorePath => core_source_value(config),
         RuntimeItem::CoreUpdate => config.mihomo.update.clone(),
         RuntimeItem::Controller => config.controller.url.clone(),
+        RuntimeItem::LlmProvider => llm_provider_label(&config.llm.provider),
+        RuntimeItem::LlmBaseUrl => config.llm.base_url.clone(),
+        RuntimeItem::LlmModel => {
+            if config.llm.model.trim().is_empty() {
+                "missing".into()
+            } else {
+                config.llm.model.clone()
+            }
+        }
+        RuntimeItem::LlmApiKey => agent::api_key_status(paths, config),
+        RuntimeItem::LlmProvidersUpdate => "manual".into(),
+        RuntimeItem::TestAssistant => "run".into(),
         RuntimeItem::Refresh => app.runtime.error.as_deref().unwrap_or("online").to_string(),
     }
 }
@@ -7695,6 +8358,54 @@ fn core_source_index(source: core::CoreSource) -> usize {
         .iter()
         .position(|candidate| *candidate == source)
         .unwrap_or_default()
+}
+
+fn llm_provider_index(provider: &str) -> usize {
+    llm_providers::presets()
+        .iter()
+        .position(|preset| preset.id == provider)
+        .unwrap_or_default()
+}
+
+fn llm_provider_label(provider: &str) -> String {
+    llm_providers::presets()
+        .iter()
+        .find(|preset| preset.id == provider)
+        .map(|preset| preset.label.clone())
+        .unwrap_or_else(|| "OpenAI Compatible".into())
+}
+
+fn llm_provider_note(provider: &str) -> String {
+    llm_providers::presets()
+        .iter()
+        .find(|preset| preset.id == provider)
+        .map(|preset| preset.note.clone())
+        .unwrap_or_else(|| "Custom compatible endpoint.".into())
+}
+
+fn llm_provider_note_by_index(index: usize) -> String {
+    llm_providers::presets()
+        .get(index)
+        .map(|preset| preset.note.clone())
+        .unwrap_or_else(|| "Custom compatible endpoint.".into())
+}
+
+fn llm_model_options(config: &AppConfig) -> Vec<String> {
+    llm_providers::model_options(&config.llm.provider)
+}
+
+fn llm_model_dropdown_options(config: &AppConfig) -> Vec<String> {
+    let mut options = llm_model_options(config);
+    options.push("Custom...".into());
+    options
+}
+
+fn llm_model_index(config: &AppConfig) -> usize {
+    let options = llm_model_options(config);
+    options
+        .iter()
+        .position(|model| model == &config.llm.model)
+        .unwrap_or(options.len())
 }
 
 fn dns_item_value(config: &AppConfig, item: DnsItem) -> String {
@@ -9989,7 +10700,7 @@ mod tests {
     }
 
     #[test]
-    fn dns_rows_show_nameserver_policy() {
+    fn dns_rows_show_nameserver_policy() -> Result<()> {
         let mut config = AppConfig::default();
         config
             .dns
@@ -10000,13 +10711,14 @@ mod tests {
         let policy_row = rows
             .iter()
             .find(|row| row.label == "DNS Policy")
-            .expect("DNS policy row");
+            .context("DNS policy row")?;
 
         assert_eq!(policy_row.value, "+.taobao.net=30.30.30.30");
         assert!(matches!(
             policy_row.kind,
             RowKind::Input(InputMode::DnsNameserverPolicy)
         ));
+        Ok(())
     }
 
     #[test]
@@ -10504,12 +11216,14 @@ mod tests {
     }
 
     #[test]
-    fn runtime_rows_do_not_include_dns_shortcut() {
+    fn runtime_rows_do_not_include_dns_shortcut() -> Result<()> {
+        let paths = test_paths("runtime-rows")?;
         let config = AppConfig::default();
         let app = ConfigApp::new(&config);
-        let rows = runtime_rows(&config, &app);
+        let rows = runtime_rows(&paths, &config, &app);
 
         assert!(!rows.iter().any(|row| row.label == "DNS"));
+        Ok(())
     }
 
     #[tokio::test]
@@ -11247,6 +11961,8 @@ proxies:
             active_config_file: root.join("mihomo-active.yaml"),
             log_file: root.join("clashtui.log"),
             core_log_file: root.join("mihomo.log"),
+            llm_api_key_file: root.join("llm-api-key"),
+            llm_providers_file: root.join("llm-providers.yaml"),
             profiles_dir,
             cores_dir: root.join("cores"),
         })

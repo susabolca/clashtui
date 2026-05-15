@@ -421,6 +421,8 @@ mod tests {
             active_config_file: std::env::temp_dir().join("clashtui-port-test/mihomo-active.yaml"),
             log_file: std::env::temp_dir().join("clashtui-port-test/clashtui.log"),
             core_log_file: std::env::temp_dir().join("clashtui-port-test/mihomo.log"),
+            llm_api_key_file: std::env::temp_dir().join("clashtui-port-test/llm-api-key"),
+            llm_providers_file: std::env::temp_dir().join("clashtui-port-test/llm-providers.yaml"),
             profiles_dir: std::env::temp_dir().join("clashtui-port-test/profiles"),
             cores_dir: std::env::temp_dir().join("clashtui-port-test/cores"),
         };

@@ -7,6 +7,8 @@ use tokio::fs;
 pub const DEFAULT_MIXED_PORT: u16 = 7070;
 pub const DEFAULT_CONTROLLER_URL: &str = "http://127.0.0.1:19090";
 pub const DEFAULT_RUNTIME_BACKEND: &str = "service";
+pub const DEFAULT_LLM_BASE_URL: &str = "https://api.deepseek.com";
+pub const DEFAULT_LLM_API_KEY_ENV: &str = "DEEPSEEK_API_KEY";
 const LEGACY_DEFAULT_MIXED_PORT: u16 = 7897;
 const LEGACY_DEFAULT_CONTROLLER_URLS: [&str; 1] = ["http://127.0.0.1:9097"];
 const DEFAULT_DNS_LISTEN: &str = "127.0.0.1:10553";
@@ -22,6 +24,8 @@ pub struct Paths {
     pub active_config_file: PathBuf,
     pub log_file: PathBuf,
     pub core_log_file: PathBuf,
+    pub llm_api_key_file: PathBuf,
+    pub llm_providers_file: PathBuf,
     pub profiles_dir: PathBuf,
     pub cores_dir: PathBuf,
 }
@@ -48,6 +52,8 @@ impl Paths {
         let active_config_file = config_dir.join("mihomo-active.yaml");
         let log_file = config_dir.join("clashtui.log");
         let core_log_file = config_dir.join("mihomo.log");
+        let llm_api_key_file = config_dir.join("llm-api-key");
+        let llm_providers_file = config_dir.join("llm-providers.yaml");
         let profiles_dir = config_dir.join("profiles");
         let cores_dir = config_dir.join("cores");
         Ok(Self {
@@ -59,6 +65,8 @@ impl Paths {
             active_config_file,
             log_file,
             core_log_file,
+            llm_api_key_file,
+            llm_providers_file,
             profiles_dir,
             cores_dir,
         })
@@ -154,6 +162,7 @@ pub struct AppConfig {
     pub system_proxy: SystemProxyConfig,
     pub tun: TunConfig,
     pub dns: DnsConfig,
+    pub llm: LlmConfig,
     pub autostart: AutostartConfig,
     pub port_allocation: PortAllocationConfig,
     pub runtime_backend: String,
@@ -175,6 +184,7 @@ impl Default for AppConfig {
             system_proxy: SystemProxyConfig::default(),
             tun: TunConfig::default(),
             dns: DnsConfig::default(),
+            llm: LlmConfig::default(),
             autostart: AutostartConfig::default(),
             port_allocation: PortAllocationConfig::default(),
             runtime_backend: DEFAULT_RUNTIME_BACKEND.into(),
@@ -349,6 +359,28 @@ impl AppConfig {
             self.port_allocation.auto_dns = false;
         }
         changed || controller_changed || mixed_changed || dns_changed
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LlmConfig {
+    pub provider: String,
+    pub base_url: String,
+    pub model: String,
+    pub api_key_env: String,
+    pub api_key_file: Option<String>,
+}
+
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self {
+            provider: "deepseek".into(),
+            base_url: DEFAULT_LLM_BASE_URL.into(),
+            model: "deepseek-v4-flash".into(),
+            api_key_env: DEFAULT_LLM_API_KEY_ENV.into(),
+            api_key_file: None,
+        }
     }
 }
 

@@ -28,8 +28,11 @@ proxy, DNS, and optional TUN from one compact TUI.
   Port Proxy usage still works without the service.
 - Can use a custom mihomo binary or download a managed MetaCubeX/mihomo release
   into the clashtui config directory.
-- Includes an LLM Chat page and LLM-friendly config spec. Chat integration is
-  still in development.
+- Includes a native LLM Chat assistant for explaining runtime behavior,
+  inspecting logs/config, and proposing safe draft config patches.
+- Keeps LLM provider presets in `llm-providers.yaml`; API keys and custom model
+  ids stay local, while bundled provider updates are merged only when the user
+  runs the Runtime action.
 
 ## Quick Start
 
@@ -219,8 +222,10 @@ Sections:
 
 - `Main`: runtime summary, Global Proxy, Port Proxy list, Add Port Proxy.
 - `Subscription`: subscription list, profile cache, usage, expiry, refresh.
-- `Runtime`: service, autostart, logs, mihomo core, controller, DNS.
-- `Chat`: LLM-assisted configuration preview, still in development.
+- `Runtime`: service, autostart, logs, mihomo core, controller, LLM settings,
+  and manual LLM provider catalog updates.
+- `Chat`: LLM-assisted config, runtime explanation, troubleshooting, and draft
+  patch review.
 - `Exit`: save, start, stop, reload, restart, defaults, and exit actions.
 
 Common keys:

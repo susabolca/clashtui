@@ -164,6 +164,8 @@ mod imp {
                 active_config_file: PathBuf::from("/tmp/clashtui/mihomo-active.yaml"),
                 log_file: PathBuf::from("/tmp/clashtui/clashtui.log"),
                 core_log_file: PathBuf::from("/tmp/clashtui/mihomo.log"),
+                llm_api_key_file: PathBuf::from("/tmp/clashtui/llm-api-key"),
+                llm_providers_file: PathBuf::from("/tmp/clashtui/llm-providers.yaml"),
                 profiles_dir: PathBuf::from("/tmp/clashtui/profiles"),
                 cores_dir: PathBuf::from("/tmp/clashtui/cores"),
             };

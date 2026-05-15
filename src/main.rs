@@ -1,9 +1,12 @@
+mod agent;
 mod autostart;
 mod config;
 mod config_menu;
 mod core;
 mod daemon;
 mod dns;
+mod llm;
+mod llm_providers;
 mod mihomo;
 mod platform;
 mod port_allocator;

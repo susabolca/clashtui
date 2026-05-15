@@ -22,7 +22,8 @@
 - 支持系统代理、mihomo DNS，以及可选 TUN 模式。
 - macOS/Linux 上提供 privileged service 模式用于 TUN；不安装 service 时，普通 Port Proxy 功能仍可正常使用。
 - 支持自定义 mihomo 二进制，也可以在 clashtui 配置目录中下载和管理 MetaCubeX/mihomo。
-- 包含 LLM Chat 页面和面向 LLM 的配置 spec。Chat 集成仍在开发中。
+- 包含原生 LLM Chat assistant，可解释运行时行为、检查日志/配置，并生成安全的 draft 配置 patch。
+- LLM provider 预设维护在 `llm-providers.yaml` 中；API key 和自定义模型保留在本地，内置 provider 更新只会在用户手动执行 Runtime 更新动作时合并。
 
 ## 快速开始
 
@@ -195,8 +196,8 @@ target/release/clashtui service-uninstall
 
 - `Main`：运行时摘要、Global Proxy、Port Proxy 列表、Add Port Proxy。
 - `Subscription`：订阅列表、profile 缓存、流量、到期时间、刷新状态。
-- `Runtime`：service、自启动、日志、mihomo core、controller、DNS。
-- `Chat`：LLM 辅助配置预览，仍在开发中。
+- `Runtime`：service、自启动、日志、mihomo core、controller、LLM 设置，以及手动 LLM provider catalog 更新。
+- `Chat`：LLM 辅助配置、运行时解释、问题排查和 draft patch 确认。
 - `Exit`：保存、start、stop、reload、restart、默认值和退出动作。
 
 常用按键：
