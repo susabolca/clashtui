@@ -124,12 +124,16 @@ impl LlmClient {
         mut on_content: impl FnMut(String),
     ) -> Result<LlmCompletion> {
         let url = format!("{}/chat/completions", self.base_url);
-        let body = json!({
+        let mut body = json!({
             "model": model,
             "messages": messages,
-            "tools": tools,
             "stream": true,
         });
+        if !tools.is_empty()
+            && let Some(object) = body.as_object_mut()
+        {
+            object.insert("tools".into(), json!(tools));
+        }
         let mut response = timeout(
             LLM_REQUEST_TIMEOUT,
             self.client
@@ -166,21 +170,27 @@ impl LlmClient {
             while let Some(line_end) = buffer.find('\n') {
                 let line = buffer[..line_end].trim_end_matches('\r').to_string();
                 buffer.drain(..=line_end);
-                let Some(data) = line.strip_prefix("data:") else {
-                    continue;
-                };
-                let data = data.trim();
-                if data.is_empty() {
-                    continue;
-                }
-                if data == "[DONE]" {
+                if apply_stream_line(&line, &mut content, &mut tool_calls, &mut on_content)? {
                     return Ok(LlmCompletion {
                         content,
                         tool_calls: finish_tool_calls(tool_calls),
                     });
                 }
-                apply_stream_delta(data, &mut content, &mut tool_calls, &mut on_content)?;
             }
+        }
+
+        if !buffer.trim().is_empty()
+            && apply_stream_line(
+                buffer.trim_end_matches('\r'),
+                &mut content,
+                &mut tool_calls,
+                &mut on_content,
+            )?
+        {
+            return Ok(LlmCompletion {
+                content,
+                tool_calls: finish_tool_calls(tool_calls),
+            });
         }
 
         Ok(LlmCompletion {
@@ -188,6 +198,26 @@ impl LlmClient {
             tool_calls: finish_tool_calls(tool_calls),
         })
     }
+}
+
+fn apply_stream_line(
+    line: &str,
+    content: &mut String,
+    tool_calls: &mut BTreeMap<usize, PendingToolCall>,
+    on_content: &mut impl FnMut(String),
+) -> Result<bool> {
+    let Some(data) = line.strip_prefix("data:") else {
+        return Ok(false);
+    };
+    let data = data.trim();
+    if data.is_empty() {
+        return Ok(false);
+    }
+    if data == "[DONE]" {
+        return Ok(true);
+    }
+    apply_stream_delta(data, content, tool_calls, on_content)?;
+    Ok(false)
 }
 
 fn apply_stream_delta(
@@ -300,6 +330,41 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "read_config");
         assert_eq!(calls[0].function.arguments, r#"{"kind":"draft"}"#);
+        Ok(())
+    }
+
+    #[test]
+    fn stream_line_accepts_final_chunk_without_newline() -> Result<()> {
+        let mut content = String::new();
+        let mut tools = BTreeMap::new();
+        let mut streamed = String::new();
+
+        let done = apply_stream_line(
+            r#"data: {"choices":[{"delta":{"content":"last line"}}]}"#,
+            &mut content,
+            &mut tools,
+            &mut |part| streamed.push_str(&part),
+        )?;
+
+        assert!(!done);
+        assert_eq!(content, "last line");
+        assert_eq!(streamed, "last line");
+        Ok(())
+    }
+
+    #[test]
+    fn stream_line_detects_done_marker() -> Result<()> {
+        let mut content = String::new();
+        let mut tools = BTreeMap::new();
+        let mut streamed = String::new();
+
+        let done = apply_stream_line("data: [DONE]", &mut content, &mut tools, &mut |part| {
+            streamed.push_str(&part)
+        })?;
+
+        assert!(done);
+        assert!(content.is_empty());
+        assert!(streamed.is_empty());
         Ok(())
     }
 }

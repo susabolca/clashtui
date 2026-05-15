@@ -35,6 +35,7 @@ use crate::config::{
 };
 use crate::core;
 use crate::dns;
+use crate::llm::{LlmClient, LlmMessage};
 use crate::llm_providers;
 use crate::mihomo::{MihomoClient, ProxyGroup};
 use crate::port_allocator;
@@ -92,6 +93,7 @@ pub async fn run(paths: &Paths, config: &mut AppConfig) -> Result<()> {
         app.poll_subscription_profile_refresh();
         app.poll_proxy_log_refresh();
         app.poll_chat();
+        app.poll_assistant_test();
         app.start_proxy_log_refresh(paths, &draft);
         app.poll_runtime_command(paths, &draft).await;
         terminal
@@ -117,6 +119,7 @@ pub async fn run(paths: &Paths, config: &mut AppConfig) -> Result<()> {
         app.poll_subscription_profile_refresh();
         app.poll_proxy_log_refresh();
         app.poll_chat();
+        app.poll_assistant_test();
         app.poll_runtime_command(paths, &draft).await;
     }
 
@@ -832,6 +835,7 @@ enum ActionKind {
     Logs,
     RefreshRuntime,
     UpdateLlmProviders,
+    TestAssistant,
     UpdateCore,
     StartRuntime,
     StopRuntime,
@@ -943,6 +947,21 @@ struct RuntimeCommandTask {
 struct ChatTask {
     receiver: Receiver<AgentEvent>,
     handle: JoinHandle<()>,
+}
+
+struct AssistantTestTask {
+    receiver: Receiver<AssistantTestEvent>,
+    handle: JoinHandle<()>,
+    started_at: Instant,
+    response: String,
+    error: Option<String>,
+    finished: bool,
+}
+
+enum AssistantTestEvent {
+    Content(String),
+    Error(String),
+    Done,
 }
 
 #[derive(Default)]
@@ -1063,6 +1082,7 @@ struct ConfigApp {
     rule_group_selection: Option<RuleGroupSelection>,
     last_ip_info_refresh: Option<Instant>,
     chat: ChatState,
+    assistant_test: Option<AssistantTestTask>,
     status: String,
     should_quit: bool,
     dirty: bool,
@@ -1116,6 +1136,7 @@ impl ConfigApp {
             rule_group_selection: None,
             last_ip_info_refresh: None,
             chat: ChatState::default(),
+            assistant_test: None,
             status: String::new(),
             should_quit: false,
             dirty: false,
@@ -1469,6 +1490,94 @@ impl ConfigApp {
                 content: "assistant canceled".into(),
             });
             self.status = "Assistant canceled".into();
+        }
+    }
+
+    fn start_assistant_test(&mut self, paths: &Paths, config: &AppConfig) {
+        if self.assistant_test.is_some() {
+            self.status = "Assistant test is already running".into();
+            return;
+        }
+        let paths = paths.clone();
+        let config = config.clone();
+        let (sender, receiver) = mpsc::channel();
+        let handle = tokio::spawn(async move {
+            run_assistant_test_task(paths, config, sender).await;
+        });
+        self.assistant_test = Some(AssistantTestTask {
+            receiver,
+            handle,
+            started_at: Instant::now(),
+            response: String::new(),
+            error: None,
+            finished: false,
+        });
+        self.status = "Testing assistant connection".into();
+    }
+
+    fn poll_assistant_test(&mut self) {
+        let mut events = Vec::new();
+        let mut disconnected = false;
+        if let Some(task) = self.assistant_test.as_mut() {
+            loop {
+                match task.receiver.try_recv() {
+                    Ok(event) => events.push(event),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let Some(task) = self.assistant_test.as_mut() {
+            for event in events {
+                match event {
+                    AssistantTestEvent::Content(part) => {
+                        task.response.push_str(&part);
+                        self.status = "Assistant test streaming".into();
+                    }
+                    AssistantTestEvent::Error(message) => {
+                        task.error = Some(message);
+                        task.finished = true;
+                        self.status = "Assistant test failed".into();
+                    }
+                    AssistantTestEvent::Done => {
+                        task.finished = true;
+                        if task.error.is_none() {
+                            self.status = "Assistant test finished".into();
+                        }
+                    }
+                }
+            }
+
+            if disconnected {
+                task.finished = true;
+                if task.response.trim().is_empty() && task.error.is_none() {
+                    task.error = Some("assistant test stopped before returning output".into());
+                    self.status = "Assistant test failed".into();
+                }
+            }
+        }
+    }
+
+    fn assistant_test_finished(&self) -> bool {
+        self.assistant_test
+            .as_ref()
+            .is_some_and(|task| task.finished)
+    }
+
+    fn close_assistant_test(&mut self) {
+        if self.assistant_test_finished() {
+            self.assistant_test = None;
+        }
+    }
+
+    fn cancel_assistant_test(&mut self) {
+        if let Some(task) = self.assistant_test.take() {
+            task.handle.abort();
+            self.status = "Assistant test canceled".into();
         }
     }
 
@@ -2549,6 +2658,19 @@ async fn handle_key(
         return Ok(());
     }
 
+    if app.assistant_test.is_some() {
+        app.poll_assistant_test();
+        match key.code {
+            KeyCode::Esc if app.assistant_test_finished() => app.close_assistant_test(),
+            KeyCode::Enter | KeyCode::Char(' ') if app.assistant_test_finished() => {
+                app.close_assistant_test()
+            }
+            KeyCode::Esc => app.cancel_assistant_test(),
+            _ => {}
+        }
+        return Ok(());
+    }
+
     if app.dropdown.is_some() {
         return handle_dropdown_key(paths, config, app, key).await;
     }
@@ -2608,7 +2730,11 @@ async fn handle_paste(
     app: &mut ConfigApp,
     value: &str,
 ) -> Result<()> {
-    if app.runtime_command.is_some() || app.alert.is_some() || app.confirm.is_some() {
+    if app.runtime_command.is_some()
+        || app.alert.is_some()
+        || app.confirm.is_some()
+        || app.assistant_test.is_some()
+    {
         return Ok(());
     }
     let value = normalize_pasted_text(value);
@@ -2788,6 +2914,48 @@ fn apply_pending_chat_patch(config: &mut AppConfig, app: &mut ConfigApp) -> Resu
     } else {
         "Patch applied to draft; Save required".into()
     };
+    Ok(())
+}
+
+async fn run_assistant_test_task(
+    paths: Paths,
+    config: AppConfig,
+    sender: mpsc::Sender<AssistantTestEvent>,
+) {
+    if let Err(err) = run_assistant_test_inner(paths, config, &sender).await {
+        let _ = sender.send(AssistantTestEvent::Error(err.to_string()));
+    }
+    let _ = sender.send(AssistantTestEvent::Done);
+}
+
+async fn run_assistant_test_inner(
+    paths: Paths,
+    config: AppConfig,
+    sender: &mpsc::Sender<AssistantTestEvent>,
+) -> Result<()> {
+    let api_key = agent::resolve_api_key(&paths, &config).await?;
+    if config.llm.model.trim().is_empty() {
+        anyhow::bail!("LLM model is not configured");
+    }
+
+    let client = LlmClient::new(&config.llm.base_url, api_key);
+    let completion = client
+        .stream_chat_completion(
+            &config.llm.model,
+            &[
+                LlmMessage::system("Reply to the user's greeting in one short sentence."),
+                LlmMessage::user("hello"),
+            ],
+            &[],
+            |part| {
+                let _ = sender.send(AssistantTestEvent::Content(part));
+            },
+        )
+        .await?;
+
+    if completion.content.trim().is_empty() {
+        anyhow::bail!("assistant test returned an empty response");
+    }
     Ok(())
 }
 
@@ -3307,15 +3475,7 @@ async fn submit_runtime_item(
         RuntimeItem::LlmModel => app.open_llm_model_dropdown(config),
         RuntimeItem::LlmApiKey => begin_llm_api_key_input(app),
         RuntimeItem::LlmProvidersUpdate => update_llm_providers(paths, config, app)?,
-        RuntimeItem::TestAssistant => {
-            app.switch_section(Page::Chat);
-            let message = "Test the LLM connection briefly. Reply with one sentence and do not modify config.".to_string();
-            app.chat.entries.push(ChatEntry {
-                kind: ChatEntryKind::User,
-                content: message.clone(),
-            });
-            app.start_chat_agent(paths, config, message);
-        }
+        RuntimeItem::TestAssistant => app.start_assistant_test(paths, config),
     }
     Ok(())
 }
@@ -4649,6 +4809,9 @@ fn draw(frame: &mut Frame, paths: &Paths, config: &AppConfig, app: &ConfigApp) {
     if app.delay_check.is_some() {
         draw_delay_check(frame, app);
     }
+    if app.assistant_test.is_some() {
+        draw_assistant_test(frame, app);
+    }
     if app.runtime_command.is_some() {
         draw_runtime_command(frame, app);
     }
@@ -5671,7 +5834,7 @@ fn runtime_rows(paths: &Paths, config: &AppConfig, app: &ConfigApp) -> Vec<Setti
                 RuntimeItem::LlmModel => RowKind::Choice(ChoiceAction::LlmModel),
                 RuntimeItem::LlmApiKey => RowKind::Input(InputMode::LlmApiKey),
                 RuntimeItem::LlmProvidersUpdate => RowKind::Action(ActionKind::UpdateLlmProviders),
-                RuntimeItem::TestAssistant => RowKind::Action(ActionKind::RefreshRuntime),
+                RuntimeItem::TestAssistant => RowKind::Action(ActionKind::TestAssistant),
             };
             SettingRow {
                 label: item.label().into(),
@@ -5923,6 +6086,7 @@ fn row_is_function_action(row: &SettingRow) -> bool {
                 | ActionKind::Logs
                 | ActionKind::RefreshRuntime
                 | ActionKind::UpdateLlmProviders
+                | ActionKind::TestAssistant
                 | ActionKind::UpdateCore
                 | ActionKind::StartRuntime
                 | ActionKind::StopRuntime
@@ -5986,7 +6150,7 @@ const fn runtime_item_help(item: RuntimeItem) -> &'static str {
         RuntimeItem::LlmProvidersUpdate => {
             "Manually merge bundled provider updates while preserving local API keys and models."
         }
-        RuntimeItem::TestAssistant => "Open Chat and run a short assistant connection test.",
+        RuntimeItem::TestAssistant => "Send hello to the configured LLM and show the response.",
     }
 }
 
@@ -6494,8 +6658,9 @@ fn draw_chat_page(
         )),
         Line::from(""),
     ];
+    let transcript_width = left[0].width.saturating_sub(4) as usize;
     let visible = left[0].height.saturating_sub(4) as usize;
-    let lines = chat_transcript_lines(app, visible);
+    let lines = chat_transcript_lines(app, visible, transcript_width);
     if lines.is_empty() {
         transcript.extend([
             Line::from(
@@ -6512,13 +6677,13 @@ fn draw_chat_page(
     }
     frame.render_widget(bios_panel("Assistant", transcript), left[0]);
 
-    let mut input_lines = chat_input_lines(
-        app.chat.input.as_str(),
-        left[1].width.saturating_sub(4) as usize,
-        2,
-    );
+    let input_width = left[1].width.saturating_sub(4) as usize;
+    let mut input_lines = chat_input_lines(app.chat.input.as_str(), input_width, 2);
     input_lines.push(Line::from(Span::styled(
-        "Enter send | Ctrl+J newline | Esc cancel/back | Ctrl+S apply patch",
+        fit_width(
+            "Enter send | Ctrl+J newline | Esc cancel/back | Ctrl+S apply patch",
+            input_width,
+        ),
         Style::default().fg(Color::Gray),
     )));
     frame.render_widget(panel("Input", input_lines), left[1]);
@@ -6593,7 +6758,7 @@ fn draw_chat_page(
     frame.render_widget(bios_panel("Inspector", inspector), columns[1]);
 }
 
-fn chat_transcript_lines(app: &ConfigApp, visible: usize) -> Vec<Line<'static>> {
+fn chat_transcript_lines(app: &ConfigApp, visible: usize, width: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for entry in &app.chat.entries {
         let (label, style) = match entry.kind {
@@ -6607,11 +6772,10 @@ fn chat_transcript_lines(app: &ConfigApp, visible: usize) -> Vec<Line<'static>> 
             label,
             style.add_modifier(Modifier::BOLD),
         )));
-        for raw in entry.content.lines() {
-            lines.push(Line::from(Span::styled(format!("  {raw}"), style)));
-        }
         if entry.content.is_empty() {
             lines.push(Line::from(Span::styled("  ...", style)));
+        } else {
+            lines.extend(wrap_prefixed_lines(&entry.content, "  ", width, style));
         }
         lines.push(Line::from(""));
     }
@@ -6622,6 +6786,40 @@ fn chat_transcript_lines(app: &ConfigApp, visible: usize) -> Vec<Line<'static>> 
         .skip(start)
         .take(end.saturating_sub(start))
         .collect()
+}
+
+fn wrap_prefixed_lines(
+    value: &str,
+    prefix: &'static str,
+    width: usize,
+    style: Style,
+) -> Vec<Line<'static>> {
+    let prefix_width = prefix.chars().count();
+    let content_width = width.saturating_sub(prefix_width).max(1);
+    let mut lines = Vec::new();
+    for raw in value.split('\n') {
+        if raw.is_empty() {
+            lines.push(Line::from(Span::styled(prefix.to_string(), style)));
+            continue;
+        }
+
+        let mut current = String::new();
+        for ch in raw.chars() {
+            if current.chars().count() >= content_width {
+                lines.push(Line::from(Span::styled(
+                    format!("{prefix}{current}"),
+                    style,
+                )));
+                current.clear();
+            }
+            current.push(ch);
+        }
+        lines.push(Line::from(Span::styled(
+            format!("{prefix}{current}"),
+            style,
+        )));
+    }
+    lines
 }
 
 fn draw_dns_page(frame: &mut Frame, config: &AppConfig, app: &ConfigApp, area: Rect) {
@@ -7183,6 +7381,79 @@ fn draw_delay_check(frame: &mut Frame, app: &ConfigApp) {
     frame.render_widget(dialog_panel(lines), area);
 }
 
+fn draw_assistant_test(frame: &mut Frame, app: &ConfigApp) {
+    let Some(task) = &app.assistant_test else {
+        return;
+    };
+
+    let width = frame.area().width.saturating_sub(8).clamp(52, 88);
+    let message_width = width.saturating_sub(6) as usize;
+    let area = fixed_rect(width, 13, frame.area());
+    let body_limit = area.height.saturating_sub(7).max(1) as usize;
+    frame.render_widget(Clear, area);
+
+    let mut lines = vec![
+        popup_title_line("Test Assistant", area.width.saturating_sub(2)),
+        Line::from(""),
+    ];
+    if let Some(error) = &task.error {
+        lines.push(Line::from(Span::styled(
+            "Error",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
+        let body = limit_popup_lines(
+            wrap_prefixed_lines(error, "  ", message_width, Style::default().fg(Color::Red)),
+            body_limit,
+        );
+        lines.extend(body);
+    } else if task.response.is_empty() {
+        let spinner = runtime_command_spinner(task.started_at.elapsed());
+        lines.push(Line::from(format!("{spinner} sending hello...")).alignment(Alignment::Center));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "Response",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+        let body = limit_popup_lines(
+            wrap_prefixed_lines(
+                &task.response,
+                "  ",
+                message_width,
+                Style::default().fg(Color::White),
+            ),
+            body_limit,
+        );
+        lines.extend(body);
+    }
+
+    let action = if task.finished {
+        "Enter OK | Esc close"
+    } else {
+        "Esc cancel"
+    };
+    lines.extend([
+        Line::from(""),
+        Line::from(Span::styled(action, Style::default().fg(Color::Gray)))
+            .alignment(Alignment::Center),
+    ]);
+    frame.render_widget(dialog_panel(lines), area);
+}
+
+fn limit_popup_lines(mut lines: Vec<Line<'static>>, max_lines: usize) -> Vec<Line<'static>> {
+    if lines.len() <= max_lines {
+        return lines;
+    }
+    let tail = lines.split_off(lines.len().saturating_sub(max_lines.saturating_sub(1)));
+    std::iter::once(Line::from(Span::styled(
+        "  ...",
+        Style::default().fg(Color::DarkGray),
+    )))
+    .chain(tail)
+    .collect()
+}
+
 fn draw_runtime_command(frame: &mut Frame, app: &ConfigApp) {
     let Some(task) = &app.runtime_command else {
         return;
@@ -7314,29 +7585,26 @@ fn chat_input_lines(value: &str, width: usize, rows: usize) -> Vec<Line<'static>
     let width = width.max(1);
     let prompt = if width > 1 { "> " } else { ">" };
     let body_width = width.saturating_sub(prompt.chars().count()).max(1);
-    let visible_rows = wrapped_input_segments(value, body_width)
-        .len()
-        .min(rows)
-        .max(1);
-    let wrapped = wrapped_input_lines(value, body_width, rows);
+    let body_lines = input_editor_lines(value, value.len(), body_width, rows);
 
-    wrapped
+    body_lines
         .into_iter()
-        .take(visible_rows)
         .enumerate()
-        .map(|(index, line)| {
+        .map(|(index, mut line)| {
             if index == 0 {
-                Line::from(vec![
+                line.spans.insert(
+                    0,
                     Span::styled(
                         prompt.to_string(),
                         Style::default()
                             .fg(Color::Cyan)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::raw(line),
-                ])
+                );
+                line
             } else {
-                Line::from(vec![Span::raw("  "), Span::raw(line)])
+                line.spans.insert(0, Span::raw("  "));
+                line
             }
         })
         .collect()
@@ -10929,7 +11197,13 @@ mod tests {
         let lines = chat_input_lines("hello", 20, 2);
         let rendered = lines.iter().map(line_text).collect::<Vec<_>>();
 
-        assert_eq!(rendered, vec!["> hello".to_string()]);
+        assert_eq!(rendered, vec!["> hello ".to_string(), "  ".to_string()]);
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .any(|span| span.style.bg == Some(Color::White))
+        );
     }
 
     #[test]
@@ -10937,7 +11211,70 @@ mod tests {
         let lines = chat_input_lines("one\ntwo", 20, 2);
         let rendered = lines.iter().map(line_text).collect::<Vec<_>>();
 
-        assert_eq!(rendered, vec!["> one".to_string(), "  two".to_string()]);
+        assert_eq!(rendered, vec!["> one".to_string(), "  two ".to_string()]);
+    }
+
+    #[test]
+    fn chat_input_keeps_cursor_visible_in_two_rows() {
+        let lines = chat_input_lines("one\ntwo\nthree", 20, 2);
+        let rendered = lines.iter().map(line_text).collect::<Vec<_>>();
+
+        assert_eq!(rendered, vec!["> …two".to_string(), "  three ".to_string()]);
+        assert!(
+            lines[1]
+                .spans
+                .iter()
+                .any(|span| span.style.bg == Some(Color::White))
+        );
+    }
+
+    #[test]
+    fn chat_transcript_wraps_before_visible_window_is_applied() {
+        let mut app = ConfigApp::new(&AppConfig::default());
+        app.chat.entries.push(ChatEntry {
+            kind: ChatEntryKind::Assistant,
+            content: "abcdefghijklmnopqrstuvwxyz".into(),
+        });
+
+        let rendered = chat_transcript_lines(&app, 10, 12)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            rendered,
+            vec![
+                "assistant".to_string(),
+                "  abcdefghij".to_string(),
+                "  klmnopqrst".to_string(),
+                "  uvwxyz".to_string(),
+                String::new(),
+            ]
+        );
+    }
+
+    #[test]
+    fn chat_transcript_preserves_trailing_stream_newline() {
+        let mut app = ConfigApp::new(&AppConfig::default());
+        app.chat.entries.push(ChatEntry {
+            kind: ChatEntryKind::Assistant,
+            content: "line\n".into(),
+        });
+
+        let rendered = chat_transcript_lines(&app, 10, 20)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            rendered,
+            vec![
+                "assistant".to_string(),
+                "  line".to_string(),
+                "  ".to_string(),
+                String::new(),
+            ]
+        );
     }
 
     #[test]
