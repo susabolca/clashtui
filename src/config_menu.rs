@@ -6642,7 +6642,7 @@ fn draw_chat_page(
 ) {
     let columns = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(64), Constraint::Percentage(36)])
+        .constraints([Constraint::Percentage(66), Constraint::Percentage(34)])
         .split(area);
     let left = Layout::default()
         .direction(Direction::Vertical)
