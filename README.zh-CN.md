@@ -39,6 +39,13 @@ cargo build --release
 target/release/clashtui config
 ```
 
+TUI 默认使用英语。需要简体中文 UI 和 assistant 回复时，可以使用 `--language zh-CN`。
+专业术语会尽量保留英文，例如 LLM、Runtime、DNS、TUN、Provider、Model、Base URL、Port Proxy 和 mihomo：
+
+```bash
+target/release/clashtui --language zh-CN config
+```
+
 启动后台 runtime：
 
 ```bash
@@ -239,6 +246,11 @@ target/release/clashtui service-uninstall
 - `Tab` / `Left` / `Right`：在 section root 上切换页面。
 - `F9`：确认后加载默认值。
 - `F10`：确认后保存并重启。
+
+语言：
+
+- `--language en`：英语 UI 和 assistant 偏好。这是默认值。
+- `--language zh-CN`：简体中文 UI 和 assistant 偏好，专业术语会在更清晰时保持英文。
 
 ## 配置文件
 

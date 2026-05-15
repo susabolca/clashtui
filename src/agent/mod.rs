@@ -12,6 +12,7 @@ use tokio::process::Command;
 use tokio::time::{Duration, timeout};
 
 use crate::config::{AppConfig, Paths};
+use crate::i18n::Language;
 use crate::llm::{LlmClient, LlmMessage, LlmToolCall, LlmToolSpec, LlmToolSpecFunction};
 use crate::llm_providers;
 use crate::mihomo::MihomoClient;
@@ -36,9 +37,10 @@ pub async fn run_agent(
     paths: Paths,
     config: AppConfig,
     user_message: String,
+    language: Language,
     sender: Sender<AgentEvent>,
 ) {
-    if let Err(err) = run_agent_inner(paths, config, user_message, &sender).await {
+    if let Err(err) = run_agent_inner(paths, config, user_message, language, &sender).await {
         let _ = sender.send(AgentEvent::Error(err.to_string()));
     }
     let _ = sender.send(AgentEvent::Done);
@@ -48,6 +50,7 @@ async fn run_agent_inner(
     paths: Paths,
     config: AppConfig,
     user_message: String,
+    language: Language,
     sender: &Sender<AgentEvent>,
 ) -> Result<()> {
     let api_key = resolve_api_key(&paths, &config).await?;
@@ -57,7 +60,7 @@ async fn run_agent_inner(
 
     let client = LlmClient::new(&config.llm.base_url, api_key);
     let mut messages = vec![
-        LlmMessage::system(system_prompt(&user_message)),
+        LlmMessage::system(system_prompt(&user_message, language)),
         LlmMessage::user(format!(
             "Runtime snapshot:\n{}\n\nUser request:\n{}",
             runtime_snapshot(&paths, &config),
@@ -167,12 +170,13 @@ pub fn api_key_status(paths: &Paths, config: &AppConfig) -> String {
     }
 }
 
-fn system_prompt(user_message: &str) -> String {
+fn system_prompt(user_message: &str, language: Language) -> String {
     let docs = knowledge::select_docs(user_message);
     format!(
         r"You are the native clashtui configuration assistant.
 
 Rules:
+- {}
 - Help the user operate clashtui and understand mihomo behavior.
 - Use tools for current facts instead of guessing.
 - clashtui does not proxy traffic itself; mihomo does.
@@ -186,6 +190,7 @@ Rules:
 Bundled domain knowledge:
 
 {}",
+        language.assistant_rule(),
         knowledge::render_docs(&docs)
     )
 }

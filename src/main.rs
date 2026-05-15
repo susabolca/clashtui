@@ -5,6 +5,7 @@ mod config_menu;
 mod core;
 mod daemon;
 mod dns;
+mod i18n;
 mod llm;
 mod llm_providers;
 mod mihomo;
@@ -22,6 +23,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use crate::config::{AppConfig, Paths};
+use crate::i18n::Language;
 use crate::mihomo::MihomoClient;
 
 #[derive(Parser, Debug)]
@@ -39,11 +41,36 @@ struct Cli {
     #[arg(long, global = true)]
     verbose: bool,
 
+    /// UI and assistant language.
+    #[arg(long, global = true, value_enum, default_value = "en")]
+    language: Language,
+
     #[arg(long, hide = true)]
     daemon_run: bool,
 
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_language_defaults_to_english() -> Result<()> {
+        let cli = Cli::try_parse_from(["clashtui", "config"])?;
+
+        assert_eq!(cli.language, Language::En);
+        Ok(())
+    }
+
+    #[test]
+    fn cli_accepts_zh_cn_language() -> Result<()> {
+        let cli = Cli::try_parse_from(["clashtui", "--language", "zh-CN", "config"])?;
+
+        assert_eq!(cli.language, Language::ZhCn);
+        Ok(())
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -142,7 +169,7 @@ async fn main() -> Result<()> {
             .await
         }
         Some(Command::Status) => daemon::status(&paths, &config, &client, cli.verbose).await,
-        Some(Command::Config) => config_menu::run(&paths, &mut config).await,
+        Some(Command::Config) => config_menu::run(&paths, &mut config, cli.language).await,
         Some(Command::WriteSingleRuntimeConfig) => {
             let path = runtime_profile::write_single_runtime_config(&paths, &config).await?;
             println!("{}", path.display());

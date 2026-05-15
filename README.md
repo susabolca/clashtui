@@ -48,6 +48,14 @@ Open the setup UI:
 target/release/clashtui config
 ```
 
+The TUI defaults to English. Use `--language zh-CN` for Simplified Chinese UI
+and assistant replies while keeping technical terms such as LLM, Runtime, DNS,
+TUN, Provider, Model, Base URL, Port Proxy, and mihomo unchanged:
+
+```bash
+target/release/clashtui --language zh-CN config
+```
+
 Start the background runtime:
 
 ```bash
@@ -289,6 +297,12 @@ Common keys:
 - `Tab` / `Left` / `Right`: switch sections when at a section root.
 - `F9`: load defaults after confirmation.
 - `F10`: save and restart after confirmation.
+
+Language:
+
+- `--language en`: English UI and assistant preference. This is the default.
+- `--language zh-CN`: Simplified Chinese UI and assistant preference, with
+  technical terms kept in English where that is clearer.
 
 ## Config Files
 

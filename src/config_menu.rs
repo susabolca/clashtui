@@ -35,6 +35,7 @@ use crate::config::{
 };
 use crate::core;
 use crate::dns;
+use crate::i18n::Language;
 use crate::llm::{LlmClient, LlmMessage};
 use crate::llm_providers;
 use crate::mihomo::{MihomoClient, ProxyGroup};
@@ -69,7 +70,7 @@ const TOP_JOINT: char = '┬';
 const BOTTOM_JOINT: char = '┴';
 const CHAT_INPUT_WIDTH: usize = 6_000;
 
-pub async fn run(paths: &Paths, config: &mut AppConfig) -> Result<()> {
+pub async fn run(paths: &Paths, config: &mut AppConfig, language: Language) -> Result<()> {
     paths.ensure().await?;
     let provider_warning = llm_providers::init_from_file(&paths.llm_providers_file);
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
@@ -79,7 +80,7 @@ pub async fn run(paths: &Paths, config: &mut AppConfig) -> Result<()> {
 
     let mut draft = config.clone();
     let mut terminal = TerminalGuard::enter()?;
-    let mut app = ConfigApp::new(&draft);
+    let mut app = ConfigApp::new_with_language(&draft, language);
     if let Some(warning) = provider_warning {
         app.status = warning;
     }
@@ -174,6 +175,30 @@ impl Page {
     }
 
     const fn title(self) -> &'static str {
+        self.title_for(Language::En)
+    }
+
+    const fn title_for(self, language: Language) -> &'static str {
+        if language.is_zh_cn() {
+            return match self {
+                Self::Main => "主页",
+                Self::Subscription => "订阅",
+                Self::SubscriptionDetail => "订阅详情",
+                Self::SubscriptionRuleGroups => "Rule Groups",
+                Self::SubscriptionProxies => "Proxies",
+                Self::SubscriptionRules => "Rules",
+                Self::AddSubscription => "添加订阅",
+                Self::Runtime => "Runtime",
+                Self::Chat => "Chat",
+                Self::Exit => "退出",
+                Self::ProxyConfig => "Proxy",
+                Self::ProxyConnections => "Connections",
+                Self::ProxyLogs => "Logs",
+                Self::ProxyGroups => "Proxy Groups",
+                Self::Mode => "Mode",
+                Self::Dns => "DNS",
+            };
+        }
         match self {
             Self::Main => "Main",
             Self::Subscription => "Subscription",
@@ -257,6 +282,28 @@ impl RuntimeItem {
     ];
 
     const fn label(self) -> &'static str {
+        self.label_for(Language::En)
+    }
+
+    const fn label_for(self, language: Language) -> &'static str {
+        if language.is_zh_cn() {
+            return match self {
+                Self::Service => "Service",
+                Self::Autostart => "自启动",
+                Self::Logs => "Logs",
+                Self::CorePath => "Mihomo Core",
+                Self::CoreUpdate => "更新 Core",
+                Self::Controller => "Controller",
+                Self::Refresh => "刷新 Runtime",
+                Self::LlmSection => "LLM",
+                Self::LlmProvider => "LLM Provider",
+                Self::LlmBaseUrl => "LLM Base URL",
+                Self::LlmModel => "LLM Model",
+                Self::LlmApiKey => "LLM API Key",
+                Self::LlmProvidersUpdate => "更新 LLM Providers",
+                Self::TestAssistant => "Test Assistant",
+            };
+        }
         match self {
             Self::Service => "Service",
             Self::Autostart => "Autostart",
@@ -315,6 +362,27 @@ impl ExitItem {
     ];
 
     const fn label(self) -> &'static str {
+        self.label_for(Language::En)
+    }
+
+    const fn label_for(self, language: Language) -> &'static str {
+        if language.is_zh_cn() {
+            return match self {
+                Self::RuntimeSection => "Runtime",
+                Self::StartRuntime => "启动",
+                Self::StopRuntime => "停止",
+                Self::ReloadRuntime => "Reload",
+                Self::RestartRuntime => "重启",
+                Self::SaveSection => "保存",
+                Self::SaveConfig => "保存",
+                Self::SaveRestart => "保存并重启",
+                Self::SaveRestartExit => "保存、重启并退出",
+                Self::ExitSection => "退出",
+                Self::ExitWithoutSaving => "不保存退出",
+                Self::LoadDefaults => "加载默认值",
+                Self::Exit => "退出",
+            };
+        }
         match self {
             Self::RuntimeSection => "Runtime",
             Self::StartRuntime => "Start",
@@ -349,6 +417,27 @@ impl ExitItem {
     }
 
     const fn help(self) -> &'static str {
+        self.help_for(Language::En)
+    }
+
+    const fn help_for(self, language: Language) -> &'static str {
+        if language.is_zh_cn() {
+            return match self {
+                Self::RuntimeSection => "Runtime 操作使用磁盘上已保存的 config。",
+                Self::StartRuntime => "启动 clashtui daemon 和 mihomo Runtime。",
+                Self::StopRuntime => "停止 clashtui 管理的 Runtime。",
+                Self::ReloadRuntime => "用已保存的 config reload mihomo，不停止进程。",
+                Self::RestartRuntime => "使用已保存的 config 重启 Runtime。",
+                Self::SaveSection => "先保存当前 config 修改的操作。",
+                Self::SaveConfig => "保存 config 修改，不重启 Runtime。",
+                Self::SaveRestart => "保存 config 并重启当前 clashtui Runtime。",
+                Self::SaveRestartExit => "保存 config、重启 Runtime，然后关闭 TUI。",
+                Self::ExitSection => "关闭 config UI 或重置默认值。",
+                Self::ExitWithoutSaving => "丢弃未保存修改并关闭 TUI。",
+                Self::LoadDefaults => "确认后加载 setup 默认值。",
+                Self::Exit => "立即关闭 config UI，不再确认。",
+            };
+        }
         match self {
             Self::RuntimeSection => "Runtime operations use the saved config on disk.",
             Self::StartRuntime => "Start the clashtui daemon and mihomo runtime.",
@@ -495,6 +584,24 @@ impl DnsItem {
     ];
 
     const fn label(self) -> &'static str {
+        self.label_for(Language::En)
+    }
+
+    const fn label_for(self, language: Language) -> &'static str {
+        if language.is_zh_cn() {
+            return match self {
+                Self::Enabled => "DNS",
+                Self::Listen => "Listen",
+                Self::LanDomains => "LAN Domains",
+                Self::LanNameserver => "LAN DNS",
+                Self::NameserverPolicy => "DNS Policy",
+                Self::DirectNameserver => "Direct DNS",
+                Self::DirectFollowPolicy => "Direct 跟随 policy",
+                Self::Nameserver => "Default DNS",
+                Self::Fallback => "Fallback DNS",
+                Self::FakeIpFilter => "Fake-IP Filter",
+            };
+        }
         match self {
             Self::Enabled => "DNS",
             Self::Listen => "Listen",
@@ -558,6 +665,34 @@ enum InputFocus {
 
 impl InputMode {
     const fn title(self) -> &'static str {
+        self.title_for(Language::En)
+    }
+
+    const fn title_for(self, language: Language) -> &'static str {
+        if language.is_zh_cn() {
+            return match self {
+                Self::Normal => "",
+                Self::SubscriptionName => "订阅名称",
+                Self::SubscriptionUrl => "订阅 URL",
+                Self::CorePath => "Mihomo Core 路径",
+                Self::Controller => "Controller URL",
+                Self::LlmBaseUrl => "LLM Base URL",
+                Self::LlmModel => "LLM Model",
+                Self::LlmApiKey => "LLM API Key",
+                Self::MixedPort => "Mixed Port",
+                Self::HttpPort => "HTTP Port",
+                Self::SocksPort => "SOCKS Port",
+                Self::ServicePort => "Port Proxy Port",
+                Self::DnsListen => "DNS Listen",
+                Self::DnsLanDomains => "LAN Domains",
+                Self::DnsLanNameserver => "LAN DNS",
+                Self::DnsNameserverPolicy => "DNS Policy",
+                Self::DnsDirectNameserver => "Direct DNS",
+                Self::DnsNameserver => "Default DNS",
+                Self::DnsFallback => "Fallback DNS",
+                Self::DnsFakeIpFilter => "Fake-IP Filter",
+            };
+        }
         match self {
             Self::Normal => "",
             Self::SubscriptionName => "Subscription Name",
@@ -722,6 +857,20 @@ enum ConfirmAction {
 
 impl ConfirmAction {
     const fn title(self) -> &'static str {
+        self.title_for(Language::En)
+    }
+
+    const fn title_for(self, language: Language) -> &'static str {
+        if language.is_zh_cn() {
+            return match self {
+                Self::ExitWithoutSaving => "不保存退出？",
+                Self::LoadDefaults => "加载默认设置？",
+                Self::SaveRestart => "保存并重启？",
+                Self::SaveRestartExit => "保存、重启并退出？",
+                Self::DeleteSubscription => "删除订阅？",
+                Self::DeletePortProxy => "删除 Port Proxy？",
+            };
+        }
         match self {
             Self::ExitWithoutSaving => "Exit Without Saving?",
             Self::LoadDefaults => "Load Setup Defaults?",
@@ -733,6 +882,26 @@ impl ConfirmAction {
     }
 
     const fn message(self) -> &'static [&'static str] {
+        self.message_for(Language::En)
+    }
+
+    const fn message_for(self, language: Language) -> &'static [&'static str] {
+        if language.is_zh_cn() {
+            return match self {
+                Self::ExitWithoutSaving => &[
+                    "不保存当前修改，直接退出 ClashTUI Config？",
+                    "未保存的修改会被丢弃。",
+                ],
+                Self::LoadDefaults => &[
+                    "加载可配置字段的 setup 默认值？",
+                    "此操作在当前 preview 中尚未实现。",
+                ],
+                Self::SaveRestart => &["保存 config 并立即重启 mihomo？"],
+                Self::SaveRestartExit => &["保存 config、重启 mihomo，然后退出？"],
+                Self::DeleteSubscription => &["删除此订阅？"],
+                Self::DeletePortProxy => &["删除此 Port Proxy？"],
+            };
+        }
         match self {
             Self::ExitWithoutSaving => &[
                 "Exit ClashTUI Config without saving pending changes?",
@@ -750,6 +919,20 @@ impl ConfirmAction {
     }
 
     const fn yes_label(self) -> &'static str {
+        self.yes_label_for(Language::En)
+    }
+
+    const fn yes_label_for(self, language: Language) -> &'static str {
+        if language.is_zh_cn() {
+            return match self {
+                Self::ExitWithoutSaving => "确认退出",
+                Self::LoadDefaults => "确认加载",
+                Self::SaveRestart => "确认保存并重启",
+                Self::SaveRestartExit => "确认保存重启并退出",
+                Self::DeleteSubscription => "确认删除",
+                Self::DeletePortProxy => "确认删除",
+            };
+        }
         match self {
             Self::ExitWithoutSaving => "Yes, Exit",
             Self::LoadDefaults => "Yes, Load Defaults",
@@ -1040,6 +1223,7 @@ enum DelayCheckEvent {
 }
 
 struct ConfigApp {
+    language: Language,
     page: Page,
     section: Page,
     history: Vec<Location>,
@@ -1093,7 +1277,12 @@ struct ConfigApp {
 
 impl ConfigApp {
     fn new(config: &AppConfig) -> Self {
+        Self::new_with_language(config, Language::En)
+    }
+
+    fn new_with_language(config: &AppConfig, language: Language) -> Self {
         Self {
+            language,
             page: Page::Main,
             section: Page::Main,
             history: Vec::new(),
@@ -1381,21 +1570,27 @@ impl ConfigApp {
 
     fn start_chat_agent(&mut self, paths: &Paths, config: &AppConfig, message: String) {
         if self.chat.task.is_some() {
-            self.status = "Assistant is already running".into();
+            self.status = text(
+                self.language,
+                "Assistant is already running",
+                "Assistant 正在运行",
+            )
+            .into();
             return;
         }
         let paths = paths.clone();
         let config = config.clone();
+        let language = self.language;
         let (sender, receiver) = mpsc::channel();
         let handle = tokio::spawn(async move {
-            agent::run_agent(paths, config, message, sender).await;
+            agent::run_agent(paths, config, message, language, sender).await;
         });
         self.chat.task = Some(ChatTask { receiver, handle });
         self.chat.entries.push(ChatEntry {
             kind: ChatEntryKind::Assistant,
             content: String::new(),
         });
-        self.status = "Assistant thinking".into();
+        self.status = text(self.language, "Assistant thinking", "Assistant 思考中").into();
     }
 
     fn poll_chat(&mut self) {
@@ -1438,7 +1633,7 @@ impl ConfigApp {
                 if let Some(entry) = self.chat.entries.last_mut() {
                     entry.content.push_str(&part);
                 }
-                self.status = "Assistant streaming".into();
+                self.status = text(self.language, "Assistant streaming", "Assistant 输出中").into();
             }
             AgentEvent::Tool(message) => {
                 self.chat.entries.push(ChatEntry {
@@ -1461,7 +1656,12 @@ impl ConfigApp {
                         }
                     ),
                 });
-                self.status = "Patch ready; Ctrl+S applies to draft".into();
+                self.status = text(
+                    self.language,
+                    "Patch ready; Ctrl+S applies to draft",
+                    "Patch 已就绪；Ctrl+S 应用到 draft",
+                )
+                .into();
             }
             AgentEvent::Error(message) => {
                 self.chat.entries.push(ChatEntry {
@@ -1474,9 +1674,14 @@ impl ConfigApp {
             AgentEvent::Done => {
                 self.chat.task = None;
                 self.status = if self.chat.pending_patch.is_some() {
-                    "Patch ready; Ctrl+S applies to draft".into()
+                    text(
+                        self.language,
+                        "Patch ready; Ctrl+S applies to draft",
+                        "Patch 已就绪；Ctrl+S 应用到 draft",
+                    )
+                    .into()
                 } else {
-                    "Assistant done".into()
+                    text(self.language, "Assistant done", "Assistant 已完成").into()
                 };
             }
         }
@@ -1487,22 +1692,28 @@ impl ConfigApp {
             task.handle.abort();
             self.chat.entries.push(ChatEntry {
                 kind: ChatEntryKind::Tool,
-                content: "assistant canceled".into(),
+                content: text(self.language, "assistant canceled", "assistant 已取消").into(),
             });
-            self.status = "Assistant canceled".into();
+            self.status = text(self.language, "Assistant canceled", "Assistant 已取消").into();
         }
     }
 
     fn start_assistant_test(&mut self, paths: &Paths, config: &AppConfig) {
         if self.assistant_test.is_some() {
-            self.status = "Assistant test is already running".into();
+            self.status = text(
+                self.language,
+                "Assistant test is already running",
+                "Assistant test 正在运行",
+            )
+            .into();
             return;
         }
         let paths = paths.clone();
         let config = config.clone();
+        let language = self.language;
         let (sender, receiver) = mpsc::channel();
         let handle = tokio::spawn(async move {
-            run_assistant_test_task(paths, config, sender).await;
+            run_assistant_test_task(paths, config, language, sender).await;
         });
         self.assistant_test = Some(AssistantTestTask {
             receiver,
@@ -1512,7 +1723,12 @@ impl ConfigApp {
             error: None,
             finished: false,
         });
-        self.status = "Testing assistant connection".into();
+        self.status = text(
+            self.language,
+            "Testing assistant connection",
+            "正在测试 Assistant 连接",
+        )
+        .into();
     }
 
     fn poll_assistant_test(&mut self) {
@@ -1536,17 +1752,32 @@ impl ConfigApp {
                 match event {
                     AssistantTestEvent::Content(part) => {
                         task.response.push_str(&part);
-                        self.status = "Assistant test streaming".into();
+                        self.status = text(
+                            self.language,
+                            "Assistant test streaming",
+                            "Assistant test 输出中",
+                        )
+                        .into();
                     }
                     AssistantTestEvent::Error(message) => {
                         task.error = Some(message);
                         task.finished = true;
-                        self.status = "Assistant test failed".into();
+                        self.status = text(
+                            self.language,
+                            "Assistant test failed",
+                            "Assistant test 失败",
+                        )
+                        .into();
                     }
                     AssistantTestEvent::Done => {
                         task.finished = true;
                         if task.error.is_none() {
-                            self.status = "Assistant test finished".into();
+                            self.status = text(
+                                self.language,
+                                "Assistant test finished",
+                                "Assistant test 已完成",
+                            )
+                            .into();
                         }
                     }
                 }
@@ -1555,8 +1786,20 @@ impl ConfigApp {
             if disconnected {
                 task.finished = true;
                 if task.response.trim().is_empty() && task.error.is_none() {
-                    task.error = Some("assistant test stopped before returning output".into());
-                    self.status = "Assistant test failed".into();
+                    task.error = Some(
+                        text(
+                            self.language,
+                            "assistant test stopped before returning output",
+                            "assistant test 在返回内容前停止",
+                        )
+                        .into(),
+                    );
+                    self.status = text(
+                        self.language,
+                        "Assistant test failed",
+                        "Assistant test 失败",
+                    )
+                    .into();
                 }
             }
         }
@@ -1577,7 +1820,12 @@ impl ConfigApp {
     fn cancel_assistant_test(&mut self) {
         if let Some(task) = self.assistant_test.take() {
             task.handle.abort();
-            self.status = "Assistant test canceled".into();
+            self.status = text(
+                self.language,
+                "Assistant test canceled",
+                "Assistant test 已取消",
+            )
+            .into();
         }
     }
 
@@ -2142,7 +2390,11 @@ impl ConfigApp {
         self.dropdown = None;
         if let Some(location) = self.history.pop() {
             self.restore_location(location);
-            self.status = format!("Back to {}", self.page.title());
+            self.status = if self.language.is_zh_cn() {
+                format!("返回 {}", self.page.title_for(self.language))
+            } else {
+                format!("Back to {}", self.page.title())
+            };
             return true;
         }
         false
@@ -2156,7 +2408,7 @@ impl ConfigApp {
             self.open_confirm(ConfirmAction::ExitWithoutSaving);
         } else {
             self.switch_section(Page::Exit);
-            self.status = "Choose an exit action".into();
+            self.status = text(self.language, "Choose an exit action", "选择一个退出操作").into();
         }
     }
 
@@ -2177,7 +2429,12 @@ impl ConfigApp {
             return;
         }
         if !self.can_switch_sections() {
-            self.status = "Back to section root before switching sections".into();
+            self.status = text(
+                self.language,
+                "Back to section root before switching sections",
+                "切换 section 前请先返回 section root",
+            )
+            .into();
             return;
         }
         self.section = section;
@@ -2203,12 +2460,17 @@ impl ConfigApp {
             && (self.rule_group_selection.is_some()
                 || proxy_groups_page_is_global_proxy_list(config, self))
         {
-            self.status = "Select a proxy, then press Enter".into();
+            self.status = text(
+                self.language,
+                "Select a proxy, then press Enter",
+                "选择一个 proxy，然后按 Enter",
+            )
+            .into();
         } else if self.page == Page::ProxyGroups && self.proxy_pane == ProxyPane::Groups {
             self.proxy_pane = ProxyPane::Proxies;
             self.selected_proxy =
                 current_proxy_index(self.current_group(config)).unwrap_or_default();
-            self.status = "Proxy pane: Proxies".into();
+            self.status = text(self.language, "Proxy pane: Proxies", "Proxy pane: Proxies").into();
         } else {
             self.next_page();
         }
@@ -2219,10 +2481,15 @@ impl ConfigApp {
             && (self.rule_group_selection.is_some()
                 || proxy_groups_page_is_global_proxy_list(config, self))
         {
-            self.status = "Select a proxy, then press Enter".into();
+            self.status = text(
+                self.language,
+                "Select a proxy, then press Enter",
+                "选择一个 proxy，然后按 Enter",
+            )
+            .into();
         } else if self.page == Page::ProxyGroups && self.proxy_pane == ProxyPane::Proxies {
             self.proxy_pane = ProxyPane::Groups;
-            self.status = "Proxy pane: Groups".into();
+            self.status = text(self.language, "Proxy pane: Groups", "Proxy pane: Groups").into();
         } else {
             self.prev_page();
         }
@@ -2440,31 +2707,56 @@ impl ConfigApp {
     fn open_subscription_dropdown(&mut self, config: &AppConfig) {
         self.dropdown = Some(Dropdown::ProxySubscription);
         self.selected_dropdown = proxy_subscription_index(config, self).unwrap_or_default();
-        self.status = "Choose subscription, then press Enter".into();
+        self.status = text(
+            self.language,
+            "Choose subscription, then press Enter",
+            "选择订阅，然后按 Enter",
+        )
+        .into();
     }
 
     fn open_mode_dropdown(&mut self, config: &AppConfig) {
         self.dropdown = Some(Dropdown::Mode);
         self.selected_dropdown = mode_index(proxy_mode(config, self));
-        self.status = "Choose mode, then press Enter".into();
+        self.status = text(
+            self.language,
+            "Choose mode, then press Enter",
+            "选择 Mode，然后按 Enter",
+        )
+        .into();
     }
 
     fn open_core_source_dropdown(&mut self, config: &AppConfig) {
         self.dropdown = Some(Dropdown::CoreSource);
         self.selected_dropdown = core_source_index(core::selected_core_source(config));
-        self.status = "Choose mihomo core, then press Enter".into();
+        self.status = text(
+            self.language,
+            "Choose mihomo core, then press Enter",
+            "选择 mihomo core，然后按 Enter",
+        )
+        .into();
     }
 
     fn open_llm_provider_dropdown(&mut self, config: &AppConfig) {
         self.dropdown = Some(Dropdown::LlmProvider);
         self.selected_dropdown = llm_provider_index(&config.llm.provider);
-        self.status = "Choose LLM provider, then press Enter".into();
+        self.status = text(
+            self.language,
+            "Choose LLM provider, then press Enter",
+            "选择 LLM provider，然后按 Enter",
+        )
+        .into();
     }
 
     fn open_llm_model_dropdown(&mut self, config: &AppConfig) {
         self.dropdown = Some(Dropdown::LlmModel);
         self.selected_dropdown = llm_model_index(config);
-        self.status = "Choose LLM model, then press Enter".into();
+        self.status = text(
+            self.language,
+            "Choose LLM model, then press Enter",
+            "选择 LLM model，然后按 Enter",
+        )
+        .into();
     }
 
     fn open_subscription_refresh_dropdown(&mut self, config: &AppConfig) {
@@ -2476,12 +2768,17 @@ impl ConfigApp {
             self.subscription_form.refresh
         };
         self.selected_dropdown = subscription_refresh_index(refresh);
-        self.status = "Choose refresh interval, then press Enter".into();
+        self.status = text(
+            self.language,
+            "Choose refresh interval, then press Enter",
+            "选择刷新间隔，然后按 Enter",
+        )
+        .into();
     }
 
     fn close_dropdown(&mut self) {
         self.dropdown = None;
-        self.status = "Canceled".into();
+        self.status = text(self.language, "Canceled", "已取消").into();
     }
 
     fn dropdown_item_count(&self, config: &AppConfig) -> usize {
@@ -2590,13 +2887,17 @@ impl ConfigApp {
     fn open_confirm(&mut self, action: ConfirmAction) {
         self.confirm = Some(action);
         self.confirm_yes = false;
-        self.status = format!("Confirm: {}", action.title());
+        self.status = if self.language.is_zh_cn() {
+            format!("确认：{}", action.title_for(self.language))
+        } else {
+            format!("Confirm: {}", action.title())
+        };
     }
 
     fn cancel_confirm(&mut self) {
         self.confirm = None;
         self.confirm_yes = false;
-        self.status = "Canceled".into();
+        self.status = text(self.language, "Canceled", "已取消").into();
     }
 
     fn set_confirm_choice(&mut self, yes: bool) {
@@ -2881,12 +3182,17 @@ fn push_chat_input(app: &mut ConfigApp, value: &str) {
 
 fn send_chat_message(paths: &Paths, config: &AppConfig, app: &mut ConfigApp) {
     if app.chat.task.is_some() {
-        app.status = "Assistant is still running".into();
+        app.status = text(
+            app.language,
+            "Assistant is still running",
+            "Assistant 仍在运行",
+        )
+        .into();
         return;
     }
     let message = app.chat.input.trim().to_string();
     if message.is_empty() {
-        app.status = "Type a message first".into();
+        app.status = text(app.language, "Type a message first", "请先输入消息").into();
         return;
     }
     app.chat.input.clear();
@@ -2899,7 +3205,7 @@ fn send_chat_message(paths: &Paths, config: &AppConfig, app: &mut ConfigApp) {
 
 fn apply_pending_chat_patch(config: &mut AppConfig, app: &mut ConfigApp) -> Result<()> {
     let Some(patch) = app.chat.pending_patch.take() else {
-        app.status = "No pending patch".into();
+        app.status = text(app.language, "No pending patch", "没有待应用的 patch").into();
         return Ok(());
     };
     let updated = agent::apply_config_patch(config, &patch)?;
@@ -2910,9 +3216,19 @@ fn apply_pending_chat_patch(config: &mut AppConfig, app: &mut ConfigApp) -> Resu
         content: format!("Applied to draft: {}", patch.summary),
     });
     app.status = if patch.restart_required {
-        "Patch applied to draft; Save & Restart required".into()
+        text(
+            app.language,
+            "Patch applied to draft; Save & Restart required",
+            "Patch 已应用到 draft；需要 Save & Restart",
+        )
+        .into()
     } else {
-        "Patch applied to draft; Save required".into()
+        text(
+            app.language,
+            "Patch applied to draft; Save required",
+            "Patch 已应用到 draft；需要 Save",
+        )
+        .into()
     };
     Ok(())
 }
@@ -2920,9 +3236,10 @@ fn apply_pending_chat_patch(config: &mut AppConfig, app: &mut ConfigApp) -> Resu
 async fn run_assistant_test_task(
     paths: Paths,
     config: AppConfig,
+    language: Language,
     sender: mpsc::Sender<AssistantTestEvent>,
 ) {
-    if let Err(err) = run_assistant_test_inner(paths, config, &sender).await {
+    if let Err(err) = run_assistant_test_inner(paths, config, language, &sender).await {
         let _ = sender.send(AssistantTestEvent::Error(err.to_string()));
     }
     let _ = sender.send(AssistantTestEvent::Done);
@@ -2931,6 +3248,7 @@ async fn run_assistant_test_task(
 async fn run_assistant_test_inner(
     paths: Paths,
     config: AppConfig,
+    language: Language,
     sender: &mpsc::Sender<AssistantTestEvent>,
 ) -> Result<()> {
     let api_key = agent::resolve_api_key(&paths, &config).await?;
@@ -2943,7 +3261,11 @@ async fn run_assistant_test_inner(
         .stream_chat_completion(
             &config.llm.model,
             &[
-                LlmMessage::system("Reply to the user's greeting in one short sentence."),
+                LlmMessage::system(text(
+                    language,
+                    "Reply to the user's greeting in one short sentence. Keep technical terms unchanged.",
+                    "用一句简短中文回复用户问候，保留专业术语。",
+                )),
                 LlmMessage::user("hello"),
             ],
             &[],
@@ -4825,9 +5147,9 @@ fn draw_header(frame: &mut Frame, app: &ConfigApp, area: Rect, separator_column:
         let active = page == app.section;
         tabs.push(Span::styled(
             if active {
-                format!("[ {} ]", page.title())
+                format!("[ {} ]", page.title_for(app.language))
             } else {
-                format!(" {} ", page.title())
+                format!(" {} ", page.title_for(app.language))
             },
             tab_style(active),
         ));
@@ -5295,13 +5617,13 @@ fn setting_rows(paths: &Paths, config: &AppConfig, app: &ConfigApp) -> Vec<Setti
         Page::AddSubscription => add_subscription_rows(app),
         Page::Runtime => runtime_rows(paths, config, app),
         Page::Chat => chat_rows(config, app),
-        Page::Exit => exit_rows(),
+        Page::Exit => exit_rows(app.language),
         Page::ProxyConfig => proxy_config_rows(config, app),
         Page::ProxyConnections => compact_setting_rows(proxy_connection_rows(config, app)),
         Page::ProxyLogs => compact_setting_rows(proxy_log_rows(paths, config, app)),
         Page::ProxyGroups => proxy_group_rows(paths, config, app),
         Page::Mode => mode_rows(config, app),
-        Page::Dns => dns_rows(config),
+        Page::Dns => dns_rows(config, app.language),
     }
 }
 
@@ -5837,16 +6159,16 @@ fn runtime_rows(paths: &Paths, config: &AppConfig, app: &ConfigApp) -> Vec<Setti
                 RuntimeItem::TestAssistant => RowKind::Action(ActionKind::TestAssistant),
             };
             SettingRow {
-                label: item.label().into(),
+                label: item.label_for(app.language).into(),
                 value: runtime_item_value(paths, config, app, *item),
-                help: runtime_item_help(*item).into(),
+                help: runtime_item_help(*item, app.language).into(),
                 kind,
             }
         })
         .collect()
 }
 
-fn dns_rows(config: &AppConfig) -> Vec<SettingRow> {
+fn dns_rows(config: &AppConfig, language: Language) -> Vec<SettingRow> {
     DnsItem::ALL
         .iter()
         .map(|item| {
@@ -5863,9 +6185,9 @@ fn dns_rows(config: &AppConfig) -> Vec<SettingRow> {
                 DnsItem::FakeIpFilter => RowKind::Input(InputMode::DnsFakeIpFilter),
             };
             SettingRow {
-                label: item.label().into(),
+                label: item.label_for(language).into(),
                 value: dns_item_value(config, *item),
-                help: dns_item_help(*item).into(),
+                help: dns_item_help(*item, language).into(),
                 kind,
             }
         })
@@ -5878,8 +6200,18 @@ fn chat_rows(config: &AppConfig, app: &ConfigApp) -> Vec<SettingRow> {
             label: "Assistant".into(),
             value: chat_session_status(app).into(),
             help: format!(
-                "Native chat assistant using {} with bundled clashtui/mihomo knowledge.",
-                config.llm.model
+                "{} {} {}",
+                text(
+                    app.language,
+                    "Native chat assistant using",
+                    "内置 chat assistant 使用"
+                ),
+                config.llm.model,
+                text(
+                    app.language,
+                    "with bundled clashtui/mihomo knowledge.",
+                    "和内置 clashtui/mihomo knowledge。"
+                )
             ),
             kind: RowKind::Info,
         },
@@ -5912,13 +6244,13 @@ fn chat_session_status(app: &ConfigApp) -> &'static str {
     }
 }
 
-fn exit_rows() -> Vec<SettingRow> {
+fn exit_rows(language: Language) -> Vec<SettingRow> {
     ExitItem::ALL
         .iter()
         .map(|item| SettingRow {
-            label: item.label().into(),
+            label: item.label_for(language).into(),
             value: item.value().into(),
-            help: item.help().into(),
+            help: item.help_for(language).into(),
             kind: match item {
                 ExitItem::RuntimeSection | ExitItem::SaveSection | ExitItem::ExitSection => {
                     RowKind::Section
@@ -6129,7 +6461,31 @@ fn required_value(value: &str) -> String {
     }
 }
 
-const fn runtime_item_help(item: RuntimeItem) -> &'static str {
+const fn text(language: Language, en: &'static str, zh_cn: &'static str) -> &'static str {
+    if language.is_zh_cn() { zh_cn } else { en }
+}
+
+const fn runtime_item_help(item: RuntimeItem, language: Language) -> &'static str {
+    if language.is_zh_cn() {
+        return match item {
+            RuntimeItem::Service => "安装或检查 TUN 使用的 privileged Service。",
+            RuntimeItem::Autostart => "从 config 切换登录自启动。",
+            RuntimeItem::Logs => "打开 Runtime logs；此功能尚未完成。",
+            RuntimeItem::CorePath => "选择 auto、托管 Mihomo release、托管 alpha 或自定义路径。",
+            RuntimeItem::CoreUpdate => "下载当前选择的托管 Mihomo core；重启后生效。",
+            RuntimeItem::Controller => "clashtui 使用的 mihomo external controller URL。",
+            RuntimeItem::Refresh => "从 mihomo 刷新 Runtime 信息。",
+            RuntimeItem::LlmSection => "LLM assistant endpoint、model、key 和 provider catalog。",
+            RuntimeItem::LlmProvider => "选择 OpenAI-compatible assistant endpoint preset。",
+            RuntimeItem::LlmBaseUrl => "assistant chat/completions endpoint 的 Base URL。",
+            RuntimeItem::LlmModel => "发送给 OpenAI-compatible endpoint 的 Model 名称。",
+            RuntimeItem::LlmApiKey => "粘贴 API key；会保存到 llm-providers.yaml。",
+            RuntimeItem::LlmProvidersUpdate => {
+                "手动合并内置 provider 更新，并保留本地 API key 和 models。"
+            }
+            RuntimeItem::TestAssistant => "向当前 LLM 发送 hello，并显示 response 或错误。",
+        };
+    }
     match item {
         RuntimeItem::Service => "Install or inspect the privileged service used by TUN.",
         RuntimeItem::Autostart => "Toggle login autostart from config.",
@@ -6589,7 +6945,7 @@ fn draw_runtime_menu(
         .iter()
         .map(|item| {
             ListItem::new(Line::from(vec![
-                Span::raw(format!("{:<18}", item.label())),
+                Span::raw(format!("{:<18}", item.label_for(app.language))),
                 Span::styled(
                     runtime_item_value(paths, config, app, *item),
                     Style::default().fg(Color::Gray),
@@ -6601,7 +6957,10 @@ fn draw_runtime_menu(
     let mut state = ListState::default();
     state.select(Some(app.selected_runtime));
     let list = List::new(items)
-        .block(focused_block("Runtime Menu", true))
+        .block(focused_block(
+            text(app.language, "Runtime Menu", "Runtime 菜单"),
+            true,
+        ))
         .highlight_symbol(">> ")
         .highlight_style(
             Style::default()
@@ -6613,8 +6972,16 @@ fn draw_runtime_menu(
 
 fn draw_runtime_help(frame: &mut Frame, config: &AppConfig, app: &ConfigApp, area: Rect) {
     let lines = vec![
-        Line::from("Runtime contains non-proxy operational settings."),
-        Line::from("Proxy mode and server selection live on each Proxy config page."),
+        Line::from(text(
+            app.language,
+            "Runtime contains non-proxy operational settings.",
+            "Runtime 包含非 proxy 的运行设置。",
+        )),
+        Line::from(text(
+            app.language,
+            "Proxy mode and server selection live on each Proxy config page.",
+            "Proxy mode 和 server selection 在各 Proxy config 页面中设置。",
+        )),
         Line::from(""),
         Line::from(format!("Core: {}", core_source_value(config))),
         Line::from(format!("Controller: {}", config.controller.url)),
@@ -6627,10 +6994,21 @@ fn draw_runtime_help(frame: &mut Frame, config: &AppConfig, app: &ConfigApp, are
             app.runtime.error.as_deref().unwrap_or("online")
         )),
         Line::from(""),
-        Line::from("Service and TUN permission installers are planned."),
-        Line::from("Enter opens editable items where available."),
+        Line::from(text(
+            app.language,
+            "Service and TUN permission installers are planned.",
+            "Service 和 TUN 权限安装器仍在规划中。",
+        )),
+        Line::from(text(
+            app.language,
+            "Enter opens editable items where available.",
+            "可编辑项目可按 Enter 打开。",
+        )),
     ];
-    frame.render_widget(bios_panel("Runtime Help", lines), area);
+    frame.render_widget(
+        bios_panel(text(app.language, "Runtime Help", "Runtime 帮助"), lines),
+        area,
+    );
 }
 
 fn draw_chat_page(
@@ -6663,14 +7041,28 @@ fn draw_chat_page(
     let lines = chat_transcript_lines(app, visible, transcript_width);
     if lines.is_empty() {
         transcript.extend([
-            Line::from(
+            Line::from(text(
+                app.language,
                 "Ask about proxy, DNS, TUN, subscriptions, runtime logs, or config changes.",
-            ),
+                "可以询问 proxy、DNS、TUN、订阅、Runtime logs 或 config 修改。",
+            )),
             Line::from(""),
-            Line::from("Examples:"),
-            Line::from("  Explain why TUN is unavailable"),
-            Line::from("  Add a SOCKS5 Port Proxy on 7081 using HK-01"),
-            Line::from("  Make +.taobao.net resolve through 30.30.30.30"),
+            Line::from(text(app.language, "Examples:", "示例:")),
+            Line::from(text(
+                app.language,
+                "  Explain why TUN is unavailable",
+                "  解释为什么 TUN 不可用",
+            )),
+            Line::from(text(
+                app.language,
+                "  Add a SOCKS5 Port Proxy on 7081 using HK-01",
+                "  添加一个使用 HK-01 的 SOCKS5 Port Proxy，端口 7081",
+            )),
+            Line::from(text(
+                app.language,
+                "  Make +.taobao.net resolve through 30.30.30.30",
+                "  让 +.taobao.net 通过 30.30.30.30 解析",
+            )),
         ]);
     } else {
         transcript.extend(lines);
@@ -6681,7 +7073,11 @@ fn draw_chat_page(
     let mut input_lines = chat_input_lines(app.chat.input.as_str(), input_width, 2);
     input_lines.push(Line::from(Span::styled(
         fit_width(
-            "Enter send | Ctrl+J newline | Esc cancel/back | Ctrl+S apply patch",
+            text(
+                app.language,
+                "Enter send | Ctrl+J newline | Esc cancel/back | Ctrl+S apply patch",
+                "Enter 发送 | Ctrl+J 换行 | Esc 取消/返回 | Ctrl+S 应用 patch",
+            ),
             input_width,
         ),
         Style::default().fg(Color::Gray),
@@ -6699,11 +7095,11 @@ fn draw_chat_page(
         Line::from(format!(
             "Status: {}",
             if app.chat.task.is_some() {
-                "running"
+                text(app.language, "running", "运行中")
             } else if app.chat.pending_patch.is_some() {
-                "patch ready"
+                text(app.language, "patch ready", "patch 就绪")
             } else {
-                "idle"
+                text(app.language, "idle", "空闲")
             }
         )),
         Line::from(format!(
@@ -6755,7 +7151,10 @@ fn draw_chat_page(
             Line::from("Discard: Ctrl+D"),
         ]);
     }
-    frame.render_widget(bios_panel("Inspector", inspector), columns[1]);
+    frame.render_widget(
+        bios_panel(text(app.language, "Inspector", "检查器"), inspector),
+        columns[1],
+    );
 }
 
 fn chat_transcript_lines(app: &ConfigApp, visible: usize, width: usize) -> Vec<Line<'static>> {
@@ -6836,7 +7235,7 @@ fn draw_dns_menu(frame: &mut Frame, config: &AppConfig, app: &ConfigApp, area: R
         .iter()
         .map(|item| {
             ListItem::new(Line::from(vec![
-                Span::raw(format!("{:<24}", item.label())),
+                Span::raw(format!("{:<24}", item.label_for(app.language))),
                 Span::styled(
                     dns_item_value(config, *item),
                     Style::default().fg(Color::Gray),
@@ -6848,7 +7247,10 @@ fn draw_dns_menu(frame: &mut Frame, config: &AppConfig, app: &ConfigApp, area: R
     let mut state = ListState::default();
     state.select(Some(app.selected_dns));
     let list = List::new(items)
-        .block(focused_block("DNS Menu", true))
+        .block(focused_block(
+            text(app.language, "DNS Menu", "DNS 菜单"),
+            true,
+        ))
         .highlight_symbol(">> ")
         .highlight_style(
             Style::default()
@@ -6863,25 +7265,39 @@ fn draw_dns_help(frame: &mut Frame, config: &AppConfig, app: &ConfigApp, area: R
     let policy = dns::effective_nameserver_policy(&config.dns);
     let lines = vec![
         Line::from(Span::styled(
-            item.label(),
+            item.label_for(app.language),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from(dns_item_help(item)),
+        Line::from(dns_item_help(item, app.language)),
         Line::from(""),
-        Line::from("List values are comma separated."),
+        Line::from(text(
+            app.language,
+            "List values are comma separated.",
+            "列表值使用逗号分隔。",
+        )),
         Line::from("Policy format: +.example.com=1.1.1.1, 8.8.8.8"),
-        Line::from("Use system for the OS resolver, or IP/DoH/DoT servers."),
+        Line::from(text(
+            app.language,
+            "Use system for the OS resolver, or IP/DoH/DoT servers.",
+            "可使用 system 表示 OS resolver，也可填写 IP/DoH/DoT servers。",
+        )),
         Line::from(""),
-        Line::from(format!("Effective policy entries: {}", policy.len())),
+        Line::from(if app.language.is_zh_cn() {
+            format!("生效 policy 条目: {}", policy.len())
+        } else {
+            format!("Effective policy entries: {}", policy.len())
+        }),
         Line::from(format!(
-            "Configured policy: {}",
+            "{}: {}",
+            text(app.language, "Configured policy", "已配置 policy"),
             compact_nameserver_policy(&config.dns.nameserver_policy)
         )),
         Line::from(format!(
-            "LAN domains: {}",
+            "{}: {}",
+            text(app.language, "LAN domains", "LAN domains"),
             compact_list(&config.dns.lan_domains)
         )),
         Line::from(format!(
@@ -6889,13 +7305,25 @@ fn draw_dns_help(frame: &mut Frame, config: &AppConfig, app: &ConfigApp, area: R
             compact_list(&config.dns.lan_nameserver)
         )),
         Line::from(format!(
-            "Effective fake-IP filter: {}",
+            "{}: {}",
+            text(
+                app.language,
+                "Effective fake-IP filter",
+                "生效 fake-IP filter"
+            ),
             dns::effective_fake_ip_filter(&config.dns).len()
         )),
         Line::from(""),
-        Line::from("Typical LAN DNS: system, 192.168.0.1"),
+        Line::from(text(
+            app.language,
+            "Typical LAN DNS: system, 192.168.0.1",
+            "常见 LAN DNS: system, 192.168.0.1",
+        )),
     ];
-    frame.render_widget(panel("DNS Help", lines), area);
+    frame.render_widget(
+        panel(text(app.language, "DNS Help", "DNS 帮助"), lines),
+        area,
+    );
 }
 
 fn draw_footer(frame: &mut Frame, app: &ConfigApp, area: Rect, separator_column: u16) {
@@ -6921,7 +7349,10 @@ fn draw_input(frame: &mut Frame, app: &ConfigApp) {
         app.input.clone()
     };
     let mut body = vec![
-        popup_title_line(app.input_mode.title(), area.width.saturating_sub(2)),
+        popup_title_line(
+            app.input_mode.title_for(app.language),
+            area.width.saturating_sub(2),
+        ),
         Line::from(""),
     ];
     body.extend(input_box_lines(
@@ -6945,10 +7376,13 @@ fn draw_input(frame: &mut Frame, app: &ConfigApp) {
 
 fn input_action_line(app: &ConfigApp) -> Line<'static> {
     Line::from(vec![
-        Span::styled(" Save ", button_style(app.input_focus == InputFocus::Save)),
+        Span::styled(
+            text(app.language, " Save ", " 保存 "),
+            button_style(app.input_focus == InputFocus::Save),
+        ),
         Span::raw("  "),
         Span::styled(
-            " Cancel ",
+            text(app.language, " Cancel ", " 取消 "),
             button_style(app.input_focus == InputFocus::Cancel),
         ),
     ])
@@ -6957,14 +7391,30 @@ fn input_action_line(app: &ConfigApp) -> Line<'static> {
 
 fn input_help_text(app: &ConfigApp) -> &'static str {
     if app.input_focus != InputFocus::Editor {
-        return "Enter/Space activate | Tab switch | Esc cancel";
+        return text(
+            app.language,
+            "Enter/Space activate | Tab switch | Esc cancel",
+            "Enter/Space 执行 | Tab 切换 | Esc 取消",
+        );
     }
     if is_number_input(app.input_mode) {
-        "Edit value | Up/Down change | Tab buttons | Ctrl+S save | Esc cancel"
+        text(
+            app.language,
+            "Edit value | Up/Down change | Tab buttons | Ctrl+S save | Esc cancel",
+            "编辑数值 | Up/Down 调整 | Tab 按钮 | Ctrl+S 保存 | Esc 取消",
+        )
     } else if is_multiline_input(app.input_mode) {
-        "Enter newline | Tab buttons | Ctrl+S save | Esc cancel"
+        text(
+            app.language,
+            "Enter newline | Tab buttons | Ctrl+S save | Esc cancel",
+            "Enter 换行 | Tab 按钮 | Ctrl+S 保存 | Esc 取消",
+        )
     } else {
-        "Edit value | Tab buttons | Ctrl+S save | Esc cancel"
+        text(
+            app.language,
+            "Edit value | Tab buttons | Ctrl+S save | Esc cancel",
+            "编辑内容 | Tab 按钮 | Ctrl+S 保存 | Esc 取消",
+        )
     }
 }
 
@@ -7273,13 +7723,19 @@ fn draw_confirm(frame: &mut Frame, app: &ConfigApp) {
     let area = fixed_rect(42, 6, frame.area());
     frame.render_widget(Clear, area);
     let lines = vec![
-        popup_title_line(action.title(), area.width.saturating_sub(2)),
+        popup_title_line(action.title_for(app.language), area.width.saturating_sub(2)),
         Line::from(""),
         Line::from(vec![
             Span::raw("          "),
-            Span::styled(" No ", button_style(!app.confirm_yes)),
+            Span::styled(
+                text(app.language, " No ", " 否 "),
+                button_style(!app.confirm_yes),
+            ),
             Span::raw("              "),
-            Span::styled(" Yes ", button_style(app.confirm_yes)),
+            Span::styled(
+                text(app.language, " Yes ", " 是 "),
+                button_style(app.confirm_yes),
+            ),
         ]),
     ];
     frame.render_widget(dialog_panel(lines), area);
@@ -7393,7 +7849,10 @@ fn draw_assistant_test(frame: &mut Frame, app: &ConfigApp) {
     frame.render_widget(Clear, area);
 
     let mut lines = vec![
-        popup_title_line("Test Assistant", area.width.saturating_sub(2)),
+        popup_title_line(
+            text(app.language, "Test Assistant", "Test Assistant"),
+            area.width.saturating_sub(2),
+        ),
         Line::from(""),
     ];
     if let Some(error) = &task.error {
@@ -7408,7 +7867,13 @@ fn draw_assistant_test(frame: &mut Frame, app: &ConfigApp) {
         lines.extend(body);
     } else if task.response.is_empty() {
         let spinner = runtime_command_spinner(task.started_at.elapsed());
-        lines.push(Line::from(format!("{spinner} sending hello...")).alignment(Alignment::Center));
+        lines.push(
+            Line::from(format!(
+                "{spinner} {}",
+                text(app.language, "sending hello...", "发送 hello...")
+            ))
+            .alignment(Alignment::Center),
+        );
     } else {
         lines.push(Line::from(Span::styled(
             "Response",
@@ -7429,9 +7894,13 @@ fn draw_assistant_test(frame: &mut Frame, app: &ConfigApp) {
     }
 
     let action = if task.finished {
-        "Enter OK | Esc close"
+        text(
+            app.language,
+            "Enter OK | Esc close",
+            "Enter 确定 | Esc 关闭",
+        )
     } else {
-        "Esc cancel"
+        text(app.language, "Esc cancel", "Esc 取消")
     };
     lines.extend([
         Line::from(""),
@@ -7894,8 +8363,8 @@ fn status_bar_line(app: &ConfigApp, width: u16) -> Line<'static> {
 fn breadcrumb(app: &ConfigApp) -> String {
     app.history
         .iter()
-        .map(|location| location.page.title())
-        .chain(std::iter::once(app.page.title()))
+        .map(|location| location.page.title_for(app.language))
+        .chain(std::iter::once(app.page.title_for(app.language)))
         .collect::<Vec<_>>()
         .join(" / ")
 }
@@ -8754,7 +9223,23 @@ fn dns_item_value(config: &AppConfig, item: DnsItem) -> String {
     }
 }
 
-const fn dns_item_help(item: DnsItem) -> &'static str {
+const fn dns_item_help(item: DnsItem, language: Language) -> &'static str {
+    if language.is_zh_cn() {
+        return match item {
+            DnsItem::Enabled => "启用或关闭 mihomo 内置 DNS。",
+            DnsItem::Listen => "mihomo DNS 本地监听地址。默认避开 Clash Verge 的 1053。",
+            DnsItem::LanDomains => "应使用 LAN DNS 且跳过 fake IP 的 domain patterns。",
+            DnsItem::LanNameserver => "LAN domains 使用的 DNS servers。可用 system 或 router DNS。",
+            DnsItem::NameserverPolicy => {
+                "按 domain 指定 DNS policy，例如 +.taobao.net=30.30.30.30。"
+            }
+            DnsItem::DirectNameserver => "DIRECT 出站流量使用的 DNS servers。",
+            DnsItem::DirectFollowPolicy => "开启后，DIRECT DNS 也会遵循 nameserver-policy。",
+            DnsItem::Nameserver => "普通域名解析使用的默认 DNS servers。",
+            DnsItem::Fallback => "污染或海外结果的备用 DNS servers。",
+            DnsItem::FakeIpFilter => "应返回真实 IP 而不是 fake IP 的 domain patterns。",
+        };
+    }
     match item {
         DnsItem::Enabled => "Enable or disable mihomo built-in DNS.",
         DnsItem::Listen => "Local mihomo DNS listen address. Default avoids Clash Verge 1053.",
@@ -11128,7 +11613,7 @@ mod tests {
             .nameserver_policy
             .insert("+.taobao.net".into(), vec!["30.30.30.30".into()]);
 
-        let rows = dns_rows(&config);
+        let rows = dns_rows(&config, Language::En);
         let policy_row = rows
             .iter()
             .find(|row| row.label == "DNS Policy")
@@ -11212,6 +11697,20 @@ mod tests {
         let rendered = lines.iter().map(line_text).collect::<Vec<_>>();
 
         assert_eq!(rendered, vec!["> one".to_string(), "  two ".to_string()]);
+    }
+
+    #[test]
+    fn zh_cn_language_keeps_terms_and_translates_actions() -> Result<()> {
+        let paths = test_paths("zh-cn-runtime-labels")?;
+        let config = AppConfig::default();
+        let app = ConfigApp::new_with_language(&config, Language::ZhCn);
+        let rows = runtime_rows(&paths, &config, &app);
+
+        assert!(rows.iter().any(|row| row.label == "刷新 Runtime"));
+        assert!(rows.iter().any(|row| row.label == "LLM Provider"));
+        assert_eq!(Page::Subscription.title_for(Language::ZhCn), "订阅");
+        assert_eq!(Page::Runtime.title_for(Language::ZhCn), "Runtime");
+        Ok(())
     }
 
     #[test]
@@ -11308,7 +11807,7 @@ mod tests {
 
     #[test]
     fn exit_rows_expose_function_actions_without_f11() {
-        let rows = exit_rows();
+        let rows = exit_rows(Language::En);
         assert!(matches!(
             rows.first().map(|row| row.kind),
             Some(RowKind::Section)
