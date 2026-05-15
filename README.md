@@ -140,6 +140,58 @@ curl -x http://127.0.0.1:7071 -I https://www.gstatic.com/generate_204
 curl -x http://127.0.0.1:7072 -I https://www.gstatic.com/generate_204
 ```
 
+## AI Assistant
+
+The `Chat` page is a native OpenAI-compatible assistant built into clashtui.
+It is not an external Claude Code/Codex session. It uses the provider, base URL,
+model, and API key configured under `Runtime` -> `LLM`.
+
+What the assistant can do:
+
+- Stream answers in the `Chat` page for runtime explanation, config questions,
+  and troubleshooting.
+- Use `Test Assistant` from the Runtime LLM section to send a small `hello`
+  request and show either the streamed response or the error in a popup.
+- Read the current draft config with secrets redacted.
+- Inspect generated mihomo runtime files such as `mihomo-run.yaml` and
+  `mihomo-active.yaml`.
+- Read bounded tails from clashtui and mihomo logs.
+- Query the mihomo controller for version, config, and proxy group summaries.
+- Run bounded HTTP probes directly or through a configured proxy URL.
+- Run only allowlisted read-only diagnostic commands such as `ping`, `dig`,
+  `nslookup`, `ip`, `route`, `netstat`, `lsof`, `ps`, and similar tools.
+- Propose validated structured draft config patches. The user must still apply
+  the patch in Chat and then choose Save or Save & Restart; the assistant does
+  not save, restart, or edit generated runtime files automatically.
+
+The assistant has bundled local knowledge for clashtui and mihomo, including
+runtime generation, config semantics, patch rules, the mihomo config spec, DNS,
+TUN, system proxy behavior, subscriptions, Port Proxy listeners, LLM providers,
+and troubleshooting. It is designed to work from local project knowledge,
+runtime state, logs, and explicit probes. It does not provide a general remote
+web-search tool.
+
+LLM configuration is local:
+
+- `Runtime` -> `LLM Provider` selects a bundled or custom provider preset.
+- `Runtime` -> `LLM Base URL` and `Runtime` -> `LLM Model` can override the
+  selected preset.
+- `Runtime` -> `LLM API Key` saves the key into the local
+  `llm-providers.yaml`.
+- Model IDs are simple strings. Selecting a custom model appends it to the
+  local provider catalog.
+- `Runtime` -> `Update LLM Providers` manually merges the bundled provider
+  catalog into the local file while preserving API keys, custom model IDs, and
+  custom providers.
+
+China-region provider presets distinguish normal pay-as-you-go APIs from
+coding-plan endpoints when providers expose separate base URLs, models, keys,
+or quota pools. For example, Kimi Platform and Kimi Code, Qwen DashScope and
+Qwen Coding Plan, Volcengine Ark and Ark Coding Plan, Baidu Qianfan and Qianfan
+Coding Plan, and GLM normal/coding endpoints are treated as separate presets.
+When debugging authentication, quota, or model-not-found errors, check the
+provider preset, base URL, model ID, and API key source together.
+
 ## Multiple Port Proxy Listeners
 
 Port Proxy is the main reason to use clashtui when one local proxy port is not
@@ -222,6 +274,7 @@ Sections:
 
 - `Main`: runtime summary, Global Proxy, Port Proxy list, Add Port Proxy.
 - `Subscription`: subscription list, profile cache, usage, expiry, refresh.
+- `DNS`: mihomo DNS settings, nameservers, fallback, fake-IP, and policies.
 - `Runtime`: service, autostart, logs, mihomo core, controller, LLM settings,
   and manual LLM provider catalog updates.
 - `Chat`: LLM-assisted config, runtime explanation, troubleshooting, and draft
@@ -243,6 +296,7 @@ User config lives outside the repository:
 
 ```text
 ~/.config/clashtui/config.yaml
+~/.config/clashtui/llm-providers.yaml
 ~/.config/clashtui/profiles/
 ~/.config/clashtui/cores/
 ~/.config/clashtui/mihomo-run.yaml

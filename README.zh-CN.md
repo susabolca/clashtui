@@ -124,6 +124,36 @@ curl -x http://127.0.0.1:7071 -I https://www.gstatic.com/generate_204
 curl -x http://127.0.0.1:7072 -I https://www.gstatic.com/generate_204
 ```
 
+## AI Assistant
+
+`Chat` 页面是 clashtui 内置的 OpenAI-compatible assistant，不是外部 Claude
+Code/Codex session。它使用 `Runtime` -> `LLM` 分区中配置的 provider、base
+URL、model 和 API key。
+
+assistant 可以做的事：
+
+- 在 `Chat` 页面流式回答运行时解释、配置问题和故障排查。
+- 通过 Runtime LLM 分区里的 `Test Assistant` 发送一个小的 `hello` 请求，并在 popup 中显示流式 response 或错误。
+- 读取当前 draft config，并对 secret 做隐藏处理。
+- 检查生成的 mihomo runtime 文件，例如 `mihomo-run.yaml` 和 `mihomo-active.yaml`。
+- 读取有限行数的 clashtui/mihomo 日志尾部。
+- 查询 mihomo controller，获取 version、config 和 proxy group 摘要。
+- 直接或通过指定 proxy URL 执行有限的 HTTP probe。
+- 只运行 allowlist 中的只读诊断命令，例如 `ping`、`dig`、`nslookup`、`ip`、`route`、`netstat`、`lsof`、`ps` 等。
+- 生成经过验证的结构化 draft config patch。用户仍然需要在 Chat 中确认应用 patch，然后手动 Save 或 Save & Restart；assistant 不会自动保存、重启，也不会直接编辑生成的 runtime 文件。
+
+assistant 内置了 clashtui 和 mihomo 的本地知识，包括 runtime 生成逻辑、配置语义、patch 规则、mihomo config spec、DNS、TUN、系统代理、订阅、Port Proxy、LLM provider 和故障排查说明。它主要基于本地知识、当前 runtime 状态、日志和显式 probe 工作；当前没有通用的远程网页搜索工具。
+
+LLM 配置保存在本地：
+
+- `Runtime` -> `LLM Provider` 选择内置或自定义 provider preset。
+- `Runtime` -> `LLM Base URL` 和 `Runtime` -> `LLM Model` 可以覆盖所选 preset。
+- `Runtime` -> `LLM API Key` 会把 key 保存到本地 `llm-providers.yaml`。
+- Model ID 是普通字符串；输入自定义 model 后会追加到本地 provider catalog。
+- `Runtime` -> `Update LLM Providers` 由用户手动执行，会把当前二进制内置的 provider catalog 合并到本地文件，同时保留 API key、自定义 model ID 和自定义 provider。
+
+面向中国地区的 provider preset 会区分普通按量 API 和 coding plan endpoint。部分供应商的 coding plan 有独立 base URL、model、key 或额度池，例如 Kimi Platform/Kimi Code、Qwen DashScope/Qwen Coding Plan、Volcengine Ark/Ark Coding Plan、Baidu Qianfan/Qianfan Coding Plan、GLM normal/coding endpoint 都会作为不同 preset 处理。排查鉴权、额度或 model-not-found 问题时，需要同时检查 provider preset、base URL、model ID 和 API key 来源。
+
 ## 多 Port Proxy
 
 当一个本地代理端口不够用时，Port Proxy 是 clashtui 的核心使用场景。每个服务暴露一个 HTTP、SOCKS5 或 mixed listener，并且可以使用不同订阅或不同节点。
@@ -196,6 +226,7 @@ target/release/clashtui service-uninstall
 
 - `Main`：运行时摘要、Global Proxy、Port Proxy 列表、Add Port Proxy。
 - `Subscription`：订阅列表、profile 缓存、流量、到期时间、刷新状态。
+- `DNS`：mihomo DNS、nameserver、fallback、fake-IP 和策略配置。
 - `Runtime`：service、自启动、日志、mihomo core、controller、LLM 设置，以及手动 LLM provider catalog 更新。
 - `Chat`：LLM 辅助配置、运行时解释、问题排查和 draft patch 确认。
 - `Exit`：保存、start、stop、reload、restart、默认值和退出动作。
@@ -215,6 +246,7 @@ target/release/clashtui service-uninstall
 
 ```text
 ~/.config/clashtui/config.yaml
+~/.config/clashtui/llm-providers.yaml
 ~/.config/clashtui/profiles/
 ~/.config/clashtui/cores/
 ~/.config/clashtui/mihomo-run.yaml
