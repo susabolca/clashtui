@@ -65,6 +65,50 @@ cargo run -- start
 cargo run -- status
 ```
 
+## 如何开发
+
+环境要求：
+
+- 安装 Rust toolchain 和 Cargo。
+- 完整的 service/TUN 开发需要 macOS 或 Linux。普通配置界面、状态检查和用户态 runtime 流程不需要安装 privileged service。
+- 准备一个 mihomo 二进制，可以在 TUI 中配置，也可以通过 `MIHOMO_CORE` 指定，或者让 clashtui 下载托管 core。
+
+常用本地检查：
+
+```bash
+cargo fmt --check
+cargo clippy --all-targets
+cargo test
+```
+
+开发时可以直接运行 debug build：
+
+```bash
+cargo run -- config
+cargo run -- start --verbose
+cargo run -- status --verbose
+cargo run -- stop --verbose
+```
+
+使用本地 mihomo 二进制测试：
+
+```bash
+MIHOMO_CORE=/path/to/mihomo cargo run -- start --verbose
+```
+
+生成的配置、profile 缓存、日志和托管 core 会写到用户配置目录，不会写入仓库。需要干净环境时，可以删除或编辑 `~/.config/clashtui/config.yaml`。
+
+service 和 TUN 相关功能需要从已构建的二进制安装 privileged service：
+
+```bash
+cargo build
+target/debug/clashtui service-install --path target/debug/clashtui
+target/debug/clashtui service-status
+target/debug/clashtui service-uninstall
+```
+
+安装命令会使用 `sudo`，并把指定二进制复制到系统 service 位置；修改 service 侧代码后，需要重新构建并重新安装。
+
 ## 基本使用流程
 
 1. 运行 `clashtui config`。

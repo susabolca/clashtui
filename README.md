@@ -72,6 +72,57 @@ cargo run -- start
 cargo run -- status
 ```
 
+## Development
+
+Requirements:
+
+- Rust toolchain with Cargo.
+- macOS or Linux for full service/TUN development. Normal config, status, and
+  user-mode runtime flows can still be developed without installing the
+  privileged service.
+- A mihomo binary, either configured in the TUI, set with `MIHOMO_CORE`, or
+  downloaded by clashtui as a managed core.
+
+Common local loop:
+
+```bash
+cargo fmt --check
+cargo clippy --all-targets
+cargo test
+```
+
+Run the debug build directly while editing:
+
+```bash
+cargo run -- config
+cargo run -- start --verbose
+cargo run -- status --verbose
+cargo run -- stop --verbose
+```
+
+To test with a local mihomo binary:
+
+```bash
+MIHOMO_CORE=/path/to/mihomo cargo run -- start --verbose
+```
+
+Generated config, profile cache, logs, and managed cores are written to the
+user config directory, not to the repository. Remove or edit
+`~/.config/clashtui/config.yaml` when you need a clean local setup.
+
+Service and TUN work requires installing the privileged service from a built
+binary:
+
+```bash
+cargo build
+target/debug/clashtui service-install --path target/debug/clashtui
+target/debug/clashtui service-status
+target/debug/clashtui service-uninstall
+```
+
+The install command uses `sudo` and copies the selected binary into the system
+service location, so rebuild and reinstall after changing service-side code.
+
 ## Basic Workflow
 
 1. Run `clashtui config`.
