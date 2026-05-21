@@ -40,8 +40,9 @@ mihomo binaries and metadata.
 - `clashtui config` edits a draft. `Save` writes `config.yaml` only.
 - `Save & Restart` writes `config.yaml` and restarts the owned runtime.
 - `clashtui restart` applies the saved config.
-- `clashtui start` starts from the saved config and downloads a managed mihomo
-  core only when the selected/local core is missing.
+- `clashtui start` starts from the saved config, downloads a managed mihomo
+  core only when the selected/local core is missing, and ensures GeoIP/GeoSite
+  data files exist in the runtime work directory.
 - `clashtui reload` reloads mihomo from saved config without stopping it. Prefer
   restart for listener ports, TUN, DNS listen address, runtime backend, or core
   changes.
@@ -166,6 +167,11 @@ core_path: null
 - `update`: currently informational/manual. Explicit updates are done from the
   TUI Runtime page `Update Core`.
 - `core_path`: absolute path to a custom mihomo-compatible binary.
+- GeoIP/GeoSite data files are stored under the clashtui config directory and
+  copied into service/runtime work directories as needed. Missing files are
+  downloaded from MetaCubeX `meta-rules-dat`. Use the TUI Runtime page
+  `Update GeoIP DB` to manually refresh `Country.mmdb`, `geoip.metadb`,
+  `geoip.dat`, and `geosite.dat`.
 
 ### `controller`
 

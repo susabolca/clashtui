@@ -264,6 +264,7 @@ enum RuntimeItem {
     Logs,
     CorePath,
     CoreUpdate,
+    GeodataUpdate,
     Controller,
     Refresh,
     LlmSection,
@@ -276,12 +277,13 @@ enum RuntimeItem {
 }
 
 impl RuntimeItem {
-    const ALL: [Self; 14] = [
+    const ALL: [Self; 15] = [
         Self::Service,
         Self::Autostart,
         Self::Logs,
         Self::CorePath,
         Self::CoreUpdate,
+        Self::GeodataUpdate,
         Self::Controller,
         Self::Refresh,
         Self::LlmSection,
@@ -305,6 +307,7 @@ impl RuntimeItem {
                 Self::Logs => "Logs",
                 Self::CorePath => "Mihomo Core",
                 Self::CoreUpdate => "更新 Core",
+                Self::GeodataUpdate => "更新 GeoIP DB",
                 Self::Controller => "Controller",
                 Self::Refresh => "刷新 Runtime",
                 Self::LlmSection => "LLM",
@@ -322,6 +325,7 @@ impl RuntimeItem {
             Self::Logs => "Logs",
             Self::CorePath => "Mihomo Core",
             Self::CoreUpdate => "Update Core",
+            Self::GeodataUpdate => "Update GeoIP DB",
             Self::Controller => "Controller",
             Self::Refresh => "Refresh Runtime",
             Self::LlmSection => "LLM",
@@ -1079,6 +1083,7 @@ enum ActionKind {
     UpdateLlmProviders,
     TestAssistant,
     UpdateCore,
+    UpdateGeodata,
     StartRuntime,
     StopRuntime,
     ReloadRuntime,
@@ -1153,6 +1158,7 @@ enum RuntimeCommand {
     Reload,
     Restart,
     UpdateCore,
+    UpdateGeodata,
 }
 
 impl RuntimeCommand {
@@ -1163,6 +1169,7 @@ impl RuntimeCommand {
             Self::Reload => "Reloading Runtime",
             Self::Restart => "Restarting Runtime",
             Self::UpdateCore => "Updating Mihomo Core",
+            Self::UpdateGeodata => "Updating GeoIP DB",
         }
     }
 
@@ -1173,6 +1180,7 @@ impl RuntimeCommand {
             Self::Reload => "Reloading mihomo...",
             Self::Restart => "Restarting mihomo...",
             Self::UpdateCore => "Updating mihomo core...",
+            Self::UpdateGeodata => "Updating GeoIP and GeoSite data...",
         }
     }
 }
@@ -1635,11 +1643,12 @@ impl ConfigApp {
 
         let message = result
             .message
-            .unwrap_or_else(|| "restart failed without output".into());
-        self.alert("Restart Failed", message.clone());
+            .unwrap_or_else(|| format!("{} failed without output", task.command.title()));
+        let title = format!("{} Failed", task.command.title());
+        self.alert(&title, message.clone());
         self.status = format!(
-            "{}; restart failed: {}",
-            task.success,
+            "{}: {}",
+            title,
             first_output_line(&message).unwrap_or("see restart output")
         );
     }
@@ -4194,6 +4203,13 @@ async fn submit_runtime_item(
             "Mihomo core update finished; restart to use",
             false,
         ),
+        RuntimeItem::GeodataUpdate => app.start_runtime_command(
+            paths,
+            config,
+            RuntimeCommand::UpdateGeodata,
+            "GeoIP DB update finished",
+            false,
+        ),
         RuntimeItem::Controller => begin_controller_input(config, app),
         RuntimeItem::Refresh => refresh_runtime(paths, config, app),
         RuntimeItem::LlmSection => app.status = "LLM assistant settings".into(),
@@ -5279,6 +5295,23 @@ async fn wait_for_runtime_after_restart(config: &AppConfig) -> bool {
     false
 }
 
+fn format_geodata_update_report(report: &core::GeodataUpdateReport) -> String {
+    let total_bytes = report.files.iter().map(|file| file.bytes).sum();
+    let files = report
+        .files
+        .iter()
+        .map(|file| format!("{} {}", file.file_name, format_bytes_short(file.bytes)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "GeoIP DB updated: {} files, {} total in {}; {}",
+        report.files.len(),
+        format_bytes_short(total_bytes),
+        report.target_dir.display(),
+        files
+    )
+}
+
 fn run_runtime_cli_command(command: RuntimeCommand) -> Result<std::process::Output> {
     let arg = match command {
         RuntimeCommand::Start => "start",
@@ -5286,6 +5319,9 @@ fn run_runtime_cli_command(command: RuntimeCommand) -> Result<std::process::Outp
         RuntimeCommand::Restart => "restart",
         RuntimeCommand::Reload => anyhow::bail!("reload is handled through mihomo controller"),
         RuntimeCommand::UpdateCore => anyhow::bail!("core update is handled in the config UI"),
+        RuntimeCommand::UpdateGeodata => {
+            anyhow::bail!("GeoIP DB update is handled in the config UI")
+        }
     };
     let exe = std::env::current_exe().context("failed to locate current executable")?;
     Command::new(exe)
@@ -5334,6 +5370,19 @@ async fn run_runtime_command_task(
                         install.path.display()
                     )
                 }),
+            },
+            Err(err) => RuntimeCommandResult {
+                success: false,
+                message: Some(format!("{err:#}")),
+            },
+        };
+    }
+
+    if matches!(command, RuntimeCommand::UpdateGeodata) {
+        return match core::update_geodata(&paths).await {
+            Ok(report) => RuntimeCommandResult {
+                success: true,
+                message: Some(format_geodata_update_report(&report)),
             },
             Err(err) => RuntimeCommandResult {
                 success: false,
@@ -6925,6 +6974,7 @@ fn runtime_rows(paths: &Paths, config: &AppConfig, app: &ConfigApp) -> Vec<Setti
                 RuntimeItem::Logs => RowKind::Action(ActionKind::Logs),
                 RuntimeItem::CorePath => RowKind::Choice(ChoiceAction::CoreSource),
                 RuntimeItem::CoreUpdate => RowKind::Action(ActionKind::UpdateCore),
+                RuntimeItem::GeodataUpdate => RowKind::Action(ActionKind::UpdateGeodata),
                 RuntimeItem::Controller => RowKind::Input(InputMode::Controller),
                 RuntimeItem::Refresh => RowKind::Action(ActionKind::RefreshRuntime),
                 RuntimeItem::LlmSection => RowKind::SoftSection,
@@ -7197,6 +7247,7 @@ fn row_is_function_action(row: &SettingRow) -> bool {
                 | ActionKind::UpdateLlmProviders
                 | ActionKind::TestAssistant
                 | ActionKind::UpdateCore
+                | ActionKind::UpdateGeodata
                 | ActionKind::StartRuntime
                 | ActionKind::StopRuntime
                 | ActionKind::ReloadRuntime
@@ -7256,6 +7307,9 @@ const fn runtime_item_help(item: RuntimeItem, language: Language) -> &'static st
             RuntimeItem::Logs => "打开 Runtime logs；此功能尚未完成。",
             RuntimeItem::CorePath => "选择 auto、托管 Mihomo release、托管 alpha 或自定义路径。",
             RuntimeItem::CoreUpdate => "下载当前选择的托管 Mihomo core；重启后生效。",
+            RuntimeItem::GeodataUpdate => {
+                "手动下载最新 Country.mmdb、GeoIP 和 GeoSite 数据到 config 目录。"
+            }
             RuntimeItem::Controller => "clashtui 使用的 mihomo external controller URL。",
             RuntimeItem::Refresh => "从 mihomo 刷新 Runtime 信息。",
             RuntimeItem::LlmSection => "LLM assistant endpoint、model、key 和 provider catalog。",
@@ -7278,6 +7332,9 @@ const fn runtime_item_help(item: RuntimeItem, language: Language) -> &'static st
         }
         RuntimeItem::CoreUpdate => {
             "Download the latest selected managed Mihomo core; restart to use it."
+        }
+        RuntimeItem::GeodataUpdate => {
+            "Manually download the latest Country.mmdb, GeoIP, and GeoSite data into the config directory."
         }
         RuntimeItem::Controller => "Mihomo external controller URL used by clashtui.",
         RuntimeItem::Refresh => "Refresh runtime information from mihomo.",
@@ -10249,6 +10306,7 @@ fn runtime_item_value(
         RuntimeItem::Logs => "open planned".into(),
         RuntimeItem::CorePath => core_source_value(config),
         RuntimeItem::CoreUpdate => config.mihomo.update.clone(),
+        RuntimeItem::GeodataUpdate => "manual".into(),
         RuntimeItem::Controller => config.controller.url.clone(),
         RuntimeItem::Refresh => app.runtime.error.as_deref().unwrap_or("online").to_string(),
         RuntimeItem::LlmSection => String::new(),
@@ -13655,6 +13713,15 @@ mod tests {
         let rows = runtime_rows(&paths, &config, &app);
 
         assert!(!rows.iter().any(|row| row.label == "DNS"));
+        let geodata = rows
+            .iter()
+            .find(|row| row.label == "Update GeoIP DB")
+            .context("GeoIP DB update row")?;
+        assert_eq!(geodata.value, "manual");
+        assert!(matches!(
+            geodata.kind,
+            RowKind::Action(ActionKind::UpdateGeodata)
+        ));
         let llm_index = rows
             .iter()
             .position(|row| row.label == "LLM")

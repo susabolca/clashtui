@@ -23,8 +23,8 @@ use crate::service;
 use crate::system_proxy;
 
 const CORE_NAMES: [&str; 4] = ["mihomo", "verge-mihomo", "verge-mihomo-alpha", "clash-meta"];
-const GEODATA_FILES: [&str; 4] = ["Country.mmdb", "geoip.metadb", "geoip.dat", "geosite.dat"];
-const GEODATA_APP_DIRS: [&str; 5] = [
+const GEODATA_APP_DIRS: [&str; 6] = [
+    "clashtui",
     "io.github.clash-verge-rev.clash-verge-rev",
     "clash-verge-rev",
     "clash-verge",
@@ -36,6 +36,8 @@ const STOP_WAIT: Duration = Duration::from_millis(200);
 const STOP_RETRIES: usize = 75;
 const CORE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(90);
 const CORE_DOWNLOAD_USER_AGENT: &str = concat!("clashtui/v", env!("CARGO_PKG_VERSION"));
+const META_RULES_URL_PREFIX: &str =
+    "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest";
 const META_ALPHA_VERSION_URL: &str =
     "https://github.com/MetaCubeX/mihomo/releases/download/Prerelease-Alpha/version.txt";
 const META_ALPHA_URL_PREFIX: &str =
@@ -152,6 +154,43 @@ struct DownloadAttempt {
     proxy_url: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct GeodataResource {
+    file_name: &'static str,
+    asset_name: &'static str,
+}
+
+const GEODATA_RESOURCES: [GeodataResource; 4] = [
+    GeodataResource {
+        file_name: "Country.mmdb",
+        asset_name: "country.mmdb",
+    },
+    GeodataResource {
+        file_name: "geoip.metadb",
+        asset_name: "geoip.metadb",
+    },
+    GeodataResource {
+        file_name: "geoip.dat",
+        asset_name: "geoip.dat",
+    },
+    GeodataResource {
+        file_name: "geosite.dat",
+        asset_name: "geosite.dat",
+    },
+];
+
+#[derive(Debug, Clone)]
+pub struct GeodataUpdateReport {
+    pub target_dir: PathBuf,
+    pub files: Vec<GeodataFileUpdate>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GeodataFileUpdate {
+    pub file_name: String,
+    pub bytes: u64,
+}
+
 pub async fn ensure_running(paths: &Paths, config: &mut AppConfig) -> Result<()> {
     if config.use_service_runtime() {
         let status = service::status()?;
@@ -183,7 +222,7 @@ async fn ensure_legacy_global_runtime(paths: &Paths, config: &AppConfig) -> Resu
     remove_pid(&instance.pid_file).await?;
     let core_path = ensure_core_path(paths, config).await?;
 
-    ensure_geodata(&instance.work_dir).await?;
+    ensure_geodata(paths, &instance.work_dir).await?;
     port_allocator::validate_required_ports_available(config)?;
 
     let mut bootstrap_config = config.clone();
@@ -220,7 +259,7 @@ async fn ensure_user_single_runtime(paths: &Paths, config: &AppConfig) -> Result
     remove_pid(&instance.pid_file).await?;
     let core_path = ensure_core_path(paths, config).await?;
 
-    ensure_geodata(&paths.config_dir).await?;
+    ensure_geodata(paths, &paths.config_dir).await?;
     port_allocator::validate_required_ports_available(config)?;
     runtime_profile::write_single_runtime_config(paths, config).await?;
     start_instance(&instance, &core_path).await
@@ -236,7 +275,7 @@ async fn ensure_service_runtime(paths: &Paths, config: &AppConfig) -> Result<()>
 
     let core_path = ensure_core_path(paths, config).await?;
 
-    ensure_geodata(&paths.config_dir).await?;
+    ensure_geodata(paths, &paths.config_dir).await?;
     port_allocator::validate_required_ports_available(config)?;
     let runtime_config = runtime_profile::write_single_runtime_config(paths, config).await?;
     service::start_core(&core_path, paths, &runtime_config)
@@ -260,7 +299,7 @@ pub async fn ensure_service_running(
         .await
         .with_context(|| format!("{} mihomo core is not available", instance.label))?;
 
-    ensure_geodata(&instance.work_dir).await?;
+    ensure_geodata(paths, &instance.work_dir).await?;
     runtime_profile::write_service_config(paths, &instance, config, service).await?;
     start_instance(&instance, &core_path).await?;
     Ok(instance)
@@ -822,23 +861,59 @@ async fn start_instance(instance: &RuntimePaths, core_path: &Path) -> Result<()>
     Ok(())
 }
 
-async fn ensure_geodata(target_dir: &Path) -> Result<()> {
+pub async fn update_geodata(paths: &Paths) -> Result<GeodataUpdateReport> {
+    paths.ensure().await?;
+    let mut files = Vec::new();
+
+    for resource in GEODATA_RESOURCES {
+        let target = paths.config_dir.join(resource.file_name);
+        let bytes = download_geodata_resource(resource, &target)
+            .await
+            .with_context(|| format!("failed to update {}", resource.file_name))?;
+        files.push(GeodataFileUpdate {
+            file_name: resource.file_name.into(),
+            bytes,
+        });
+    }
+
+    Ok(GeodataUpdateReport {
+        target_dir: paths.config_dir.clone(),
+        files,
+    })
+}
+
+async fn ensure_geodata(paths: &Paths, target_dir: &Path) -> Result<()> {
     fs::create_dir_all(target_dir).await?;
-    for file_name in GEODATA_FILES {
-        let target = target_dir.join(file_name);
+    for resource in GEODATA_RESOURCES {
+        let target = target_dir.join(resource.file_name);
         if is_usable_file(&target).await? {
             continue;
         }
-        let Some(source) = find_geodata_source(file_name).await? else {
-            continue;
-        };
-        fs::copy(&source, &target).await.with_context(|| {
-            format!(
-                "failed to copy geodata {} to {}",
+        if let Some(source) = find_geodata_source(paths, resource.file_name).await? {
+            fs::copy(&source, &target).await.with_context(|| {
+                format!(
+                    "failed to copy geodata {} to {}",
+                    source.display(),
+                    target.display()
+                )
+            })?;
+            eprintln!(
+                "geodata: copied {} from {} to {}",
+                resource.file_name,
                 source.display(),
                 target.display()
-            )
-        })?;
+            );
+            continue;
+        }
+        let bytes = download_geodata_resource(resource, &target)
+            .await
+            .with_context(|| format!("failed to download missing {}", resource.file_name))?;
+        eprintln!(
+            "geodata: downloaded {} bytes={} path={}",
+            resource.file_name,
+            bytes,
+            target.display()
+        );
     }
     Ok(())
 }
@@ -881,8 +956,8 @@ async fn stop_stale_service_instances(paths: &Paths, current_count: usize) -> Re
     Ok(())
 }
 
-async fn find_geodata_source(file_name: &str) -> Result<Option<PathBuf>> {
-    for dir in geodata_search_dirs() {
+async fn find_geodata_source(paths: &Paths, file_name: &str) -> Result<Option<PathBuf>> {
+    for dir in geodata_search_dirs(paths) {
         let candidate = dir.join(file_name);
         if is_usable_file(&candidate).await? {
             return Ok(Some(candidate));
@@ -891,8 +966,37 @@ async fn find_geodata_source(file_name: &str) -> Result<Option<PathBuf>> {
     Ok(None)
 }
 
-fn geodata_search_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
+async fn download_geodata_resource(resource: GeodataResource, target: &Path) -> Result<u64> {
+    let Some(parent) = target.parent() else {
+        anyhow::bail!("geodata target has no parent: {}", target.display());
+    };
+    fs::create_dir_all(parent).await?;
+
+    let url = format!("{META_RULES_URL_PREFIX}/{}", resource.asset_name);
+    let bytes = fetch_bytes(&url)
+        .await
+        .with_context(|| format!("failed to fetch {url}"))?;
+    if bytes.is_empty() {
+        anyhow::bail!("geodata response is empty: {url}");
+    }
+
+    let temp_path = target.with_file_name(format!("{}.download", resource.file_name));
+    fs::write(&temp_path, &bytes)
+        .await
+        .with_context(|| format!("failed to write {}", temp_path.display()))?;
+    if cfg!(windows) && target.exists() {
+        fs::remove_file(target)
+            .await
+            .with_context(|| format!("failed to replace {}", target.display()))?;
+    }
+    fs::rename(&temp_path, target)
+        .await
+        .with_context(|| format!("failed to install {}", target.display()))?;
+    Ok(bytes.len() as u64)
+}
+
+fn geodata_search_dirs(paths: &Paths) -> Vec<PathBuf> {
+    let mut dirs = vec![paths.config_dir.clone()];
     if let Some(path) = env::var_os("CLASHTUI_GEODATA_DIR") {
         dirs.push(PathBuf::from(path));
     }

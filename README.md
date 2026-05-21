@@ -50,6 +50,9 @@ clashtui stop
 clashtui restart
 ```
 
+首次启动会在配置目录准备 mihomo 运行所需的 GeoIP/GeoSite 数据文件。
+也可以在 `clashtui config` 的 Runtime 菜单里手工执行 `Update GeoIP DB` 更新。
+
 如需更多输出：
 
 ```bash
