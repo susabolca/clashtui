@@ -128,6 +128,9 @@ pub async fn start(
     } else {
         println!("daemon: started pid={pid}");
     }
+    println!(
+        "mihomo: waiting for runtime readiness; first start may prepare geodata/ip db and take a while"
+    );
     let client = MihomoClient::new(&config.controller);
     if let Err(err) = wait_for_mihomo(&client).await {
         print_log_tail("clashtui log", &paths.log_file, LOG_TAIL_LINES);

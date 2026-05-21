@@ -3887,8 +3887,10 @@ async fn submit_selection(
         Page::ProxyGroups => match app.proxy_pane {
             ProxyPane::Groups => {
                 app.proxy_pane = ProxyPane::Proxies;
-                app.selected_proxy =
-                    current_proxy_index(app.current_group(config)).unwrap_or_default();
+                app.selected_proxy = app
+                    .current_group(config)
+                    .map(|group| selected_proxy_index_for_group(config, app, group))
+                    .unwrap_or_default();
                 app.status = "Select a proxy, then press Enter".into();
             }
             ProxyPane::Proxies => select_proxy(paths, config, app).await?,
@@ -6546,7 +6548,7 @@ fn proxy_profile_rows(config: &AppConfig) -> Vec<SettingRow> {
             value: if profile.name == config.active_proxy_profile {
                 "active".into()
             } else {
-                profile.mode.clone()
+                String::new()
             },
             help: proxy_profile_summary(profile),
             kind: RowKind::Submenu(Page::ProfileConfig),
@@ -6555,7 +6557,7 @@ fn proxy_profile_rows(config: &AppConfig) -> Vec<SettingRow> {
 
     rows.push(SettingRow {
         label: "Add Profile".into(),
-        value: "new".into(),
+        value: String::new(),
         help: "Create another reusable Global Proxy profile.".into(),
         kind: RowKind::Action(ActionKind::AddPortProxy),
     });
@@ -7015,11 +7017,15 @@ fn proxy_group_rows(paths: &Paths, config: &AppConfig, app: &ConfigApp) -> Vec<S
             runtime
                 .groups
                 .iter()
-                .map(|group| SettingRow {
-                    label: display_name(&group.name),
-                    value: format!("{} -> {}", group.kind, display_name(&group.now)),
-                    help: "Enter opens the proxy list for this group.".into(),
-                    kind: RowKind::Action(ActionKind::SelectProxyGroup),
+                .map(|group| {
+                    let selected_proxy = desired_proxy_selection(config, app, &group.name)
+                        .unwrap_or(group.now.as_str());
+                    SettingRow {
+                        label: display_name(&group.name),
+                        value: format!("{} -> {}", group.kind, display_name(selected_proxy)),
+                        help: "Enter opens the proxy list for this group.".into(),
+                        kind: RowKind::Action(ActionKind::SelectProxyGroup),
+                    }
                 })
                 .collect()
         }
@@ -7032,11 +7038,13 @@ fn proxy_group_rows(paths: &Paths, config: &AppConfig, app: &ConfigApp) -> Vec<S
                     kind: RowKind::Info,
                 }];
             };
+            let selected_proxy =
+                desired_proxy_selection(config, app, &group.name).unwrap_or(group.now.as_str());
             group
                 .all
                 .iter()
                 .map(|proxy| SettingRow {
-                    label: if proxy == &group.now {
+                    label: if proxy == selected_proxy {
                         format!("* {}", display_name(proxy))
                     } else {
                         display_name(proxy)
@@ -7047,7 +7055,7 @@ fn proxy_group_rows(paths: &Paths, config: &AppConfig, app: &ConfigApp) -> Vec<S
                                 .get(&subscription_proxy_delay_key_for_name(name, proxy))
                                 .map(String::as_str)
                         }),
-                        proxy == &group.now,
+                        proxy == selected_proxy,
                     ),
                     help: format!("Enter saves this proxy for {}.", display_name(&group.name)),
                     kind: RowKind::Action(ActionKind::SelectProxy),
@@ -7671,10 +7679,12 @@ fn draw_groups(frame: &mut Frame, config: &AppConfig, app: &ConfigApp, area: Rec
                 } else {
                     Style::default()
                 };
+                let selected_proxy =
+                    desired_proxy_selection(config, app, &group.name).unwrap_or(group.now.as_str());
                 ListItem::new(vec![
                     Line::from(Span::styled(display_name(&group.name), selected)),
                     Line::from(Span::styled(
-                        format!("  {} -> {}", group.kind, display_name(&group.now)),
+                        format!("  {} -> {}", group.kind, display_name(selected_proxy)),
                         Style::default().fg(Color::Gray),
                     )),
                 ])
@@ -7711,12 +7721,14 @@ fn draw_proxy_options(frame: &mut Frame, config: &AppConfig, app: &ConfigApp, ar
     let items = if group.all.is_empty() {
         vec![ListItem::new("No selectable proxies.")]
     } else {
+        let selected_proxy =
+            desired_proxy_selection(config, app, &group.name).unwrap_or(&group.now);
         group
             .all
             .iter()
             .enumerate()
             .map(|(index, proxy)| {
-                let current = if proxy == &group.now { "*" } else { " " };
+                let current = if proxy == selected_proxy { "*" } else { " " };
                 let style = if index == app.selected_proxy {
                     Style::default()
                         .fg(Color::Cyan)
@@ -10091,6 +10103,17 @@ fn desired_proxy_selection<'a>(
         return Some(selection.as_str());
     }
     config.proxy_selections.get(group).map(String::as_str)
+}
+
+fn selected_proxy_index_for_group(
+    config: &AppConfig,
+    app: &ConfigApp,
+    group: &ProxyGroup,
+) -> usize {
+    desired_proxy_selection(config, app, &group.name)
+        .and_then(|proxy| group.all.iter().position(|candidate| candidate == proxy))
+        .or_else(|| current_proxy_index(Some(group)))
+        .unwrap_or_default()
 }
 
 fn save_selected_proxy_choice(
@@ -13260,15 +13283,23 @@ mod tests {
 
     #[test]
     fn profile_rows_expose_default_and_add_action() {
-        let config = AppConfig::default();
+        let mut config = AppConfig::default();
+        config.proxy_profiles.push(ProxyProfile {
+            name: "work".into(),
+            mode: "rule".into(),
+            ..ProxyProfile::default()
+        });
         let rows = proxy_profile_rows(&config);
 
         assert_eq!(rows.first().map(|row| row.label.as_str()), Some("default"));
         assert_eq!(rows.first().map(|row| row.value.as_str()), Some("active"));
+        assert_eq!(rows.get(1).map(|row| row.label.as_str()), Some("work"));
+        assert_eq!(rows.get(1).map(|row| row.value.as_str()), Some(""));
         assert_eq!(
-            rows.get(1).map(|row| row.label.as_str()),
+            rows.get(2).map(|row| row.label.as_str()),
             Some("Add Profile")
         );
+        assert_eq!(rows.get(2).map(|row| row.value.as_str()), Some(""));
     }
 
     #[test]
@@ -14954,6 +14985,42 @@ proxies:
         assert_eq!(
             rows.get(1).map(|row| row_value_style(row, false).fg),
             Some(Some(Color::Cyan))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn profile_rule_proxy_rows_use_profile_rule_selection() -> Result<()> {
+        let paths = test_paths("profile-rule-proxy-selection")?;
+        let mut config = AppConfig::default();
+        config.proxy_profiles[0].mode = "rule".into();
+        config.proxy_profiles[0]
+            .rule_selections
+            .insert("Auto".into(), "JP 01".into());
+        let mut app = ConfigApp::new(&config);
+        app.page = Page::ProxyGroups;
+        app.proxy_pane = ProxyPane::Proxies;
+        app.runtime.groups = vec![ProxyGroup {
+            name: "Auto".into(),
+            kind: "select".into(),
+            now: "HK 01".into(),
+            all: vec!["HK 01".into(), "JP 01".into()],
+        }];
+        app.history.push(Location {
+            section: Page::Profile,
+            page: Page::ProfileConfig,
+            selected: 4,
+        });
+
+        let rows = proxy_group_rows(&paths, &config, &app);
+
+        assert_eq!(rows.first().map(|row| row.label.as_str()), Some("HK 01"));
+        assert_eq!(rows.first().map(|row| row.value.as_str()), Some("Check"));
+        assert_eq!(rows.get(1).map(|row| row.label.as_str()), Some("* JP 01"));
+        assert_eq!(rows.get(1).map(|row| row.value.as_str()), Some("selected"));
+        assert_eq!(
+            selected_proxy_index_for_group(&config, &app, &app.runtime.groups[0]),
+            1
         );
         Ok(())
     }
