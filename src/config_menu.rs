@@ -17,10 +17,13 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
+    ScrollbarState, Wrap,
+};
 use ratatui::{Frame, Terminal};
 use time::macros::format_description;
 use time::{OffsetDateTime, UtcOffset};
@@ -69,6 +72,8 @@ const V_LINE: char = '│';
 const TOP_JOINT: char = '┬';
 const BOTTOM_JOINT: char = '┴';
 const CHAT_INPUT_WIDTH: usize = 12_000;
+const CHAT_SCROLL_STEP: usize = 6;
+const CHAT_TOOL_OUTPUT_MAX_LINES: usize = 5;
 const CHAT_PATCH_DIFF_CONTEXT: usize = 2;
 const CHAT_PATCH_DIFF_MAX_LINES: usize = 160;
 const PATCH_DIFF_REMOVE_BG: Color = Color::Rgb(96, 28, 28);
@@ -1218,6 +1223,8 @@ enum AssistantTestEvent {
 struct ChatState {
     entries: Vec<ChatEntry>,
     input: String,
+    input_cursor: usize,
+    input_focused: bool,
     scroll: usize,
     task: Option<ChatTask>,
     usage: ChatUsage,
@@ -1765,6 +1772,7 @@ impl ConfigApp {
                 }
             }
         }
+        self.chat.scroll = 0;
     }
 
     fn apply_chat_usage(&mut self, usage: agent::AgentUsage) {
@@ -1799,9 +1807,10 @@ impl ConfigApp {
         if let Some(task) = self.chat.task.take() {
             task.handle.abort();
             self.chat.entries.push(ChatEntry {
-                kind: ChatEntryKind::Tool,
+                kind: ChatEntryKind::Assistant,
                 content: text(self.language, "assistant canceled", "assistant 已取消").into(),
             });
+            self.chat.scroll = 0;
             self.status = text(self.language, "Assistant canceled", "Assistant 已取消").into();
         }
     }
@@ -3293,6 +3302,10 @@ async fn handle_chat_key(
     app: &mut ConfigApp,
     key: KeyEvent,
 ) -> Result<()> {
+    if app.chat.input_focused {
+        return handle_focused_chat_key(paths, config, app, key).await;
+    }
+
     match key.code {
         KeyCode::F(10) => app.open_confirm(ConfirmAction::SaveRestart),
         KeyCode::Esc if app.chat.task.is_some() => app.cancel_chat(),
@@ -3302,10 +3315,12 @@ async fn handle_chat_key(
         KeyCode::Right => app.move_right(config),
         KeyCode::Left => app.move_left(config),
         KeyCode::PageUp => {
-            app.chat.scroll = app.chat.scroll.saturating_add(6);
+            app.chat.scroll = app.chat.scroll.saturating_add(CHAT_SCROLL_STEP);
+            clamp_chat_scroll_to_terminal(app);
         }
         KeyCode::PageDown => {
-            app.chat.scroll = app.chat.scroll.saturating_sub(6);
+            clamp_chat_scroll_to_terminal(app);
+            app.chat.scroll = app.chat.scroll.saturating_sub(CHAT_SCROLL_STEP);
         }
         KeyCode::Char('s') | KeyCode::Char('S')
             if key.modifiers.contains(KeyModifiers::CONTROL) =>
@@ -3321,6 +3336,7 @@ async fn handle_chat_key(
             if key.modifiers.contains(KeyModifiers::CONTROL) =>
         {
             app.chat.input.clear();
+            app.chat.input_cursor = 0;
         }
         KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             push_chat_input(app, "\n");
@@ -3333,11 +3349,68 @@ async fn handle_chat_key(
             push_chat_input(app, "\n");
         }
         KeyCode::Enter => send_chat_message(paths, config, app),
-        KeyCode::Backspace => {
-            app.chat.input.pop();
-        }
         KeyCode::Char(value) if app.chat.input.len() < CHAT_INPUT_WIDTH => {
-            app.chat.input.push(value);
+            insert_chat_input_char(app, value);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn handle_focused_chat_key(
+    paths: &Paths,
+    config: &mut AppConfig,
+    app: &mut ConfigApp,
+    key: KeyEvent,
+) -> Result<()> {
+    match key.code {
+        KeyCode::F(10) => app.open_confirm(ConfirmAction::SaveRestart),
+        KeyCode::Esc => {
+            app.chat.input_focused = false;
+        }
+        KeyCode::PageUp => {
+            app.chat.scroll = app.chat.scroll.saturating_add(CHAT_SCROLL_STEP);
+            clamp_chat_scroll_to_terminal(app);
+        }
+        KeyCode::PageDown => {
+            clamp_chat_scroll_to_terminal(app);
+            app.chat.scroll = app.chat.scroll.saturating_sub(CHAT_SCROLL_STEP);
+        }
+        KeyCode::Char('s') | KeyCode::Char('S')
+            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            app.status = text(
+                app.language,
+                "Chat patches apply to draft automatically; press F10 to save and restart",
+                "Chat patch 会自动应用到 draft；按 F10 保存并重启",
+            )
+            .into();
+        }
+        KeyCode::Char('u') | KeyCode::Char('U')
+            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            app.chat.input.clear();
+            app.chat.input_cursor = 0;
+        }
+        KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            push_chat_input(app, "\n");
+        }
+        KeyCode::Enter
+            if key
+                .modifiers
+                .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL | KeyModifiers::SHIFT) =>
+        {
+            push_chat_input(app, "\n");
+        }
+        KeyCode::Enter => send_chat_message(paths, config, app),
+        KeyCode::Backspace => delete_chat_input_char_before_cursor(app),
+        KeyCode::Delete => delete_chat_input_char_at_cursor(app),
+        KeyCode::Left => move_chat_input_cursor_left(app),
+        KeyCode::Right => move_chat_input_cursor_right(app),
+        KeyCode::Home => move_chat_input_cursor_line_start(app),
+        KeyCode::End => move_chat_input_cursor_line_end(app),
+        KeyCode::Char(value) if app.chat.input.len() < CHAT_INPUT_WIDTH => {
+            insert_chat_input_char(app, value);
         }
         _ => {}
     }
@@ -3346,8 +3419,71 @@ async fn handle_chat_key(
 
 fn push_chat_input(app: &mut ConfigApp, value: &str) {
     if app.chat.input.len().saturating_add(value.len()) <= CHAT_INPUT_WIDTH {
-        app.chat.input.push_str(value);
+        focus_chat_input(app);
+        app.chat.input.insert_str(app.chat.input_cursor, value);
+        app.chat.input_cursor += value.len();
     }
+}
+
+fn focus_chat_input(app: &mut ConfigApp) {
+    app.chat.input_focused = true;
+    clamp_chat_input_cursor(app);
+}
+
+fn clamp_chat_input_cursor(app: &mut ConfigApp) {
+    app.chat.input_cursor = normalize_cursor(&app.chat.input, app.chat.input_cursor);
+}
+
+fn insert_chat_input_char(app: &mut ConfigApp, ch: char) {
+    if app.chat.input.len().saturating_add(ch.len_utf8()) > CHAT_INPUT_WIDTH {
+        return;
+    }
+    focus_chat_input(app);
+    app.chat.input.insert(app.chat.input_cursor, ch);
+    app.chat.input_cursor += ch.len_utf8();
+}
+
+fn delete_chat_input_char_before_cursor(app: &mut ConfigApp) {
+    clamp_chat_input_cursor(app);
+    if app.chat.input_cursor == 0 {
+        return;
+    }
+    let previous = prev_char_boundary(&app.chat.input, app.chat.input_cursor.saturating_sub(1));
+    app.chat.input.drain(previous..app.chat.input_cursor);
+    app.chat.input_cursor = previous;
+}
+
+fn delete_chat_input_char_at_cursor(app: &mut ConfigApp) {
+    clamp_chat_input_cursor(app);
+    if app.chat.input_cursor >= app.chat.input.len() {
+        return;
+    }
+    let next = next_char_boundary(&app.chat.input, app.chat.input_cursor);
+    app.chat.input.drain(app.chat.input_cursor..next);
+}
+
+fn move_chat_input_cursor_left(app: &mut ConfigApp) {
+    clamp_chat_input_cursor(app);
+    if app.chat.input_cursor == 0 {
+        return;
+    }
+    app.chat.input_cursor =
+        prev_char_boundary(&app.chat.input, app.chat.input_cursor.saturating_sub(1));
+}
+
+fn move_chat_input_cursor_right(app: &mut ConfigApp) {
+    clamp_chat_input_cursor(app);
+    app.chat.input_cursor = next_char_boundary(&app.chat.input, app.chat.input_cursor);
+}
+
+fn move_chat_input_cursor_line_start(app: &mut ConfigApp) {
+    clamp_chat_input_cursor(app);
+    app.chat.input_cursor = line_start(&app.chat.input, app.chat.input_cursor);
+}
+
+fn move_chat_input_cursor_line_end(app: &mut ConfigApp) {
+    clamp_chat_input_cursor(app);
+    app.chat.input_cursor = line_end(&app.chat.input, app.chat.input_cursor);
 }
 
 fn send_chat_message(paths: &Paths, config: &AppConfig, app: &mut ConfigApp) {
@@ -3362,14 +3498,18 @@ fn send_chat_message(paths: &Paths, config: &AppConfig, app: &mut ConfigApp) {
     }
     let message = app.chat.input.trim().to_string();
     if message.is_empty() {
+        focus_chat_input(app);
         app.status = text(app.language, "Type a message first", "请先输入消息").into();
         return;
     }
     app.chat.input.clear();
+    app.chat.input_cursor = 0;
+    app.chat.input_focused = false;
     app.chat.entries.push(ChatEntry {
         kind: ChatEntryKind::User,
         content: message.clone(),
     });
+    app.chat.scroll = 0;
     let conversation = chat_conversation_context(&app.chat.entries);
     app.start_chat_agent(paths, config, conversation);
 }
@@ -7882,57 +8022,71 @@ fn draw_chat_page(
         .constraints([Constraint::Min(8), Constraint::Length(5)])
         .split(columns[0]);
 
-    let mut transcript = vec![
-        Line::from(Span::styled(
-            "Chat",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-    ];
-    let transcript_width = left[0].width.saturating_sub(4) as usize;
-    let visible = left[0].height.saturating_sub(4) as usize;
-    let lines = chat_transcript_lines(app, visible, transcript_width);
+    let mut transcript = Vec::new();
+    let transcript_width = panel_inner_width(left[0]).saturating_sub(1);
+    let visible = panel_inner_height(left[0]);
+    let all_lines = chat_transcript_all_lines(app, transcript_width);
+    let total_lines = all_lines.len();
+    let lines = visible_chat_transcript_lines(all_lines, app.chat.scroll, visible);
     if lines.is_empty() {
-        transcript.extend([
-            Line::from(text(
-                app.language,
-                "Ask about proxy, DNS, TUN, subscriptions, runtime logs, or config changes.",
-                "可以询问 proxy、DNS、TUN、订阅、Runtime logs 或 config 修改。",
-            )),
-            Line::from(""),
-            Line::from(text(app.language, "Examples:", "示例:")),
-            Line::from(text(
-                app.language,
-                "  Explain why TUN is unavailable",
-                "  解释为什么 TUN 不可用",
-            )),
-            Line::from(text(
-                app.language,
-                "  Add a SOCKS5 Port Proxy on 7081 using HK-01",
-                "  添加一个使用 HK-01 的 SOCKS5 Port Proxy，端口 7081",
-            )),
-        ]);
+        transcript.extend(
+            [
+                Line::from(text(
+                    app.language,
+                    "Ask about proxy, DNS, TUN, subscriptions, runtime logs, or config changes.",
+                    "可以询问 proxy、DNS、TUN、订阅、Runtime logs 或 config 修改。",
+                )),
+                Line::from(""),
+                Line::from(text(app.language, "Examples:", "示例:")),
+                Line::from(text(
+                    app.language,
+                    "  Explain why TUN is unavailable",
+                    "  解释为什么 TUN 不可用",
+                )),
+                Line::from(text(
+                    app.language,
+                    "  Add a SOCKS5 Port Proxy on 7081 using HK-01",
+                    "  添加一个使用 HK-01 的 SOCKS5 Port Proxy，端口 7081",
+                )),
+            ]
+            .into_iter()
+            .take(visible),
+        );
     } else {
         transcript.extend(lines);
     }
-    frame.render_widget(bios_panel_preserve_indent("Assistant", transcript), left[0]);
+    frame.render_widget(bios_panel_preserve_indent("Chat", transcript), left[0]);
+    render_chat_scrollbar(frame, left[0], total_lines, visible, app.chat.scroll);
 
-    let input_width = left[1].width.saturating_sub(4) as usize;
-    let mut input_lines = chat_input_lines(app.chat.input.as_str(), input_width, 2);
+    let input_width = panel_inner_width(left[1]);
+    let mut input_lines = chat_input_lines(
+        app.chat.input.as_str(),
+        app.chat.input_cursor,
+        app.chat.input_focused,
+        input_width,
+        2,
+    );
+    let input_help = if app.chat.input_focused {
+        text(
+            app.language,
+            "Esc release | Enter send | Ctrl+J newline | F10 save & restart",
+            "Esc 释放 | Enter 发送 | Ctrl+J 换行 | F10 保存并重启",
+        )
+    } else {
+        text(
+            app.language,
+            "Type to focus | Left/Right screen | Enter send | Esc back",
+            "输入后聚焦 | Left/Right 切换页面 | Enter 发送 | Esc 返回",
+        )
+    };
     input_lines.push(Line::from(Span::styled(
-        fit_width(
-            text(
-                app.language,
-                "Enter send | Ctrl+J newline | Esc cancel/back | F10 save & restart",
-                "Enter 发送 | Ctrl+J 换行 | Esc 取消/返回 | F10 保存并重启",
-            ),
-            input_width,
-        ),
+        fit_width(input_help, input_width),
         Style::default().fg(Color::Gray),
     )));
-    frame.render_widget(panel("Input", input_lines), left[1]);
+    frame.render_widget(
+        chat_input_panel(input_lines, app.chat.input_focused),
+        left[1],
+    );
 
     let inspector = vec![
         Line::from(Span::styled(
@@ -8009,37 +8163,180 @@ fn draw_chat_page(
 }
 
 fn chat_transcript_lines(app: &ConfigApp, visible: usize, width: usize) -> Vec<Line<'static>> {
+    let lines = chat_transcript_all_lines(app, width);
+    visible_chat_transcript_lines(lines, app.chat.scroll, visible)
+}
+
+fn chat_transcript_all_lines(app: &ConfigApp, width: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for entry in &app.chat.entries {
-        let (label, style) = match entry.kind {
-            ChatEntryKind::User => ("user", Style::default().fg(Color::Cyan)),
-            ChatEntryKind::Assistant => ("assistant", Style::default().fg(Color::White)),
-            ChatEntryKind::Tool => ("tool", Style::default().fg(Color::Gray)),
-            ChatEntryKind::Patch => ("patch", Style::default().fg(Color::Yellow)),
-            ChatEntryKind::Error => ("error", Style::default().fg(Color::Red)),
+        match entry.kind {
+            ChatEntryKind::Tool => {
+                lines.extend(chat_tool_entry_lines(&entry.content, width));
+                lines.push(Line::from(""));
+                continue;
+            }
+            ChatEntryKind::Patch => {
+                lines.extend(wrap_patch_entry_lines(&entry.content, width));
+                lines.push(Line::from(""));
+                continue;
+            }
+            ChatEntryKind::User | ChatEntryKind::Assistant | ChatEntryKind::Error => {}
         };
-        if entry.kind != ChatEntryKind::Patch {
-            lines.push(Line::from(Span::styled(
-                label,
-                style.add_modifier(Modifier::BOLD),
-            )));
-        }
+
+        let style = match entry.kind {
+            ChatEntryKind::User => Style::default().fg(Color::Cyan),
+            ChatEntryKind::Assistant => Style::default().fg(Color::White),
+            ChatEntryKind::Error => Style::default().fg(Color::Red),
+            ChatEntryKind::Tool | ChatEntryKind::Patch => Style::default(),
+        };
         if entry.content.is_empty() {
-            lines.push(Line::from(Span::styled("  ...", style)));
-        } else if entry.kind == ChatEntryKind::Patch {
-            lines.extend(wrap_patch_entry_lines(&entry.content, width));
+            lines.push(Line::from(Span::styled("● ...", style)));
         } else {
-            lines.extend(wrap_prefixed_lines(&entry.content, "  ", width, style));
+            lines.extend(wrap_hanging_lines(&entry.content, "● ", "  ", width, style));
         }
         lines.push(Line::from(""));
     }
-    let end = lines.len().saturating_sub(app.chat.scroll);
+    if !lines.is_empty() {
+        lines.pop();
+    }
+    lines
+}
+
+fn visible_chat_transcript_lines(
+    lines: Vec<Line<'static>>,
+    scroll: usize,
+    visible: usize,
+) -> Vec<Line<'static>> {
+    let scroll = scroll.min(lines.len().saturating_sub(visible));
+    let end = lines.len().saturating_sub(scroll);
     let start = end.saturating_sub(visible);
     lines
         .into_iter()
         .skip(start)
         .take(end.saturating_sub(start))
         .collect()
+}
+
+fn clamp_chat_scroll_to_terminal(app: &mut ConfigApp) {
+    let Some(max_scroll) = current_chat_max_scroll(app) else {
+        return;
+    };
+    app.chat.scroll = app.chat.scroll.min(max_scroll);
+}
+
+fn current_chat_max_scroll(app: &ConfigApp) -> Option<usize> {
+    let (width, height) = crossterm::terminal::size().ok()?;
+    let area = chat_transcript_area_for_terminal(width, height);
+    let transcript_width = panel_inner_width(area).saturating_sub(1);
+    let visible = panel_inner_height(area);
+    Some(chat_max_scroll(app, transcript_width, visible))
+}
+
+fn chat_transcript_area_for_terminal(width: u16, height: u16) -> Rect {
+    let area = Rect::new(0, 0, width, height);
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(10),
+            Constraint::Length(2),
+        ])
+        .split(area);
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(66), Constraint::Percentage(34)])
+        .split(layout[1]);
+    let left = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(8), Constraint::Length(5)])
+        .split(columns[0]);
+    left[0]
+}
+
+fn chat_max_scroll(app: &ConfigApp, width: usize, visible: usize) -> usize {
+    chat_transcript_all_lines(app, width)
+        .len()
+        .saturating_sub(visible)
+}
+
+fn render_chat_scrollbar(
+    frame: &mut Frame,
+    area: Rect,
+    total_lines: usize,
+    visible: usize,
+    scroll: usize,
+) {
+    if visible == 0 || total_lines <= visible {
+        return;
+    }
+
+    let mut state = ScrollbarState::new(chat_scrollbar_content_length(total_lines, visible))
+        .position(chat_scrollbar_position(total_lines, visible, scroll))
+        .viewport_content_length(visible);
+    let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(None)
+        .end_symbol(None)
+        .track_symbol(Some("│"))
+        .track_style(Style::default().fg(Color::DarkGray))
+        .thumb_symbol("█")
+        .thumb_style(Style::default().fg(Color::Gray));
+
+    frame.render_stateful_widget(
+        scrollbar,
+        area.inner(Margin {
+            horizontal: 1,
+            vertical: 1,
+        }),
+        &mut state,
+    );
+}
+
+fn chat_scrollbar_position(total_lines: usize, visible: usize, scroll: usize) -> usize {
+    let max_scroll = total_lines.saturating_sub(visible);
+    max_scroll.saturating_sub(scroll.min(max_scroll))
+}
+
+fn chat_scrollbar_content_length(total_lines: usize, visible: usize) -> usize {
+    total_lines.saturating_sub(visible).saturating_add(1)
+}
+
+fn chat_tool_entry_lines(value: &str, width: usize) -> Vec<Line<'static>> {
+    let mut raw_lines = value.split('\n');
+    let header = raw_lines.next().unwrap_or("Ran tool");
+    let mut lines = wrap_hanging_lines(
+        header,
+        "● ",
+        "  ",
+        width,
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
+    );
+
+    let output = raw_lines.collect::<Vec<_>>();
+    if output.is_empty() {
+        return lines;
+    }
+
+    let output_width = width.saturating_sub(4).max(1);
+    for (index, raw) in output.iter().take(CHAT_TOOL_OUTPUT_MAX_LINES).enumerate() {
+        let prefix = if index == 0 { "  └ " } else { "    " };
+        lines.push(Line::from(Span::styled(
+            format!("{prefix}{}", fit_width(raw, output_width)),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    if output.len() > CHAT_TOOL_OUTPUT_MAX_LINES {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "    ... {} lines hidden",
+                output.len() - CHAT_TOOL_OUTPUT_MAX_LINES
+            ),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    lines
 }
 
 fn wrap_patch_entry_lines(value: &str, width: usize) -> Vec<Line<'static>> {
@@ -8109,6 +8406,66 @@ fn wrap_prefixed_lines(
             style,
         )));
     }
+    lines
+}
+
+fn wrap_hanging_lines(
+    value: &str,
+    first_prefix: &str,
+    continuation_prefix: &str,
+    width: usize,
+    style: Style,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut first = true;
+    for raw in value.split('\n') {
+        let prefix = if first {
+            first_prefix
+        } else {
+            continuation_prefix
+        };
+        let wrapped = wrap_hanging_raw_line(raw, prefix, continuation_prefix, width, style);
+        lines.extend(wrapped);
+        first = false;
+    }
+    lines
+}
+
+fn wrap_hanging_raw_line(
+    raw: &str,
+    first_prefix: &str,
+    continuation_prefix: &str,
+    width: usize,
+    style: Style,
+) -> Vec<Line<'static>> {
+    let first_prefix_width = first_prefix.chars().count();
+    let continuation_prefix_width = continuation_prefix.chars().count();
+    let first_width = width.saturating_sub(first_prefix_width).max(1);
+    let continuation_width = width.saturating_sub(continuation_prefix_width).max(1);
+    if raw.is_empty() {
+        return vec![Line::from(Span::styled(first_prefix.to_string(), style))];
+    }
+
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut current_prefix = first_prefix;
+    let mut current_width = first_width;
+    for ch in raw.chars() {
+        if current.chars().count() >= current_width {
+            lines.push(Line::from(Span::styled(
+                format!("{current_prefix}{current}"),
+                style,
+            )));
+            current.clear();
+            current_prefix = continuation_prefix;
+            current_width = continuation_width;
+        }
+        current.push(ch);
+    }
+    lines.push(Line::from(Span::styled(
+        format!("{current_prefix}{current}"),
+        style,
+    )));
     lines
 }
 
@@ -8964,12 +9321,18 @@ fn input_box_lines(value: &str, cursor: usize, width: usize, rows: usize) -> Vec
     lines
 }
 
-fn chat_input_lines(value: &str, width: usize, rows: usize) -> Vec<Line<'static>> {
+fn chat_input_lines(
+    value: &str,
+    cursor: usize,
+    focused: bool,
+    width: usize,
+    rows: usize,
+) -> Vec<Line<'static>> {
     let rows = rows.max(1);
     let width = width.max(1);
     let prompt = if width > 1 { "> " } else { ">" };
     let body_width = width.saturating_sub(prompt.chars().count()).max(1);
-    let body_lines = input_editor_lines(value, value.len(), body_width, rows);
+    let body_lines = input_editor_lines_with_cursor(value, cursor, body_width, rows, focused);
 
     body_lines
         .into_iter()
@@ -8995,6 +9358,16 @@ fn chat_input_lines(value: &str, width: usize, rows: usize) -> Vec<Line<'static>
 }
 
 fn input_editor_lines(value: &str, cursor: usize, width: usize, rows: usize) -> Vec<Line<'static>> {
+    input_editor_lines_with_cursor(value, cursor, width, rows, true)
+}
+
+fn input_editor_lines_with_cursor(
+    value: &str,
+    cursor: usize,
+    width: usize,
+    rows: usize,
+    show_cursor: bool,
+) -> Vec<Line<'static>> {
     let rows = rows.max(1);
     let width = width.max(1);
     let cursor = normalize_cursor(value, cursor);
@@ -9019,14 +9392,15 @@ fn input_editor_lines(value: &str, cursor: usize, width: usize, rows: usize) -> 
                 cursor,
                 width,
                 start > 0 && visible_index == 0,
-                segment.contains_cursor(cursor),
+                show_cursor && segment.contains_cursor(cursor),
             )
         })
         .collect::<Vec<_>>();
 
     while visible.len() < rows {
-        let show_cursor = value.is_empty() && cursor == 0 && visible.is_empty();
-        visible.push(empty_input_line(show_cursor));
+        let show_empty_cursor =
+            show_cursor && value.is_empty() && cursor == 0 && visible.is_empty();
+        visible.push(empty_input_line(show_empty_cursor));
     }
     visible
 }
@@ -9346,6 +9720,14 @@ fn fit_width(value: &str, width: usize) -> String {
         output.push(ch);
     }
     output
+}
+
+fn panel_inner_width(area: Rect) -> usize {
+    area.width.saturating_sub(2) as usize
+}
+
+fn panel_inner_height(area: Rect) -> usize {
+    area.height.saturating_sub(2) as usize
 }
 
 fn progress_percent(done: usize, total: usize) -> usize {
@@ -11993,6 +12375,30 @@ fn panel<'a>(title: &'a str, lines: Vec<Line<'a>>) -> Paragraph<'a> {
         .wrap(Wrap { trim: true })
 }
 
+fn chat_input_panel(lines: Vec<Line<'static>>, focused: bool) -> Paragraph<'static> {
+    let title = if focused { "Input*" } else { "Input" };
+    let border_style = if focused {
+        Style::default()
+            .fg(Color::Cyan)
+            .bg(Color::Black)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray).bg(Color::Black)
+    };
+    Paragraph::new(lines)
+        .style(Style::default().fg(Color::White).bg(Color::Black))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(border_style)
+                .title(Span::styled(
+                    title,
+                    border_style.add_modifier(Modifier::BOLD),
+                )),
+        )
+        .wrap(Wrap { trim: false })
+}
+
 fn bios_panel<'a>(title: &'a str, lines: Vec<Line<'a>>) -> Paragraph<'a> {
     Paragraph::new(lines)
         .style(Style::default().fg(Color::White).bg(Color::Black))
@@ -13041,9 +13447,69 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn chat_input_focus_captures_left_and_right_until_escape() -> Result<()> {
+        let paths = test_paths("chat-input-focus")?;
+        let mut config = AppConfig::default();
+        let mut app = ConfigApp::new(&config);
+        app.switch_section(Page::Chat);
+
+        handle_chat_key(
+            &paths,
+            &mut config,
+            &mut app,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty()),
+        )
+        .await?;
+        assert_eq!(app.page, Page::Chat);
+        assert!(app.chat.input_focused);
+        assert_eq!(app.chat.input, "a");
+        assert_eq!(app.chat.input_cursor, 1);
+
+        handle_chat_key(
+            &paths,
+            &mut config,
+            &mut app,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::empty()),
+        )
+        .await?;
+        assert_eq!(app.page, Page::Chat);
+        assert_eq!(app.chat.input_cursor, 0);
+
+        handle_chat_key(
+            &paths,
+            &mut config,
+            &mut app,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::empty()),
+        )
+        .await?;
+        assert_eq!(app.page, Page::Chat);
+        assert_eq!(app.chat.input_cursor, 1);
+
+        handle_chat_key(
+            &paths,
+            &mut config,
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+        )
+        .await?;
+        assert_eq!(app.page, Page::Chat);
+        assert!(!app.chat.input_focused);
+
+        handle_chat_key(
+            &paths,
+            &mut config,
+            &mut app,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::empty()),
+        )
+        .await?;
+        assert_eq!(app.page, Page::Runtime);
+        Ok(())
+    }
+
     #[test]
     fn chat_input_renders_prompt_and_text_on_same_line() {
-        let lines = chat_input_lines("hello", 20, 2);
+        let lines = chat_input_lines("hello", "hello".len(), true, 20, 2);
         let rendered = lines.iter().map(line_text).collect::<Vec<_>>();
 
         assert_eq!(rendered, vec!["> hello ".to_string(), "  ".to_string()]);
@@ -13056,8 +13522,20 @@ mod tests {
     }
 
     #[test]
+    fn chat_input_hides_cursor_when_not_focused() {
+        let lines = chat_input_lines("hello", "hello".len(), false, 20, 2);
+
+        assert!(
+            !lines
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .any(|span| span.style.bg == Some(Color::White))
+        );
+    }
+
+    #[test]
     fn chat_input_indents_continuation_lines() {
-        let lines = chat_input_lines("one\ntwo", 20, 2);
+        let lines = chat_input_lines("one\ntwo", "one\ntwo".len(), true, 20, 2);
         let rendered = lines.iter().map(line_text).collect::<Vec<_>>();
 
         assert_eq!(rendered, vec!["> one".to_string(), "  two ".to_string()]);
@@ -13079,7 +13557,7 @@ mod tests {
 
     #[test]
     fn chat_input_keeps_cursor_visible_in_two_rows() {
-        let lines = chat_input_lines("one\ntwo\nthree", 20, 2);
+        let lines = chat_input_lines("one\ntwo\nthree", "one\ntwo\nthree".len(), true, 20, 2);
         let rendered = lines.iter().map(line_text).collect::<Vec<_>>();
 
         assert_eq!(rendered, vec!["> …two".to_string(), "  three ".to_string()]);
@@ -13107,11 +13585,9 @@ mod tests {
         assert_eq!(
             rendered,
             vec![
-                "assistant".to_string(),
-                "  abcdefghij".to_string(),
+                "● abcdefghij".to_string(),
                 "  klmnopqrst".to_string(),
                 "  uvwxyz".to_string(),
-                String::new(),
             ]
         );
     }
@@ -13129,15 +13605,118 @@ mod tests {
             .map(line_text)
             .collect::<Vec<_>>();
 
+        assert_eq!(rendered, vec!["● line".to_string(), "  ".to_string()]);
+    }
+
+    #[test]
+    fn chat_tool_entries_show_ran_and_limit_output_lines() {
+        let mut app = ConfigApp::new(&AppConfig::default());
+        app.chat.entries.push(ChatEntry {
+            kind: ChatEntryKind::Tool,
+            content: "Ran git status --short\none\ntwo\nthree\nfour\nfive\nsix".into(),
+        });
+
+        let lines = chat_transcript_lines(&app, 20, 40);
+        let rendered = lines.iter().map(line_text).collect::<Vec<_>>();
+
         assert_eq!(
             rendered,
             vec![
-                "assistant".to_string(),
-                "  line".to_string(),
-                "  ".to_string(),
-                String::new(),
+                "● Ran git status --short".to_string(),
+                "  └ one".to_string(),
+                "    two".to_string(),
+                "    three".to_string(),
+                "    four".to_string(),
+                "    five".to_string(),
+                "    ... 1 lines hidden".to_string(),
             ]
         );
+        let output_style = lines
+            .iter()
+            .find(|line| line_text(line) == "  └ one")
+            .and_then(|line| line.spans.first())
+            .map(|span| span.style.fg);
+        assert_eq!(output_style, Some(Some(Color::DarkGray)));
+    }
+
+    #[test]
+    fn chat_visible_window_keeps_last_content_line() {
+        let mut app = ConfigApp::new(&AppConfig::default());
+        app.chat.entries.push(ChatEntry {
+            kind: ChatEntryKind::Tool,
+            content: "Ran command\none\ntwo\nthree".into(),
+        });
+
+        let rendered = chat_transcript_lines(&app, 4, 40)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            rendered,
+            vec![
+                "● Ran command".to_string(),
+                "  └ one".to_string(),
+                "    two".to_string(),
+                "    three".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn chat_visible_window_clamps_scroll_past_top() {
+        let mut app = ConfigApp::new(&AppConfig::default());
+        app.chat.entries.push(ChatEntry {
+            kind: ChatEntryKind::Assistant,
+            content: "one\ntwo\nthree".into(),
+        });
+        app.chat.scroll = 99;
+
+        let rendered = chat_transcript_lines(&app, 2, 40)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+
+        assert_eq!(rendered, vec!["● one".to_string(), "  two".to_string()]);
+    }
+
+    #[test]
+    fn chat_max_scroll_uses_rendered_line_count() {
+        let mut app = ConfigApp::new(&AppConfig::default());
+        app.chat.entries.push(ChatEntry {
+            kind: ChatEntryKind::Assistant,
+            content: "one\ntwo\nthree".into(),
+        });
+
+        assert_eq!(chat_max_scroll(&app, 40, 2), 1);
+        assert_eq!(chat_max_scroll(&app, 40, 10), 0);
+    }
+
+    #[test]
+    fn chat_scrollbar_position_converts_from_tail_scroll() {
+        assert_eq!(chat_scrollbar_position(10, 4, 0), 6);
+        assert_eq!(chat_scrollbar_position(10, 4, 2), 4);
+        assert_eq!(chat_scrollbar_position(10, 4, 6), 0);
+        assert_eq!(chat_scrollbar_position(10, 4, 99), 0);
+        assert_eq!(chat_scrollbar_position(3, 4, 0), 0);
+    }
+
+    #[test]
+    fn chat_scrollbar_content_length_matches_scroll_range() {
+        assert_eq!(chat_scrollbar_content_length(10, 4), 7);
+        assert_eq!(chat_scrollbar_content_length(4, 4), 1);
+        assert_eq!(chat_scrollbar_content_length(3, 4), 1);
+    }
+
+    #[test]
+    fn chat_events_reset_scroll_to_tail() {
+        let mut app = ConfigApp::new(&AppConfig::default());
+        let mut config = AppConfig::default();
+        app.chat.scroll = 12;
+
+        app.apply_chat_event(&mut config, AgentEvent::Tool("Ran command\nok".into()));
+
+        assert_eq!(app.chat.scroll, 0);
     }
 
     #[test]

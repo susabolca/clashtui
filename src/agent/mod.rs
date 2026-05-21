@@ -154,26 +154,35 @@ async fn run_agent_inner(
             if tool_calls_used > MAX_TOOL_CALLS {
                 anyhow::bail!("agent stopped after too many tool calls");
             }
-            let _ = sender.send(AgentEvent::Tool(format!("running {}", call.function.name)));
-            let result = match execute_tool(&paths, &config, &call, sender).await {
-                Ok(result) => result,
+            let result = match execute_tool(&paths, &config, &call).await {
+                Ok(result) => {
+                    let _ = sender.send(AgentEvent::Tool(format_tool_display(&call, &result)));
+                    result
+                }
                 Err(err) => {
                     let message = err.to_string();
-                    let _ = sender.send(AgentEvent::Tool(format!(
-                        "{} failed: {message}",
-                        call.function.name
-                    )));
-                    json!({ "ok": false, "error": message })
+                    let result = json!({ "ok": false, "error": message });
+                    let _ = sender.send(AgentEvent::Tool(format_tool_display(&call, &result)));
+                    result
                 }
             };
             let patch_sent = call.function.name == "propose_config_patch"
                 && result.get("ok").and_then(Value::as_bool) == Some(true)
                 && result.get("patch_sent").and_then(Value::as_bool) == Some(true);
+            let patch_ready = if patch_sent {
+                Some(
+                    serde_json::from_str::<ConfigPatch>(&call.function.arguments)
+                        .context("invalid config patch returned from tool call")?,
+                )
+            } else {
+                None
+            };
             messages.push(LlmMessage::tool(
                 call.id,
                 truncate_tool_output(&serde_json::to_string_pretty(&result)?),
             ));
-            if patch_sent {
+            if let Some(patch) = patch_ready {
+                let _ = sender.send(AgentEvent::PatchReady(patch));
                 return Ok(());
             }
         }
@@ -594,12 +603,7 @@ fn tool_spec(name: &'static str, description: &'static str, parameters: Value) -
     }
 }
 
-async fn execute_tool(
-    paths: &Paths,
-    config: &AppConfig,
-    call: &LlmToolCall,
-    sender: &Sender<AgentEvent>,
-) -> Result<Value> {
+async fn execute_tool(paths: &Paths, config: &AppConfig, call: &LlmToolCall) -> Result<Value> {
     let args: Value = if call.function.arguments.trim().is_empty() {
         json!({})
     } else {
@@ -613,9 +617,120 @@ async fn execute_tool(
         "get_mihomo_state" => get_mihomo_state_tool(config).await,
         "http_probe" => http_probe_tool(&args).await,
         "run_command" => run_command_tool(&args).await,
-        "propose_config_patch" => propose_config_patch_tool(config, args, sender),
+        "propose_config_patch" => propose_config_patch_tool(config, args),
         other => Ok(json!({ "ok": false, "error": format!("unknown tool: {other}") })),
     }
+}
+
+fn format_tool_display(call: &LlmToolCall, result: &Value) -> String {
+    let args = parse_tool_arguments(call).unwrap_or_else(|| json!({}));
+    let command = tool_command_display(call.function.name.as_str(), &args);
+    let output = tool_output_display(call.function.name.as_str(), result);
+    if output.trim().is_empty() {
+        format!("Ran {command}")
+    } else {
+        format!("Ran {command}\n{output}")
+    }
+}
+
+fn parse_tool_arguments(call: &LlmToolCall) -> Option<Value> {
+    if call.function.arguments.trim().is_empty() {
+        Some(json!({}))
+    } else {
+        serde_json::from_str(&call.function.arguments).ok()
+    }
+}
+
+fn tool_command_display(name: &str, args: &Value) -> String {
+    match name {
+        "run_command" => {
+            let command = args.get("command").and_then(Value::as_str).unwrap_or(name);
+            let command_args = args
+                .get("args")
+                .and_then(Value::as_array)
+                .map(|values| values.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+                .unwrap_or_default();
+            shell_command_display(command, &command_args)
+        }
+        "read_log_tail" => {
+            let kind = args
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("clashtui");
+            let lines = args.get("lines").and_then(Value::as_u64).unwrap_or(80);
+            format!("read_log_tail --kind {} --lines {lines}", shell_quote(kind))
+        }
+        "read_runtime_files" => {
+            let kind = args.get("kind").and_then(Value::as_str).unwrap_or("both");
+            format!("read_runtime_files --kind {}", shell_quote(kind))
+        }
+        "http_probe" => {
+            let method = args.get("method").and_then(Value::as_str).unwrap_or("HEAD");
+            let url = args.get("url").and_then(Value::as_str).unwrap_or("-");
+            format!("http_probe {method} {}", shell_quote(url))
+        }
+        _ => name.to_string(),
+    }
+}
+
+fn tool_output_display(name: &str, result: &Value) -> String {
+    if let Some(error) = result.get("error").and_then(Value::as_str) {
+        return format!("error: {error}");
+    }
+
+    match name {
+        "run_command" => {
+            let stdout = result.get("stdout").and_then(Value::as_str).unwrap_or("");
+            let stderr = result.get("stderr").and_then(Value::as_str).unwrap_or("");
+            match (stdout.trim().is_empty(), stderr.trim().is_empty()) {
+                (false, false) => format!("{stdout}\n{stderr}"),
+                (false, true) => stdout.to_string(),
+                (true, false) => stderr.to_string(),
+                (true, true) => {
+                    let status = result
+                        .get("status")
+                        .and_then(Value::as_i64)
+                        .map_or_else(|| "-".into(), |status| status.to_string());
+                    format!("status={status}")
+                }
+            }
+        }
+        "read_log_tail" => result
+            .get("tail")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        "http_probe" => {
+            let status = result
+                .get("status")
+                .and_then(Value::as_u64)
+                .map_or_else(|| "-".into(), |status| status.to_string());
+            let duration = result
+                .get("duration_ms")
+                .and_then(Value::as_u64)
+                .map_or_else(|| "-".into(), |duration| duration.to_string());
+            format!("status={status} duration_ms={duration}")
+        }
+        _ => serde_json::to_string_pretty(result).unwrap_or_else(|_| result.to_string()),
+    }
+}
+
+fn shell_command_display(command: &str, args: &[&str]) -> String {
+    std::iter::once(shell_quote(command))
+        .chain(args.iter().map(|arg| shell_quote(arg)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shell_quote(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/' | ':'))
+    {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn read_config_tool(config: &AppConfig) -> Result<Value> {
@@ -783,9 +898,7 @@ async fn run_command_tool(args: &Value) -> Result<Value> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    for arg in &command_args {
-        validate_command_arg(arg)?;
-    }
+    validate_command_args(command, &command_args)?;
 
     let timeout_ms = args
         .get("timeout_ms")
@@ -838,23 +951,44 @@ fn validate_diagnostic_command(command: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_command_args(command: &str, args: &[String]) -> Result<()> {
+    for arg in args {
+        validate_command_arg(arg)?;
+    }
+
+    match command {
+        "curl" => validate_curl_args(args),
+        "wget" => validate_wget_args(args),
+        _ => Ok(()),
+    }
+}
+
 fn validate_command_arg(arg: &str) -> Result<()> {
     if arg.len() > 512 || arg.contains('\0') {
         anyhow::bail!("run_command argument is invalid");
     }
     let lower = arg.to_ascii_lowercase();
+    let normalized = if arg.starts_with('-') && !arg.starts_with("--") {
+        arg
+    } else {
+        lower.as_str()
+    };
     if matches!(
-        lower.as_str(),
+        normalized,
         "add"
             | "apply"
             | "change"
+            | "commit"
             | "del"
             | "delete"
             | "down"
             | "flush"
             | "kill"
+            | "modify"
             | "replace"
+            | "reset"
             | "restart"
+            | "restore"
             | "set"
             | "start"
             | "stop"
@@ -871,14 +1005,113 @@ fn validate_command_arg(arg: &str) -> Result<()> {
     Ok(())
 }
 
-fn propose_config_patch_tool(
-    config: &AppConfig,
-    args: Value,
-    sender: &Sender<AgentEvent>,
-) -> Result<Value> {
+fn validate_curl_args(args: &[String]) -> Result<()> {
+    for arg in args {
+        let lower = arg.to_ascii_lowercase();
+        if matches!(
+            arg.as_str(),
+            "-o" | "--output"
+                | "-O"
+                | "--remote-name"
+                | "-J"
+                | "--remote-header-name"
+                | "-T"
+                | "--upload-file"
+                | "-d"
+                | "--data"
+                | "--data-ascii"
+                | "--data-binary"
+                | "--data-raw"
+                | "--data-urlencode"
+                | "-F"
+                | "--form"
+                | "--form-string"
+                | "-X"
+                | "--request"
+                | "-K"
+                | "--config"
+                | "-c"
+                | "--cookie-jar"
+                | "-D"
+                | "--dump-header"
+                | "--output-dir"
+                | "--create-dirs"
+        ) || lower.starts_with("--output=")
+            || lower.starts_with("--upload-file=")
+            || lower.starts_with("--data")
+            || lower.starts_with("--form")
+            || lower.starts_with("--request=")
+            || lower.starts_with("--cookie-jar=")
+            || lower.starts_with("--dump-header=")
+            || lower.starts_with("--output-dir=")
+        {
+            anyhow::bail!("curl is limited to read-only stdout diagnostics");
+        }
+    }
+    Ok(())
+}
+
+fn validate_wget_args(args: &[String]) -> Result<()> {
+    let mut read_only_mode = false;
+    for (index, arg) in args.iter().enumerate() {
+        let lower = arg.to_ascii_lowercase();
+        if arg == "--spider" {
+            read_only_mode = true;
+        }
+        if arg == "-O-" || (arg.starts_with('-') && arg.ends_with("O-")) {
+            read_only_mode = true;
+        }
+        if arg == "-O" {
+            read_only_mode |= args
+                .get(index + 1)
+                .is_some_and(|value| value.as_str() == "-");
+        }
+        if lower == "--output-document=-" {
+            read_only_mode = true;
+        }
+        if matches!(
+            arg.as_str(),
+            "-O" | "--output-document"
+                | "-a"
+                | "--append-output"
+                | "-o"
+                | "--output-file"
+                | "-m"
+                | "--mirror"
+                | "-r"
+                | "--recursive"
+                | "--post-data"
+                | "--post-file"
+                | "--method"
+                | "--body-data"
+                | "--body-file"
+        ) || lower.starts_with("--output-document=")
+            || lower.starts_with("--append-output=")
+            || lower.starts_with("--output-file=")
+            || lower.starts_with("--post-")
+            || lower.starts_with("--method=")
+            || lower.starts_with("--body-")
+        {
+            let stdout_output = (arg == "-O"
+                && args
+                    .get(index + 1)
+                    .is_some_and(|value| value.as_str() == "-"))
+                || lower == "--output-document=-";
+            if !stdout_output {
+                anyhow::bail!("wget is limited to --spider or stdout diagnostics");
+            }
+        }
+    }
+
+    if !read_only_mode {
+        anyhow::bail!("wget requires --spider or stdout output (-O -)");
+    }
+    Ok(())
+}
+
+fn propose_config_patch_tool(config: &AppConfig, args: Value) -> Result<Value> {
     let patch: ConfigPatch = serde_json::from_value(args).context("invalid config patch")?;
     let _updated = apply_config_patch(config, &patch)?;
-    let _ = sender.send(AgentEvent::PatchReady(patch.clone()));
     Ok(json!({
         "ok": true,
         "patch_sent": true,
@@ -929,32 +1162,75 @@ fn truncate_command_output(value: &str) -> String {
 
 const DIAGNOSTIC_COMMANDS: &[&str] = &[
     "arp",
+    "cat",
+    "curl",
     "date",
+    "df",
     "dig",
     "dmesg",
+    "drill",
+    "du",
+    "env",
+    "file",
+    "free",
+    "grep",
+    "head",
     "host",
+    "hostname",
     "id",
     "ifconfig",
     "ip",
     "ipconfig",
+    "iostat",
+    "iw",
+    "iwconfig",
+    "iwgetid",
+    "journalctl",
+    "log",
+    "ls",
     "lsof",
+    "mtr",
     "netsh",
     "netstat",
     "networksetup",
+    "networkctl",
+    "nmcli",
     "nslookup",
+    "pathping",
     "pgrep",
     "ping",
+    "ping6",
+    "printenv",
     "ps",
+    "pwd",
     "resolvectl",
     "route",
+    "rg",
+    "sar",
     "scutil",
     "ss",
+    "stat",
     "sw_vers",
+    "sysctl",
     "systemd-resolve",
+    "tail",
+    "tcpdump",
+    "tracepath",
+    "tracepath6",
     "traceroute",
+    "traceroute6",
+    "tshark",
     "uname",
+    "uptime",
+    "vm_stat",
+    "vmstat",
+    "w",
+    "wc",
+    "wget",
     "where",
     "which",
+    "who",
+    "whois",
     "whoami",
 ];
 
@@ -995,5 +1271,55 @@ mod tests {
         assert_eq!(trimmed.len(), 1);
         assert!(trimmed[0].content.ends_with("...[truncated]"));
         assert!(trimmed[0].content.chars().count() <= MAX_CONTEXT_MESSAGE_CHARS);
+    }
+
+    #[test]
+    fn diagnostic_allowlist_includes_common_network_tools() -> Result<()> {
+        for command in [
+            "curl",
+            "wget",
+            "mtr",
+            "tracepath",
+            "tcpdump",
+            "netstat",
+            "ip",
+        ] {
+            validate_diagnostic_command(command)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn diagnostic_args_reject_curl_write_and_upload_options() {
+        assert!(validate_command_args("curl", &strings(["-I", "https://example.com"])).is_ok());
+        assert!(
+            validate_command_args("curl", &strings(["-o", "out", "https://example.com"])).is_err()
+        );
+        assert!(
+            validate_command_args("curl", &strings(["-T", "file", "https://example.com"])).is_err()
+        );
+        assert!(
+            validate_command_args("curl", &strings(["--data", "x=1", "https://example.com"]))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn diagnostic_args_restrict_wget_to_no_file_output() {
+        assert!(
+            validate_command_args("wget", &strings(["--spider", "https://example.com"])).is_ok()
+        );
+        assert!(
+            validate_command_args("wget", &strings(["-O", "-", "https://example.com"])).is_ok()
+        );
+        assert!(validate_command_args("wget", &strings(["-qO-", "https://example.com"])).is_ok());
+        assert!(validate_command_args("wget", &strings(["https://example.com"])).is_err());
+        assert!(
+            validate_command_args("wget", &strings(["-O", "out", "https://example.com"])).is_err()
+        );
+    }
+
+    fn strings(values: impl IntoIterator<Item = &'static str>) -> Vec<String> {
+        values.into_iter().map(str::to_string).collect()
     }
 }
