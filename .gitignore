@@ -1,0 +1,29 @@
+/target/
+
+# Local editor and OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local runtime/debug output
+*.log
+*.pid
+*.sock
+*.core
+*.profraw
+*.profdata
+
+# Local environment files
+.env
+.env.*
+
+# Accidentally copied binaries
+/clashtui
+/*.exe
+/*.dll
+/*.so
+/*.dylib
+/*.bin
