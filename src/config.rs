@@ -1,14 +1,30 @@
-use std::{collections::BTreeMap, env, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    env,
+    path::PathBuf,
+};
 
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 
 pub const DEFAULT_MIXED_PORT: u16 = 7070;
+pub const DEFAULT_PAC_PORT: u16 = 18080;
 pub const DEFAULT_CONTROLLER_URL: &str = "http://127.0.0.1:19090";
 pub const DEFAULT_RUNTIME_BACKEND: &str = "service";
 pub const DEFAULT_LLM_BASE_URL: &str = "https://api.deepseek.com";
 pub const DEFAULT_LLM_API_KEY_ENV: &str = "DEEPSEEK_API_KEY";
+pub const SYSTEM_PROXY_MODE_HTTP: &str = "http";
+pub const SYSTEM_PROXY_MODE_PAC: &str = "pac";
+pub const PAC_STRATEGY_PROXY_ALL: &str = "proxy-all";
+pub const PAC_STRATEGY_RULES: &str = "rules";
+pub const PAC_STRATEGY_CUSTOM: &str = "custom";
+pub const DEFAULT_PAC_RULE_SOURCE_URL: &str =
+    "https://raw.githubusercontent.com/gfwlist/gfwlist/master/gfwlist.txt";
+pub const DEFAULT_PAC_CONTENT: &str = r#"function FindProxyForURL(url, host) {
+  return "PROXY %proxy-host%:%mixed-port%; SOCKS5 %proxy-host%:%mixed-port%; DIRECT;";
+}
+"#;
 const LEGACY_DEFAULT_MIXED_PORT: u16 = 7897;
 const LEGACY_DEFAULT_CONTROLLER_URLS: [&str; 1] = ["http://127.0.0.1:9097"];
 const DEFAULT_DNS_LISTEN: &str = "127.0.0.1:10553";
@@ -26,6 +42,7 @@ pub struct Paths {
     pub core_log_file: PathBuf,
     pub llm_api_key_file: PathBuf,
     pub llm_providers_file: PathBuf,
+    pub pac_gfwlist_file: PathBuf,
     pub profiles_dir: PathBuf,
     pub cores_dir: PathBuf,
 }
@@ -54,6 +71,7 @@ impl Paths {
         let core_log_file = config_dir.join("mihomo.log");
         let llm_api_key_file = config_dir.join("llm-api-key");
         let llm_providers_file = config_dir.join("llm-providers.yaml");
+        let pac_gfwlist_file = config_dir.join("gfwlist.txt");
         let profiles_dir = config_dir.join("profiles");
         let cores_dir = config_dir.join("cores");
         Ok(Self {
@@ -67,6 +85,7 @@ impl Paths {
             core_log_file,
             llm_api_key_file,
             llm_providers_file,
+            pac_gfwlist_file,
             profiles_dir,
             cores_dir,
         })
@@ -260,9 +279,86 @@ impl AppConfig {
         };
 
         SystemProxyTarget {
-            host: self.proxy_host.clone(),
+            host: self.system_proxy_host(),
             port: self.mixed_port,
             bypass,
+        }
+    }
+
+    pub fn system_proxy_mode(&self) -> &str {
+        if self
+            .system_proxy
+            .mode
+            .eq_ignore_ascii_case(SYSTEM_PROXY_MODE_PAC)
+        {
+            SYSTEM_PROXY_MODE_PAC
+        } else {
+            SYSTEM_PROXY_MODE_HTTP
+        }
+    }
+
+    pub fn system_proxy_uses_pac(&self) -> bool {
+        self.system_proxy_mode() == SYSTEM_PROXY_MODE_PAC
+    }
+
+    pub fn system_proxy_pac_enabled(&self) -> bool {
+        self.system_proxy.enabled && self.system_proxy_uses_pac()
+    }
+
+    pub fn system_proxy_pac_strategy(&self) -> &str {
+        match self
+            .system_proxy
+            .pac_strategy
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            PAC_STRATEGY_CUSTOM => PAC_STRATEGY_CUSTOM,
+            PAC_STRATEGY_RULES | "rule" | "rule-list" | "gfwlist" => PAC_STRATEGY_RULES,
+            _ => PAC_STRATEGY_PROXY_ALL,
+        }
+    }
+
+    pub fn system_proxy_host(&self) -> String {
+        local_proxy_host(&self.proxy_host).to_string()
+    }
+
+    pub fn system_proxy_pac_url(&self) -> String {
+        format!(
+            "http://{}:{}/commands/pac",
+            url_host(&self.system_proxy_host()),
+            self.system_proxy.pac_port
+        )
+    }
+
+    pub fn rendered_pac_content_with_rules(
+        &self,
+        managed_proxy_rules: &[String],
+        managed_direct_rules: &[String],
+    ) -> String {
+        match self.system_proxy_pac_strategy() {
+            PAC_STRATEGY_CUSTOM => render_pac_content(
+                &self.system_proxy.pac_content,
+                &self.system_proxy_host(),
+                self.mixed_port,
+            ),
+            PAC_STRATEGY_RULES => {
+                let proxy_rules =
+                    merged_pac_rules(managed_proxy_rules, &self.system_proxy.pac_proxy_rules);
+                let direct_rules =
+                    merged_pac_rules(managed_direct_rules, &self.system_proxy.pac_direct_rules);
+                render_rule_pac_content(
+                    &self.system_proxy_host(),
+                    self.mixed_port,
+                    &proxy_rules,
+                    &direct_rules,
+                )
+            }
+            _ => render_pac_content(
+                DEFAULT_PAC_CONTENT,
+                &self.system_proxy_host(),
+                self.mixed_port,
+            ),
         }
     }
 
@@ -594,25 +690,45 @@ impl Default for ControllerConfig {
 #[serde(default)]
 pub struct SystemProxyConfig {
     pub enabled: bool,
+    pub mode: String,
     pub use_default_bypass: bool,
     pub bypass: String,
+    pub pac_port: u16,
+    pub pac_strategy: String,
+    pub pac_rule_source_url: String,
+    pub pac_proxy_rules: Vec<String>,
+    pub pac_direct_rules: Vec<String>,
+    pub pac_content: String,
 }
 
 impl Default for SystemProxyConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            mode: SYSTEM_PROXY_MODE_HTTP.into(),
             use_default_bypass: true,
             bypass: String::new(),
+            pac_port: DEFAULT_PAC_PORT,
+            pac_strategy: PAC_STRATEGY_PROXY_ALL.into(),
+            pac_rule_source_url: DEFAULT_PAC_RULE_SOURCE_URL.into(),
+            pac_proxy_rules: Vec::new(),
+            pac_direct_rules: Vec::new(),
+            pac_content: DEFAULT_PAC_CONTENT.into(),
         }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SystemProxyTarget {
     pub host: String,
     pub port: u16,
     pub bypass: String,
+}
+
+impl SystemProxyTarget {
+    pub fn server(&self) -> String {
+        format!("{}:{}", self.host, self.port)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -829,9 +945,140 @@ fn default_tun_device() -> String {
 fn default_bypass() -> String {
     if cfg!(target_os = "windows") {
         "localhost;127.*;192.168.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;<local>".into()
+    } else if cfg!(target_os = "macos") {
+        "127.0.0.1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,localhost,*.local,*.crashlytics.com,<local>".into()
     } else {
         "localhost,127.0.0.1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,::1".into()
     }
+}
+
+fn local_proxy_host(host: &str) -> &str {
+    match host.trim() {
+        "" | "*" | "0.0.0.0" | "::" | "[::]" => "127.0.0.1",
+        host => host,
+    }
+}
+
+fn url_host(host: &str) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    }
+}
+
+fn render_pac_content(template: &str, proxy_host: &str, mixed_port: u16) -> String {
+    let content = if template.trim().is_empty() {
+        DEFAULT_PAC_CONTENT
+    } else {
+        template
+    };
+    content
+        .replace("%proxy-host%", proxy_host)
+        .replace("%proxy_host%", proxy_host)
+        .replace("%mixed-port%", &mixed_port.to_string())
+}
+
+fn merged_pac_rules(managed_rules: &[String], custom_rules: &[String]) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut rules = Vec::new();
+    for rule in managed_rules.iter().chain(custom_rules) {
+        let rule = rule.trim();
+        if !rule.is_empty() && seen.insert(rule.to_string()) {
+            rules.push(rule.to_string());
+        }
+    }
+    rules
+}
+
+fn render_rule_pac_content(
+    proxy_host: &str,
+    mixed_port: u16,
+    proxy_rules: &[String],
+    direct_rules: &[String],
+) -> String {
+    let proxy_target =
+        format!("PROXY {proxy_host}:{mixed_port}; SOCKS5 {proxy_host}:{mixed_port}; DIRECT");
+    format!(
+        r##"var proxyRules = {};
+var directRules = {};
+var proxyTarget = {};
+
+function normalizePacRule(rule) {{
+  rule = String(rule || "").replace(/^\s+|\s+$/g, "");
+  if (!rule || rule.charAt(0) === "!" || rule.charAt(0) === "#") return "";
+  if (rule.charAt(0) === "/" && rule.lastIndexOf("/") > 0) return rule;
+  if (rule.indexOf("@@") === 0) rule = rule.substring(2);
+  if (rule.indexOf("||") === 0) rule = rule.substring(2);
+  if (rule.charAt(0) === "|") rule = rule.substring(1);
+  if (rule.charAt(0) === ".") rule = rule.substring(1);
+  while (rule.charAt(rule.length - 1) === "^" || rule.charAt(rule.length - 1) === "|") {{
+    rule = rule.substring(0, rule.length - 1);
+  }}
+  rule = rule.replace(/\^/g, "*");
+  return rule.toLowerCase();
+}}
+
+function domainMatch(host, domain) {{
+  return host === domain || dnsDomainIs(host, "." + domain);
+}}
+
+function regexRuleMatch(url, rule) {{
+  if (rule.charAt(0) !== "/" || rule.lastIndexOf("/") <= 0) return false;
+  var end = rule.lastIndexOf("/");
+  try {{
+    return new RegExp(rule.substring(1, end), "i").test(url);
+  }} catch (e) {{
+    return false;
+  }}
+}}
+
+function pacRuleMatch(url, host, rule) {{
+  rule = String(rule || "").replace(/^\s+|\s+$/g, "");
+  if (regexRuleMatch(url, rule)) return true;
+  rule = normalizePacRule(rule);
+  if (!rule) return false;
+  host = String(host || "").toLowerCase();
+  url = String(url || "").toLowerCase();
+  if (rule.indexOf("*") >= 0) return shExpMatch(host, rule) || shExpMatch(url, rule);
+  if (rule.indexOf("://") >= 0) return shExpMatch(url, rule + "*");
+  var slash = rule.indexOf("/");
+  if (slash >= 0) rule = rule.substring(0, slash);
+  return domainMatch(host, rule);
+}}
+
+function anyPacRuleMatch(url, host, rules) {{
+  for (var i = 0; i < rules.length; i++) {{
+    if (pacRuleMatch(url, host, rules[i])) return true;
+  }}
+  return false;
+}}
+
+function FindProxyForURL(url, host) {{
+  if (anyPacRuleMatch(url, host, directRules)) return "DIRECT";
+  if (anyPacRuleMatch(url, host, proxyRules)) return proxyTarget;
+  return "DIRECT";
+}}
+"##,
+        json_string_array(proxy_rules),
+        json_string_array(direct_rules),
+        json_string(&proxy_target)
+    )
+}
+
+fn json_string_array(values: &[String]) -> String {
+    serde_json::to_string(
+        &values
+            .iter()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_or_else(|_| "[]".into())
+}
+
+fn json_string(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"DIRECT\"".into())
 }
 
 #[cfg(test)]
@@ -853,6 +1100,73 @@ mod tests {
         assert!(config.port_allocation.auto_controller);
         assert!(!config.port_allocation.auto_mixed);
         assert!(config.port_allocation.auto_dns);
+    }
+
+    #[test]
+    fn system_proxy_defaults_to_http_with_pac_template() {
+        let config = AppConfig::default();
+
+        assert_eq!(config.system_proxy_mode(), SYSTEM_PROXY_MODE_HTTP);
+        assert_eq!(config.system_proxy.pac_port, DEFAULT_PAC_PORT);
+        assert_eq!(config.system_proxy_pac_strategy(), PAC_STRATEGY_PROXY_ALL);
+        assert_eq!(
+            config.system_proxy.pac_rule_source_url,
+            DEFAULT_PAC_RULE_SOURCE_URL
+        );
+        assert!(
+            config
+                .rendered_pac_content_with_rules(&[], &[])
+                .contains("127.0.0.1:7070")
+        );
+    }
+
+    #[test]
+    fn system_proxy_target_uses_connectable_local_host() {
+        let mut config = AppConfig {
+            proxy_host: "0.0.0.0".into(),
+            ..AppConfig::default()
+        };
+        config.system_proxy.mode = SYSTEM_PROXY_MODE_PAC.into();
+
+        assert_eq!(config.system_proxy_target().server(), "127.0.0.1:7070");
+        assert_eq!(
+            config.system_proxy_pac_url(),
+            "http://127.0.0.1:18080/commands/pac"
+        );
+    }
+
+    #[test]
+    fn rule_pac_content_renders_gfwlist_like_rules() {
+        let mut config = AppConfig::default();
+        config.system_proxy.pac_strategy = "gfwlist".into();
+        config.system_proxy.pac_proxy_rules = vec!["||google.com".into(), "*.youtube.com".into()];
+        config.system_proxy.pac_direct_rules = vec!["localhost".into()];
+
+        let content = config.rendered_pac_content_with_rules(&[], &[]);
+
+        assert_eq!(config.system_proxy_pac_strategy(), PAC_STRATEGY_RULES);
+        assert!(content.contains(r#""||google.com""#));
+        assert!(content.contains(r#""*.youtube.com""#));
+        assert!(content.contains(r#""localhost""#));
+        assert!(content.contains("return \"DIRECT\""));
+    }
+
+    #[test]
+    fn rule_pac_content_merges_managed_and_custom_rules() {
+        let mut config = AppConfig::default();
+        config.system_proxy.pac_strategy = PAC_STRATEGY_RULES.into();
+        config.system_proxy.pac_proxy_rules = vec!["||custom.example".into()];
+        config.system_proxy.pac_direct_rules = vec!["custom.local".into()];
+
+        let content = config.rendered_pac_content_with_rules(
+            &["||managed.example".into(), "||custom.example".into()],
+            &["managed.local".into()],
+        );
+
+        assert!(content.contains(r#""||managed.example""#));
+        assert!(content.contains(r#""||custom.example""#));
+        assert!(content.contains(r#""managed.local""#));
+        assert!(content.contains(r#""custom.local""#));
     }
 
     #[test]

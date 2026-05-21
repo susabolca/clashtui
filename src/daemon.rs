@@ -1,4 +1,5 @@
 use std::fs::OpenOptions;
+use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -10,6 +11,8 @@ use tokio::time::sleep;
 
 use crate::config::{AppConfig, ControllerConfig, Paths, PortProxyService, RuntimePaths};
 use crate::mihomo::MihomoClient;
+use crate::pac::PacServer;
+use crate::system_proxy::SystemProxySyncState;
 use crate::{
     autostart, core, dns, port_allocator, runtime_profile, service, subscription, system_proxy, tun,
 };
@@ -193,11 +196,20 @@ pub async fn run(
     let mut last_config = serialize_config(&config)?;
     let mut needs_apply = true;
     let mut last_health_ok: Option<bool> = None;
+    let mut system_proxy_state = SystemProxySyncState::default();
+    let mut pac_server = PacServer::default();
 
     loop {
         if needs_apply {
             eprintln!("runtime apply: begin");
-            match apply_runtime(&paths, &mut config).await {
+            match apply_runtime(
+                &paths,
+                &mut config,
+                &mut system_proxy_state,
+                &mut pac_server,
+            )
+            .await
+            {
                 Ok(()) => {
                     last_config = serialize_config(&config)?;
                     needs_apply = false;
@@ -225,6 +237,7 @@ pub async fn run(
 
         match AppConfig::load_or_init(&paths).await {
             Ok(mut next_config) => {
+                let mut config_changed = false;
                 match port_allocator::ensure_allocated_with_controller(
                     &paths,
                     &mut next_config,
@@ -233,13 +246,12 @@ pub async fn run(
                 )
                 .await
                 {
-                    Ok(true) => {
-                        if let Err(err) = next_config.save(&paths).await {
-                            eprintln!("failed to save allocated ports: {err:#}");
-                        }
-                    }
+                    Ok(true) => config_changed = true,
                     Ok(false) => {}
                     Err(err) => eprintln!("failed to allocate ports: {err:#}"),
+                }
+                if config_changed && let Err(err) = next_config.save(&paths).await {
+                    eprintln!("failed to save config after runtime normalization: {err:#}");
                 }
                 apply_controller_overrides(
                     &mut next_config,
@@ -364,9 +376,12 @@ async fn cleanup_owned_runtimes(
     client: &MihomoClient,
     verbose: bool,
 ) -> Result<()> {
-    if config.system_proxy.enabled
-        && let Err(err) = system_proxy::clear()
-    {
+    let mut system_proxy_state = SystemProxySyncState::default();
+    if let Err(err) = system_proxy::clear_owned(
+        &config.system_proxy_target(),
+        &config.system_proxy_pac_url(),
+        &mut system_proxy_state,
+    ) {
         eprintln!("failed to clear system proxy: {err:#}");
     }
 
@@ -428,17 +443,7 @@ pub async fn status(
     );
 
     let runtime_healthy = print_runtime_summary(config, client, verbose).await;
-    match system_proxy::status() {
-        Ok(status) if verbose => println!(
-            "system-proxy: enabled={} server={} bypass={}",
-            status.enabled, status.server, status.bypass
-        ),
-        Ok(status) => println!(
-            "system-proxy: enabled={} server={}",
-            status.enabled, status.server
-        ),
-        Err(err) => println!("system-proxy: unavailable error={err}"),
-    }
+    print_system_proxy_summary(config, verbose);
     if verbose {
         print_network_summary(config, running);
     }
@@ -683,6 +688,97 @@ async fn print_runtime_summary(config: &AppConfig, client: &MihomoClient, verbos
     config_healthy
 }
 
+fn print_system_proxy_summary(config: &AppConfig, verbose: bool) {
+    match system_proxy::status() {
+        Ok(status) => {
+            let expected_http = config.system_proxy_target().server();
+            let expected_pac = config.system_proxy_pac_url();
+            let pac_server = if config.system_proxy_pac_enabled() {
+                if pac_server_running(config) {
+                    "running"
+                } else {
+                    "offline"
+                }
+            } else {
+                "off"
+            };
+
+            let summary = if !config.system_proxy.enabled {
+                let actual = actual_system_proxy_summary(&status);
+                if actual == "off" {
+                    "off".to_string()
+                } else {
+                    format!("off actual={actual}")
+                }
+            } else if config.system_proxy_uses_pac() {
+                if status.pac_enabled && status.pac_url == expected_pac {
+                    format!("pac ok url={expected_pac} pac-server={pac_server}")
+                } else {
+                    format!(
+                        "pac mismatch expected={} actual={} pac-server={}",
+                        expected_pac,
+                        actual_pac_summary(&status),
+                        pac_server
+                    )
+                }
+            } else if status.enabled && status.server == expected_http {
+                format!("http ok server={expected_http}")
+            } else {
+                format!(
+                    "http mismatch expected={} actual={}",
+                    expected_http,
+                    actual_system_proxy_summary(&status)
+                )
+            };
+
+            println!("system-proxy: {summary}");
+            if verbose {
+                println!(
+                    "system-proxy-actual: http.enabled={} http.server={} pac.enabled={} pac.url={} bypass={}",
+                    status.enabled,
+                    status.server,
+                    status.pac_enabled,
+                    if status.pac_url.is_empty() {
+                        "-"
+                    } else {
+                        status.pac_url.as_str()
+                    },
+                    status.bypass
+                );
+            }
+        }
+        Err(err) => println!("system-proxy: unavailable error={err}"),
+    }
+}
+
+fn actual_system_proxy_summary(status: &system_proxy::SystemProxyStatus) -> String {
+    let mut parts = Vec::new();
+    if status.enabled {
+        parts.push(format!("http:{}", status.server));
+    }
+    if status.pac_enabled {
+        parts.push(format!("pac:{}", status.pac_url));
+    }
+    if parts.is_empty() {
+        "off".into()
+    } else {
+        parts.join(",")
+    }
+}
+
+fn actual_pac_summary(status: &system_proxy::SystemProxyStatus) -> String {
+    if status.pac_enabled {
+        status.pac_url.clone()
+    } else {
+        "off".into()
+    }
+}
+
+fn pac_server_running(config: &AppConfig) -> bool {
+    let addr = SocketAddr::from(([127, 0, 0, 1], config.system_proxy.pac_port));
+    TcpStream::connect_timeout(&addr, Duration::from_millis(120)).is_ok()
+}
+
 async fn print_mihomo_metrics_summary(client: &MihomoClient, verbose: bool) {
     let traffic_result = client.traffic().await;
     let connections_result = client.connections().await;
@@ -787,9 +883,14 @@ fn format_bytes_short(bytes: u64) -> String {
     }
 }
 
-async fn apply_runtime(paths: &Paths, config: &mut AppConfig) -> Result<()> {
+async fn apply_runtime(
+    paths: &Paths,
+    config: &mut AppConfig,
+    system_proxy_state: &mut SystemProxySyncState,
+    pac_server: &mut PacServer,
+) -> Result<()> {
     if config.use_single_runtime() {
-        return apply_single_runtime(paths, config).await;
+        return apply_single_runtime(paths, config, system_proxy_state, pac_server).await;
     }
 
     let mut errors = Vec::new();
@@ -810,7 +911,7 @@ async fn apply_runtime(paths: &Paths, config: &mut AppConfig) -> Result<()> {
             .count()
     );
 
-    if let Err(err) = apply_global_runtime(paths, config).await {
+    if let Err(err) = apply_global_runtime(paths, config, system_proxy_state, pac_server).await {
         errors.push(format!("global: {err:#}"));
     }
     if let Err(err) = apply_port_proxy_runtimes(paths, config).await {
@@ -824,7 +925,12 @@ async fn apply_runtime(paths: &Paths, config: &mut AppConfig) -> Result<()> {
     }
 }
 
-async fn apply_single_runtime(paths: &Paths, config: &mut AppConfig) -> Result<()> {
+async fn apply_single_runtime(
+    paths: &Paths,
+    config: &mut AppConfig,
+    system_proxy_state: &mut SystemProxySyncState,
+    pac_server: &mut PacServer,
+) -> Result<()> {
     let client = MihomoClient::new(&config.controller);
     let mut runtime_config = effective_single_runtime_config(config);
     let mut errors = Vec::new();
@@ -912,17 +1018,6 @@ async fn apply_single_runtime(paths: &Paths, config: &mut AppConfig) -> Result<(
         errors.push(format!("port proxy selection: {err:#}"));
     }
 
-    if config.system_proxy.enabled
-        && let Err(err) = system_proxy::apply(&config.system_proxy_target())
-    {
-        errors.push(format!("system proxy: {err:#}"));
-    } else if config.system_proxy.enabled {
-        eprintln!(
-            "runtime apply: system proxy -> {}:{}",
-            config.proxy_host, config.mixed_port
-        );
-    }
-
     if let Err(err) = tun::apply(&client, &runtime_config.tun).await {
         errors.push(format!("tun: {err:#}"));
     } else {
@@ -941,6 +1036,22 @@ async fn apply_single_runtime(paths: &Paths, config: &mut AppConfig) -> Result<(
     if let Err(err) = verify_runtime_state(&runtime_config, &client).await {
         errors.push(format!("runtime verify: {err:#}"));
     }
+
+    let system_proxy_runtime_ok = system_proxy_runtime_ready(config, &client).await;
+    if system_proxy_runtime_ok && !errors.is_empty() {
+        eprintln!(
+            "runtime apply: system proxy sync will continue because mihomo mixed listener is ready"
+        );
+    }
+    sync_system_proxy_after_runtime(
+        paths,
+        config,
+        system_proxy_state,
+        pac_server,
+        system_proxy_runtime_ok,
+    )
+    .await
+    .unwrap_or_else(|err| errors.push(format!("system proxy: {err:#}")));
 
     for service in config
         .proxy_ports
@@ -1003,7 +1114,73 @@ fn effective_single_runtime_config(config: &AppConfig) -> AppConfig {
     }
 }
 
-async fn apply_global_runtime(paths: &Paths, config: &mut AppConfig) -> Result<()> {
+async fn sync_system_proxy_after_runtime(
+    paths: &Paths,
+    config: &AppConfig,
+    state: &mut SystemProxySyncState,
+    pac_server: &mut PacServer,
+    runtime_ok: bool,
+) -> Result<()> {
+    let target = config.system_proxy_target();
+    let pac_url = config.system_proxy_pac_url();
+
+    if !config.system_proxy.enabled {
+        pac_server.stop();
+        system_proxy::clear_owned(&target, &pac_url, state)?;
+        eprintln!("runtime apply: system proxy cleared");
+        return Ok(());
+    }
+
+    if !runtime_ok {
+        eprintln!("runtime apply: system proxy skipped because runtime is not healthy");
+        return Ok(());
+    }
+
+    if config.system_proxy_uses_pac() {
+        pac_server.ensure(paths, config).await?;
+        system_proxy::apply_pac(&pac_url, state)?;
+        eprintln!(
+            "runtime apply: system proxy pac -> {} server_port={}",
+            pac_url,
+            pac_server
+                .running_port()
+                .map_or_else(|| "-".into(), |port| port.to_string())
+        );
+    } else {
+        pac_server.stop();
+        system_proxy::apply_http(&target, state)?;
+        eprintln!("runtime apply: system proxy http -> {}", target.server());
+    }
+
+    Ok(())
+}
+
+async fn system_proxy_runtime_ready(config: &AppConfig, client: &MihomoClient) -> bool {
+    if client.version().await.is_err() {
+        return false;
+    }
+
+    if let Ok(configs) = client.configs().await {
+        let actual_mixed_port = configs.get("mixed-port").and_then(Value::as_u64);
+        if actual_mixed_port == Some(u64::from(config.mixed_port)) {
+            return true;
+        }
+    }
+
+    local_mixed_listener_running(config)
+}
+
+fn local_mixed_listener_running(config: &AppConfig) -> bool {
+    let addr = SocketAddr::from(([127, 0, 0, 1], config.mixed_port));
+    TcpStream::connect_timeout(&addr, Duration::from_millis(120)).is_ok()
+}
+
+async fn apply_global_runtime(
+    paths: &Paths,
+    config: &mut AppConfig,
+    system_proxy_state: &mut SystemProxySyncState,
+    pac_server: &mut PacServer,
+) -> Result<()> {
     let client = MihomoClient::new(&config.controller);
     let mut errors = Vec::new();
 
@@ -1061,17 +1238,6 @@ async fn apply_global_runtime(paths: &Paths, config: &mut AppConfig) -> Result<(
         errors.push(format!("proxy selection: {err:#}"));
     }
 
-    if config.system_proxy.enabled
-        && let Err(err) = system_proxy::apply(&config.system_proxy_target())
-    {
-        errors.push(format!("system proxy: {err:#}"));
-    } else if config.system_proxy.enabled {
-        eprintln!(
-            "runtime apply: system proxy -> {}:{}",
-            config.proxy_host, config.mixed_port
-        );
-    }
-
     if let Err(err) = tun::apply(&client, &config.tun).await {
         errors.push(format!("tun: {err:#}"));
     } else {
@@ -1090,6 +1256,22 @@ async fn apply_global_runtime(paths: &Paths, config: &mut AppConfig) -> Result<(
     if let Err(err) = verify_runtime_state(config, &client).await {
         errors.push(format!("runtime verify: {err:#}"));
     }
+
+    let system_proxy_runtime_ok = system_proxy_runtime_ready(config, &client).await;
+    if system_proxy_runtime_ok && !errors.is_empty() {
+        eprintln!(
+            "runtime apply: system proxy sync will continue because mihomo mixed listener is ready"
+        );
+    }
+    sync_system_proxy_after_runtime(
+        paths,
+        config,
+        system_proxy_state,
+        pac_server,
+        system_proxy_runtime_ok,
+    )
+    .await
+    .unwrap_or_else(|err| errors.push(format!("system proxy: {err:#}")));
 
     if errors.is_empty() {
         Ok(())
@@ -1290,6 +1472,12 @@ async fn load_single_runtime_profile(
 ) -> Result<()> {
     ensure_active_runtime_profile(paths, config).await?;
     let runtime_config = runtime_profile::write_single_runtime_config(paths, config).await?;
+    if config.use_service_runtime() {
+        let core_path = core::ensure_core_path(paths, config).await?;
+        service::start_core(&core_path, paths, &runtime_config)?;
+        wait_for_mihomo(client).await?;
+        return Ok(());
+    }
     client.reload_config(&runtime_config).await
 }
 

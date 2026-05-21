@@ -70,8 +70,18 @@ proxy_ports:
   services: []
 system_proxy:
   enabled: false
+  mode: http
   use_default_bypass: true
   bypass: ""
+  pac_port: 18080
+  pac_strategy: proxy-all
+  pac_rule_source_url: https://raw.githubusercontent.com/gfwlist/gfwlist/master/gfwlist.txt
+  pac_proxy_rules: []
+  pac_direct_rules: []
+  pac_content: |
+    function FindProxyForURL(url, host) {
+      return "PROXY %proxy-host%:%mixed-port%; SOCKS5 %proxy-host%:%mixed-port%; DIRECT;";
+    }
 tun:
   enable: false
   stack: mixed
@@ -172,6 +182,10 @@ core_path: null
   downloaded from MetaCubeX `meta-rules-dat`. Use the TUI Runtime page
   `Update GeoIP DB` to manually refresh `Country.mmdb`, `geoip.metadb`,
   `geoip.dat`, and `geosite.dat`.
+- PAC gfwlist data is stored as `gfwlist.txt` under the clashtui config
+  directory. Use the TUI Runtime page `Update PAC` to manually download
+  `system_proxy.pac_rule_source_url`. `system_proxy.pac_proxy_rules` and
+  `system_proxy.pac_direct_rules` are preserved as user custom rules.
 
 ### `controller`
 
@@ -245,13 +259,42 @@ rendered as mihomo listeners in one generated runtime config. In `legacy`,
 ```yaml
 system_proxy:
   enabled: false
+  mode: http
   use_default_bypass: true
   bypass: ""
+  pac_port: 18080
+  pac_strategy: proxy-all
+  pac_rule_source_url: https://raw.githubusercontent.com/gfwlist/gfwlist/master/gfwlist.txt
+  pac_proxy_rules: []
+  pac_direct_rules: []
+  pac_content: |
+    function FindProxyForURL(url, host) {
+      return "PROXY %proxy-host%:%mixed-port%; SOCKS5 %proxy-host%:%mixed-port%; DIRECT;";
+    }
 ```
 
-When enabled, OS system proxy points at `proxy_host:mixed_port`. If
-`use_default_bypass` is true, `bypass` is appended to the platform default bypass
-list.
+`enabled` is the master switch. `mode: http` points OS system proxy at the
+connectable local mixed listener, normally `127.0.0.1:7070`. `mode: pac` clears
+the plain system proxy and writes the OS automatic proxy URL:
+
+```text
+http://127.0.0.1:18080/commands/pac
+```
+
+The PAC server is owned by the daemon. `pac_strategy: proxy-all` keeps the
+simple Clash Verge style script and sends all PAC-aware traffic to the local
+mixed listener with DIRECT fallback. `pac_strategy: rules` generates a
+gfwlist-like PAC script by parsing `gfwlist.txt` and merging those rules with
+custom `pac_proxy_rules` and `pac_direct_rules`: direct rules win first, proxy
+rules use the local mixed listener, and unmatched traffic is DIRECT.
+`pac_rule_source_url` is the manual `Update PAC` source, defaulting to gfwlist.
+`Update PAC` rewrites only `gfwlist.txt`; it does not overwrite custom rules
+in `config.yaml`. `pac_strategy: custom` serves `pac_content` after replacing
+`%proxy-host%`, `%proxy_host%`, and `%mixed-port%`.
+
+PAC is not written into the mihomo runtime config; it only affects applications
+that honor OS automatic proxy settings. If `use_default_bypass` is true,
+`bypass` is appended to the platform default bypass list for HTTP mode.
 
 ### TUN
 
@@ -392,6 +435,7 @@ Default ranges:
 
 - global mixed: `7070`
 - Port Proxy listeners: `7071-7970`
+- PAC server: `18080`
 - controller: `19090-19989`
 - legacy Port Proxy controllers: `20090-20989`
 - DNS listen: `15053-15952`
@@ -493,8 +537,35 @@ active_profile: oist
 ```yaml
 system_proxy:
   enabled: true
+  mode: http
   use_default_bypass: true
   bypass: ""
+```
+
+### Enable PAC System Proxy
+
+```yaml
+system_proxy:
+  enabled: true
+  mode: pac
+  pac_port: 18080
+```
+
+### Enable Rule-List PAC
+
+```yaml
+system_proxy:
+  enabled: true
+  mode: pac
+  pac_strategy: rules
+  pac_rule_source_url: https://raw.githubusercontent.com/gfwlist/gfwlist/master/gfwlist.txt
+  # Optional custom rules. Runtime Update PAC writes gfwlist.txt and preserves
+  # these lists.
+  pac_proxy_rules:
+    - "||custom-proxy.example"
+  pac_direct_rules:
+    - "localhost"
+    - "*.local"
 ```
 
 ### Enable TUN

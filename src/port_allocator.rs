@@ -89,6 +89,10 @@ pub async fn ensure_allocated_with_controller(
         used_tcp.insert(port);
     }
 
+    if config.system_proxy_pac_enabled() {
+        used_tcp.insert(config.system_proxy.pac_port);
+    }
+
     for service in &mut config.proxy_ports.services {
         if service.enabled && service.port == 0 {
             let port = allocate_tcp(LISTENER_BASE, 0, &used_tcp, "listener")?;
@@ -157,6 +161,15 @@ pub fn validate_required_ports_available(config: &AppConfig) -> Result<()> {
         check_udp_available(host, port, "dns listen")?;
     }
 
+    if config.system_proxy_pac_enabled() {
+        check_tcp_port(
+            &mut tcp_ports,
+            "pac server",
+            LOCALHOST,
+            config.system_proxy.pac_port,
+        )?;
+    }
+
     Ok(())
 }
 
@@ -209,6 +222,9 @@ fn fixed_tcp_ports(config: &AppConfig) -> BTreeSet<u16> {
         && let Some(port) = listen_port(&config.dns.listen)
     {
         ports.insert(port);
+    }
+    if config.system_proxy_pac_enabled() {
+        ports.insert(config.system_proxy.pac_port);
     }
     for service in config
         .proxy_ports
@@ -423,6 +439,7 @@ mod tests {
             core_log_file: std::env::temp_dir().join("clashtui-port-test/mihomo.log"),
             llm_api_key_file: std::env::temp_dir().join("clashtui-port-test/llm-api-key"),
             llm_providers_file: std::env::temp_dir().join("clashtui-port-test/llm-providers.yaml"),
+            pac_gfwlist_file: std::env::temp_dir().join("clashtui-port-test/gfwlist.txt"),
             profiles_dir: std::env::temp_dir().join("clashtui-port-test/profiles"),
             cores_dir: std::env::temp_dir().join("clashtui-port-test/cores"),
         };
@@ -430,6 +447,34 @@ mod tests {
         ensure_allocated(&paths, &mut config).await?;
 
         assert_eq!(config.mixed_port, 7070);
+        Ok(())
+    }
+
+    #[test]
+    fn pac_port_conflicts_with_mixed_port_when_enabled() -> Result<()> {
+        let listener = std::net::TcpListener::bind((LOCALHOST, 0))?;
+        let port = listener.local_addr()?.port();
+        drop(listener);
+
+        let config = AppConfig {
+            mixed_port: port,
+            system_proxy: crate::config::SystemProxyConfig {
+                enabled: true,
+                mode: crate::config::SYSTEM_PROXY_MODE_PAC.into(),
+                pac_port: port,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let err = match validate_required_ports_available(&config) {
+            Ok(()) => anyhow::bail!("pac port conflict should be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains(&format!("pac server port {port} conflicts"))
+        );
         Ok(())
     }
 }

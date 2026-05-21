@@ -33,8 +33,8 @@ use tokio::time::sleep;
 use crate::agent::{self, AgentEvent, ConfigPatch};
 use crate::autostart;
 use crate::config::{
-    AppConfig, ControllerConfig, Paths, PortProxyService, ProxyProfile, RuntimePaths, Subscription,
-    SubscriptionRefresh,
+    AppConfig, ControllerConfig, Paths, PortProxyService, ProxyProfile, RuntimePaths,
+    SYSTEM_PROXY_MODE_HTTP, SYSTEM_PROXY_MODE_PAC, Subscription, SubscriptionRefresh,
 };
 use crate::core;
 use crate::dns;
@@ -42,6 +42,7 @@ use crate::i18n::Language;
 use crate::llm::{LlmClient, LlmMessage};
 use crate::llm_providers;
 use crate::mihomo::{MihomoClient, ProxyGroup};
+use crate::pac;
 use crate::port_allocator;
 use crate::runtime_profile;
 use crate::service;
@@ -105,7 +106,7 @@ pub async fn run(paths: &Paths, config: &mut AppConfig, language: Language) -> R
         app.poll_chat(&mut draft);
         app.poll_assistant_test();
         app.start_proxy_log_refresh(paths, &draft);
-        app.poll_runtime_command(paths, &draft).await;
+        app.poll_runtime_command(paths, &mut draft).await;
         terminal
             .terminal
             .draw(|frame| draw(frame, paths, &draft, &app))?;
@@ -130,7 +131,7 @@ pub async fn run(paths: &Paths, config: &mut AppConfig, language: Language) -> R
         app.poll_proxy_log_refresh();
         app.poll_chat(&mut draft);
         app.poll_assistant_test();
-        app.poll_runtime_command(paths, &draft).await;
+        app.poll_runtime_command(paths, &mut draft).await;
     }
 
     if !app.dirty {
@@ -151,6 +152,8 @@ enum Page {
     SubscriptionRules,
     AddSubscription,
     Runtime,
+    RuntimePacProxyRules,
+    RuntimePacDirectRules,
     Chat,
     Exit,
     ProxyConfig,
@@ -203,6 +206,8 @@ impl Page {
                 Self::SubscriptionRules => "Rules",
                 Self::AddSubscription => "添加订阅",
                 Self::Runtime => "Runtime",
+                Self::RuntimePacProxyRules => "Proxy Rules",
+                Self::RuntimePacDirectRules => "Direct Rules",
                 Self::Chat => "Chat",
                 Self::Exit => "退出",
                 Self::ProxyConfig => "Proxy",
@@ -224,6 +229,8 @@ impl Page {
             Self::SubscriptionRules => "Rules",
             Self::AddSubscription => "Add Subscription",
             Self::Runtime => "Runtime",
+            Self::RuntimePacProxyRules => "PAC Proxy Rules",
+            Self::RuntimePacDirectRules => "PAC Direct Rules",
             Self::Chat => "Chat",
             Self::Exit => "Exit",
             Self::ProxyConfig => "Proxy",
@@ -255,7 +262,7 @@ impl Page {
             | Self::SubscriptionRules
             | Self::AddSubscription => 2,
             Self::Dns => 3,
-            Self::Runtime => 4,
+            Self::Runtime | Self::RuntimePacProxyRules | Self::RuntimePacDirectRules => 4,
             Self::Chat => 5,
             Self::Exit => 6,
         }
@@ -270,6 +277,10 @@ enum RuntimeItem {
     CorePath,
     CoreUpdate,
     GeodataUpdate,
+    PacSection,
+    PacProxyRules,
+    PacDirectRules,
+    PacUpdate,
     Controller,
     Refresh,
     LlmSection,
@@ -282,7 +293,7 @@ enum RuntimeItem {
 }
 
 impl RuntimeItem {
-    const ALL: [Self; 15] = [
+    const ALL: [Self; 19] = [
         Self::Service,
         Self::Autostart,
         Self::Logs,
@@ -291,6 +302,10 @@ impl RuntimeItem {
         Self::GeodataUpdate,
         Self::Controller,
         Self::Refresh,
+        Self::PacSection,
+        Self::PacProxyRules,
+        Self::PacDirectRules,
+        Self::PacUpdate,
         Self::LlmSection,
         Self::LlmProvider,
         Self::LlmBaseUrl,
@@ -313,6 +328,10 @@ impl RuntimeItem {
                 Self::CorePath => "Mihomo Core",
                 Self::CoreUpdate => "更新 Core",
                 Self::GeodataUpdate => "更新 GeoIP DB",
+                Self::PacSection => "PAC",
+                Self::PacProxyRules => "Proxy Rules",
+                Self::PacDirectRules => "Direct Rules",
+                Self::PacUpdate => "更新 PAC",
                 Self::Controller => "Controller",
                 Self::Refresh => "刷新 Runtime",
                 Self::LlmSection => "LLM",
@@ -331,6 +350,10 @@ impl RuntimeItem {
             Self::CorePath => "Mihomo Core",
             Self::CoreUpdate => "Update Core",
             Self::GeodataUpdate => "Update GeoIP DB",
+            Self::PacSection => "PAC",
+            Self::PacProxyRules => "Proxy Rules",
+            Self::PacDirectRules => "Direct Rules",
+            Self::PacUpdate => "Update PAC",
             Self::Controller => "Controller",
             Self::Refresh => "Refresh Runtime",
             Self::LlmSection => "LLM",
@@ -344,7 +367,7 @@ impl RuntimeItem {
     }
 
     const fn is_section(self) -> bool {
-        matches!(self, Self::LlmSection)
+        matches!(self, Self::PacSection | Self::LlmSection)
     }
 }
 
@@ -1089,6 +1112,7 @@ enum ActionKind {
     TestAssistant,
     UpdateCore,
     UpdateGeodata,
+    UpdatePac,
     StartRuntime,
     StopRuntime,
     ReloadRuntime,
@@ -1164,6 +1188,7 @@ enum RuntimeCommand {
     Restart,
     UpdateCore,
     UpdateGeodata,
+    UpdatePac,
 }
 
 impl RuntimeCommand {
@@ -1175,6 +1200,7 @@ impl RuntimeCommand {
             Self::Restart => "Restarting Runtime",
             Self::UpdateCore => "Updating Mihomo Core",
             Self::UpdateGeodata => "Updating GeoIP DB",
+            Self::UpdatePac => "Updating PAC",
         }
     }
 
@@ -1186,6 +1212,7 @@ impl RuntimeCommand {
             Self::Restart => "Restarting mihomo...",
             Self::UpdateCore => "Updating mihomo core...",
             Self::UpdateGeodata => "Updating GeoIP and GeoSite data...",
+            Self::UpdatePac => "Updating PAC rules; may take a while...",
         }
     }
 }
@@ -1270,6 +1297,22 @@ struct RuntimeCommandResult {
     message: Option<String>,
 }
 
+impl RuntimeCommandResult {
+    fn success(message: Option<String>) -> Self {
+        Self {
+            success: true,
+            message,
+        }
+    }
+
+    fn failure(message: impl Into<String>) -> Self {
+        Self {
+            success: false,
+            message: Some(message.into()),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct DelayCheckProgress {
     title: String,
@@ -1330,6 +1373,7 @@ struct ConfigApp {
     selected_proxy_field: usize,
     selected_proxy_connection: usize,
     selected_proxy_log: usize,
+    selected_pac_rule: usize,
     selected_mode: usize,
     selected_dns: usize,
     selected_exit: usize,
@@ -1391,6 +1435,7 @@ impl ConfigApp {
             selected_proxy_field: 0,
             selected_proxy_connection: 0,
             selected_proxy_log: 0,
+            selected_pac_rule: 0,
             selected_mode: runtime_mode_index(config),
             selected_dns: 0,
             selected_exit: first_selectable_exit_index(),
@@ -1621,25 +1666,26 @@ impl ConfigApp {
         self.status = format!("{}...", command.title());
     }
 
-    async fn poll_runtime_command(&mut self, paths: &Paths, config: &AppConfig) {
+    async fn poll_runtime_command(&mut self, paths: &Paths, config: &mut AppConfig) {
         let Some(task) = self.runtime_command.as_mut() else {
             return;
         };
         let result = match task.receiver.try_recv() {
             Ok(result) => result,
             Err(TryRecvError::Empty) => return,
-            Err(TryRecvError::Disconnected) => RuntimeCommandResult {
-                success: false,
-                message: Some("runtime task stopped before reporting a result".into()),
-            },
+            Err(TryRecvError::Disconnected) => {
+                RuntimeCommandResult::failure("runtime task stopped before reporting a result")
+            }
         };
         let Some(task) = self.runtime_command.take() else {
             return;
         };
         task.handle.abort();
 
-        if result.success {
-            self.status = result.message.unwrap_or(task.success);
+        let RuntimeCommandResult { success, message } = result;
+
+        if success {
+            self.status = message.unwrap_or(task.success);
             if task.exit_after {
                 self.should_quit = true;
             } else {
@@ -1648,9 +1694,8 @@ impl ConfigApp {
             return;
         }
 
-        let message = result
-            .message
-            .unwrap_or_else(|| format!("{} failed without output", task.command.title()));
+        let message =
+            message.unwrap_or_else(|| format!("{} failed without output", task.command.title()));
         let title = format!("{} Failed", task.command.title());
         self.alert(&title, message.clone());
         self.status = format!(
@@ -2225,6 +2270,14 @@ impl ConfigApp {
             Page::Runtime => {
                 self.selected_runtime = nearest_selectable_runtime_index(self.selected_runtime);
             }
+            Page::RuntimePacProxyRules => {
+                let count = pac_proxy_rule_rows(config).len().max(1);
+                clamp_index(&mut self.selected_pac_rule, count);
+            }
+            Page::RuntimePacDirectRules => {
+                let count = pac_direct_rule_rows(config).len().max(1);
+                clamp_index(&mut self.selected_pac_rule, count);
+            }
             Page::Exit => {
                 self.selected_exit = nearest_selectable_exit_index(self.selected_exit);
             }
@@ -2372,6 +2425,7 @@ impl ConfigApp {
             Page::SubscriptionRules => self.selected_subscription_rule,
             Page::AddSubscription => self.subscription_form.selected,
             Page::Runtime => self.selected_runtime,
+            Page::RuntimePacProxyRules | Page::RuntimePacDirectRules => self.selected_pac_rule,
             Page::Exit => self.selected_exit,
             Page::ProxyConfig => self.selected_proxy_field,
             Page::ProxyConnections => self.selected_proxy_connection,
@@ -2399,6 +2453,8 @@ impl ConfigApp {
             Page::SubscriptionRules => subscription_rule_count(paths, config, self),
             Page::AddSubscription => SubscriptionFormField::ALL.len(),
             Page::Runtime => RuntimeItem::ALL.len(),
+            Page::RuntimePacProxyRules => pac_proxy_rule_rows(config).len().max(1),
+            Page::RuntimePacDirectRules => pac_direct_rule_rows(config).len().max(1),
             Page::Exit => ExitItem::ALL.len(),
             Page::ProxyConfig => self.proxy_config_fields().len(),
             Page::ProxyConnections => proxy_connection_rows(config, self).len().max(1),
@@ -2433,6 +2489,9 @@ impl ConfigApp {
             Page::SubscriptionRules => self.selected_subscription_rule = selected,
             Page::AddSubscription => self.subscription_form.selected = selected,
             Page::Runtime => self.selected_runtime = nearest_selectable_runtime_index(selected),
+            Page::RuntimePacProxyRules | Page::RuntimePacDirectRules => {
+                self.selected_pac_rule = selected;
+            }
             Page::Exit => self.selected_exit = nearest_selectable_exit_index(selected),
             Page::ProxyConfig => self.selected_proxy_field = selected,
             Page::ProxyConnections => self.selected_proxy_connection = selected,
@@ -2713,6 +2772,14 @@ impl ConfigApp {
             Page::Runtime => {
                 self.selected_runtime = next_selectable_runtime_index(self.selected_runtime)
             }
+            Page::RuntimePacProxyRules => {
+                self.selected_pac_rule =
+                    next_index(self.selected_pac_rule, pac_proxy_rule_rows(config).len())
+            }
+            Page::RuntimePacDirectRules => {
+                self.selected_pac_rule =
+                    next_index(self.selected_pac_rule, pac_direct_rule_rows(config).len())
+            }
             Page::Exit => {
                 self.selected_exit = next_selectable_exit_index(self.selected_exit);
             }
@@ -2795,6 +2862,14 @@ impl ConfigApp {
             Page::Dns => self.selected_dns = prev_index(self.selected_dns, DnsItem::ALL.len()),
             Page::Runtime => {
                 self.selected_runtime = prev_selectable_runtime_index(self.selected_runtime)
+            }
+            Page::RuntimePacProxyRules => {
+                self.selected_pac_rule =
+                    prev_index(self.selected_pac_rule, pac_proxy_rule_rows(config).len())
+            }
+            Page::RuntimePacDirectRules => {
+                self.selected_pac_rule =
+                    prev_index(self.selected_pac_rule, pac_direct_rule_rows(config).len())
             }
             Page::Exit => {
                 self.selected_exit = prev_selectable_exit_index(self.selected_exit);
@@ -3878,6 +3953,12 @@ async fn submit_selection(
         Page::ProxyConnections => {
             app.status = "Connections are read-only snapshots from mihomo".into();
         }
+        Page::RuntimePacProxyRules => {
+            app.status = "PAC proxy rules are read-only in this view".into();
+        }
+        Page::RuntimePacDirectRules => {
+            app.status = "PAC direct rules are read-only in this view".into();
+        }
         Page::ProxyLogs => {
             app.status = "Logs are read-only".into();
         }
@@ -4352,6 +4433,16 @@ async fn submit_runtime_item(
             "GeoIP DB update finished",
             false,
         ),
+        RuntimeItem::PacSection => app.status = "PAC settings".into(),
+        RuntimeItem::PacProxyRules => open_runtime_pac_proxy_rules_page(app),
+        RuntimeItem::PacDirectRules => open_runtime_pac_direct_rules_page(app),
+        RuntimeItem::PacUpdate => app.start_runtime_command(
+            paths,
+            config,
+            RuntimeCommand::UpdatePac,
+            "PAC rules updated",
+            false,
+        ),
         RuntimeItem::Controller => begin_controller_input(config, app),
         RuntimeItem::Refresh => refresh_runtime(paths, config, app),
         RuntimeItem::LlmSection => app.status = "LLM assistant settings".into(),
@@ -4363,6 +4454,14 @@ async fn submit_runtime_item(
         RuntimeItem::TestAssistant => app.start_assistant_test(paths, config),
     }
     Ok(())
+}
+
+fn open_runtime_pac_proxy_rules_page(app: &mut ConfigApp) {
+    app.enter_page(Page::RuntimePacProxyRules, "PAC proxy rules");
+}
+
+fn open_runtime_pac_direct_rules_page(app: &mut ConfigApp) {
+    app.enter_page(Page::RuntimePacDirectRules, "PAC direct rules");
 }
 
 async fn submit_proxy_config_item(
@@ -4414,9 +4513,7 @@ async fn submit_proxy_config_item(
             }
         }
         ProxyConfigField::OsProxy => toggle_system_proxy(paths, config, app).await?,
-        ProxyConfigField::Pac => {
-            app.status = "PAC configuration is not implemented in this preview".into()
-        }
+        ProxyConfigField::Pac => toggle_system_proxy_mode(config, app),
         ProxyConfigField::Tun => toggle_tun(paths, config, app).await?,
         ProxyConfigField::Logs => {
             app.selected_proxy_log = 0;
@@ -4899,6 +4996,23 @@ async fn toggle_system_proxy(
         on_off(config.system_proxy.enabled)
     );
     Ok(())
+}
+
+fn toggle_system_proxy_mode(config: &mut AppConfig, app: &mut ConfigApp) {
+    config.system_proxy.mode = if config.system_proxy_uses_pac() {
+        SYSTEM_PROXY_MODE_HTTP.into()
+    } else {
+        SYSTEM_PROXY_MODE_PAC.into()
+    };
+    app.mark_dirty();
+    app.status = format!(
+        "PAC={} pending save",
+        if config.system_proxy_uses_pac() {
+            "on"
+        } else {
+            "off"
+        }
+    );
 }
 
 async fn toggle_autostart(
@@ -5454,6 +5568,22 @@ fn format_geodata_update_report(report: &core::GeodataUpdateReport) -> String {
     )
 }
 
+fn format_pac_update_report(update: &pac::PacRuleUpdate, config: &AppConfig) -> String {
+    let mut report = format!(
+        "PAC updated: {} managed proxy rules, {} managed direct rules from {}; {} decoded ({} downloaded); file={}",
+        update.proxy_rule_count,
+        update.direct_rule_count,
+        update.source_url,
+        format_bytes_short(update.decoded_bytes as u64),
+        format_bytes_short(update.raw_bytes as u64),
+        update.target_file.display()
+    );
+    if config.system_proxy_pac_strategy() != crate::config::PAC_STRATEGY_RULES {
+        report.push_str("; set PAC strategy=rules to use gfwlist rules");
+    }
+    report
+}
+
 fn run_runtime_cli_command(command: RuntimeCommand) -> Result<std::process::Output> {
     let arg = match command {
         RuntimeCommand::Start => "start",
@@ -5464,6 +5594,7 @@ fn run_runtime_cli_command(command: RuntimeCommand) -> Result<std::process::Outp
         RuntimeCommand::UpdateGeodata => {
             anyhow::bail!("GeoIP DB update is handled in the config UI")
         }
+        RuntimeCommand::UpdatePac => anyhow::bail!("PAC update is handled in the config UI"),
     };
     let exe = std::env::current_exe().context("failed to locate current executable")?;
     Command::new(exe)
@@ -5482,85 +5613,63 @@ async fn run_runtime_command_task(
 ) -> RuntimeCommandResult {
     if matches!(command, RuntimeCommand::Reload) {
         return match reload_runtime_from_saved_config(&paths).await {
-            Ok(()) => RuntimeCommandResult {
-                success: true,
-                message: None,
-            },
-            Err(err) => RuntimeCommandResult {
-                success: false,
-                message: Some(format!("{err:#}")),
-            },
+            Ok(()) => RuntimeCommandResult::success(None),
+            Err(err) => RuntimeCommandResult::failure(format!("{err:#}")),
         };
     }
 
     if matches!(command, RuntimeCommand::UpdateCore) {
         return match core::update_managed_core(&paths, &config).await {
-            Ok(install) => RuntimeCommandResult {
-                success: true,
-                message: Some(if install.updated {
-                    format!(
-                        "{} updated to {}; restart to use {}",
-                        install.source.label(),
-                        install.version,
-                        install.path.display()
-                    )
-                } else {
-                    format!(
-                        "{} already current at {}; path={}",
-                        install.source.label(),
-                        install.version,
-                        install.path.display()
-                    )
-                }),
-            },
-            Err(err) => RuntimeCommandResult {
-                success: false,
-                message: Some(format!("{err:#}")),
-            },
+            Ok(install) => RuntimeCommandResult::success(Some(if install.updated {
+                format!(
+                    "{} updated to {}; restart to use {}",
+                    install.source.label(),
+                    install.version,
+                    install.path.display()
+                )
+            } else {
+                format!(
+                    "{} already current at {}; path={}",
+                    install.source.label(),
+                    install.version,
+                    install.path.display()
+                )
+            })),
+            Err(err) => RuntimeCommandResult::failure(format!("{err:#}")),
         };
     }
 
     if matches!(command, RuntimeCommand::UpdateGeodata) {
         return match core::update_geodata(&paths).await {
-            Ok(report) => RuntimeCommandResult {
-                success: true,
-                message: Some(format_geodata_update_report(&report)),
-            },
-            Err(err) => RuntimeCommandResult {
-                success: false,
-                message: Some(format!("{err:#}")),
-            },
+            Ok(report) => {
+                RuntimeCommandResult::success(Some(format_geodata_update_report(&report)))
+            }
+            Err(err) => RuntimeCommandResult::failure(format!("{err:#}")),
+        };
+    }
+
+    if matches!(command, RuntimeCommand::UpdatePac) {
+        return match pac::update_gfwlist_rules(&paths, &config).await {
+            Ok(update) => {
+                RuntimeCommandResult::success(Some(format_pac_update_report(&update, &config)))
+            }
+            Err(err) => RuntimeCommandResult::failure(format!("{err:#}")),
         };
     }
 
     match tokio::task::spawn_blocking(move || run_runtime_cli_command(command)).await {
-        Ok(Ok(output)) if output.status.success() => RuntimeCommandResult {
-            success: true,
-            message: None,
-        },
+        Ok(Ok(output)) if output.status.success() => RuntimeCommandResult::success(None),
         Ok(Ok(output)) => {
             if matches!(command, RuntimeCommand::Start | RuntimeCommand::Restart)
                 && wait_for_runtime_after_restart(&config).await
             {
-                RuntimeCommandResult {
-                    success: true,
-                    message: None,
-                }
+                RuntimeCommandResult::success(None)
             } else {
-                RuntimeCommandResult {
-                    success: false,
-                    message: Some(restart_output_message(&output)),
-                }
+                RuntimeCommandResult::failure(restart_output_message(&output))
             }
         }
-        Ok(Err(err)) => RuntimeCommandResult {
-            success: false,
-            message: Some(format!("{err:#}")),
-        },
-        Err(err) => RuntimeCommandResult {
-            success: false,
-            message: Some(format!("runtime task failed: {err}")),
-        },
+        Ok(Err(err)) => RuntimeCommandResult::failure(format!("{err:#}")),
+        Err(err) => RuntimeCommandResult::failure(format!("runtime task failed: {err}")),
     }
 }
 
@@ -6090,6 +6199,28 @@ fn draw_settings(
         );
         return None;
     }
+    if app.page == Page::RuntimePacProxyRules {
+        draw_compact_rows(
+            frame,
+            page_summary(app.page),
+            pac_proxy_rule_rows(config),
+            app.selected_pac_rule,
+            area,
+            Style::default().fg(Color::White),
+        );
+        return None;
+    }
+    if app.page == Page::RuntimePacDirectRules {
+        draw_compact_rows(
+            frame,
+            page_summary(app.page),
+            pac_direct_rule_rows(config),
+            app.selected_pac_rule,
+            area,
+            Style::default().fg(Color::White),
+        );
+        return None;
+    }
     if app.page == Page::ProxyLogs {
         draw_compact_rows(
             frame,
@@ -6473,8 +6604,8 @@ fn draw_help(
                 Style::default().fg(Color::Cyan),
             )),
             Line::from(""),
-            Line::from(row.help.clone()),
         ]);
+        lines.extend(help_detail_lines(&row.help));
     }
 
     frame.render_widget(
@@ -6504,6 +6635,12 @@ fn draw_help(
     );
 }
 
+fn help_detail_lines(help: &str) -> Vec<Line<'static>> {
+    help.lines()
+        .map(|line| Line::from(line.to_string()))
+        .collect()
+}
+
 fn setting_rows(paths: &Paths, config: &AppConfig, app: &ConfigApp) -> Vec<SettingRow> {
     match app.page {
         Page::Main => main_proxy_rows(config)
@@ -6528,6 +6665,8 @@ fn setting_rows(paths: &Paths, config: &AppConfig, app: &ConfigApp) -> Vec<Setti
         Page::SubscriptionRules => subscription_rule_rows(paths, config, app),
         Page::AddSubscription => add_subscription_rows(app),
         Page::Runtime => runtime_rows(paths, config, app),
+        Page::RuntimePacProxyRules => compact_setting_rows(pac_proxy_rule_rows(config)),
+        Page::RuntimePacDirectRules => compact_setting_rows(pac_direct_rule_rows(config)),
         Page::Chat => chat_rows(config, app),
         Page::Exit => exit_rows(app.language),
         Page::ProxyConfig => proxy_config_rows(config, app),
@@ -6956,14 +7095,14 @@ fn proxy_config_rows(config: &AppConfig, app: &ConfigApp) -> Vec<SettingRow> {
                 },
                 ProxyConfigField::Delete => RowKind::Action(ActionKind::DeletePortProxy),
                 ProxyConfigField::OsProxy => RowKind::Toggle(ToggleAction::SystemProxy),
-                ProxyConfigField::Pac => RowKind::Info,
+                ProxyConfigField::Pac => RowKind::Toggle(ToggleAction::SystemProxy),
                 ProxyConfigField::Tun => RowKind::Toggle(ToggleAction::Tun),
                 ProxyConfigField::Logs => RowKind::Action(ActionKind::Logs),
             };
             SettingRow {
                 label: field.label().into(),
                 value: proxy_config_field_value(config, app, *field),
-                help: proxy_config_field_help(config, app, *field).into(),
+                help: proxy_config_field_help(config, app, *field),
                 kind,
             }
         })
@@ -7123,6 +7262,10 @@ fn runtime_rows(paths: &Paths, config: &AppConfig, app: &ConfigApp) -> Vec<Setti
                 RuntimeItem::CorePath => RowKind::Choice(ChoiceAction::CoreSource),
                 RuntimeItem::CoreUpdate => RowKind::Action(ActionKind::UpdateCore),
                 RuntimeItem::GeodataUpdate => RowKind::Action(ActionKind::UpdateGeodata),
+                RuntimeItem::PacSection => RowKind::SoftSection,
+                RuntimeItem::PacProxyRules => RowKind::StatusSubmenu(Page::RuntimePacProxyRules),
+                RuntimeItem::PacDirectRules => RowKind::StatusSubmenu(Page::RuntimePacDirectRules),
+                RuntimeItem::PacUpdate => RowKind::Action(ActionKind::UpdatePac),
                 RuntimeItem::Controller => RowKind::Input(InputMode::Controller),
                 RuntimeItem::Refresh => RowKind::Action(ActionKind::RefreshRuntime),
                 RuntimeItem::LlmSection => RowKind::SoftSection,
@@ -7279,6 +7422,8 @@ fn page_summary(page: Page) -> &'static str {
         Page::SubscriptionRules => "rules / providers / raw profile",
         Page::AddSubscription => "new profile / URL / refresh",
         Page::Runtime => "service / controller / logs",
+        Page::RuntimePacProxyRules => "PAC proxy rules / user config",
+        Page::RuntimePacDirectRules => "PAC direct rules / user config",
         Page::Chat => "assistant / structured patch",
         Page::Exit => "runtime / save / close",
         Page::ProxyConfig => "proxy settings / listener / TUN",
@@ -7396,6 +7541,7 @@ fn row_is_function_action(row: &SettingRow) -> bool {
                 | ActionKind::TestAssistant
                 | ActionKind::UpdateCore
                 | ActionKind::UpdateGeodata
+                | ActionKind::UpdatePac
                 | ActionKind::StartRuntime
                 | ActionKind::StopRuntime
                 | ActionKind::ReloadRuntime
@@ -7458,6 +7604,10 @@ const fn runtime_item_help(item: RuntimeItem, language: Language) -> &'static st
             RuntimeItem::GeodataUpdate => {
                 "手动下载最新 Country.mmdb、GeoIP 和 GeoSite 数据到 config 目录。"
             }
+            RuntimeItem::PacSection => "PAC system proxy 和 rule-list 设置。",
+            RuntimeItem::PacProxyRules => "查看用户自定义 PAC proxy rules。",
+            RuntimeItem::PacDirectRules => "查看用户自定义 PAC direct rules。",
+            RuntimeItem::PacUpdate => "手动下载 gfwlist 到独立 PAC rule cache；保留自定义 rules。",
             RuntimeItem::Controller => "clashtui 使用的 mihomo external controller URL。",
             RuntimeItem::Refresh => "从 mihomo 刷新 Runtime 信息。",
             RuntimeItem::LlmSection => "LLM assistant endpoint、model、key 和 provider catalog。",
@@ -7484,6 +7634,10 @@ const fn runtime_item_help(item: RuntimeItem, language: Language) -> &'static st
         RuntimeItem::GeodataUpdate => {
             "Manually download the latest Country.mmdb, GeoIP, and GeoSite data into the config directory."
         }
+        RuntimeItem::PacSection => "PAC system proxy and rule-list settings.",
+        RuntimeItem::PacProxyRules => "Open a read-only view of user custom PAC proxy rules.",
+        RuntimeItem::PacDirectRules => "Open a read-only view of user custom PAC direct rules.",
+        RuntimeItem::PacUpdate => "Manually download gfwlist.txt; custom rules are preserved.",
         RuntimeItem::Controller => "Mihomo external controller URL used by clashtui.",
         RuntimeItem::Refresh => "Refresh runtime information from mihomo.",
         RuntimeItem::LlmSection => "LLM assistant endpoint, model, key, and provider catalog.",
@@ -7548,8 +7702,9 @@ fn draw_main_dashboard(
             config.controller.url
         )),
         Line::from(format!(
-            "Sys Proxy={}  TUN={}  DNS={}  Mode desired={} runtime={}",
+            "Sys Proxy={}/{}  TUN={}  DNS={}  Mode desired={} runtime={}",
             on_off(config.system_proxy.enabled),
+            config.system_proxy_mode(),
             on_off(config.tun.enable),
             on_off(config.dns.enable),
             config.runtime_mode,
@@ -10261,9 +10416,14 @@ fn main_proxy_row(config: &AppConfig, index: usize) -> MainProxyRow {
             mode: config.runtime_mode.clone(),
             subscription: profile,
             features: format!(
-                "SUB={} SYS={} TUN={} DNS={}",
+                "SUB={} SYS={}{} TUN={} DNS={}",
                 subscription,
                 on_off_upper(config.system_proxy.enabled),
+                if config.system_proxy.enabled {
+                    format!("/{}", config.system_proxy_mode().to_ascii_uppercase())
+                } else {
+                    String::new()
+                },
                 on_off_upper(config.tun.enable),
                 on_off_upper(config.dns.enable)
             ),
@@ -10463,10 +10623,15 @@ fn main_proxy_settings_line(config: &AppConfig, row: &MainProxyRow) -> String {
     let mode = row.mode.to_ascii_uppercase();
     if row.kind == "Global" {
         format!(
-            "PROFILE={} {} SYS={} TUN={}",
+            "PROFILE={} {} SYS={}{} TUN={}",
             row.subscription,
             mode,
             on_off_upper(config.system_proxy.enabled),
+            if config.system_proxy.enabled {
+                format!("/{}", config.system_proxy_mode().to_ascii_uppercase())
+            } else {
+                String::new()
+            },
             on_off_upper(config.tun.enable)
         )
     } else {
@@ -10591,7 +10756,13 @@ fn proxy_config_field_value(
         ProxyConfigField::LocalPort => main_proxy_row(config, app.selected_main).listen,
         ProxyConfigField::Delete => "confirm".into(),
         ProxyConfigField::OsProxy => on_off(config.system_proxy.enabled).into(),
-        ProxyConfigField::Pac => "off".into(),
+        ProxyConfigField::Pac => {
+            if config.system_proxy_uses_pac() {
+                "on".into()
+            } else {
+                "off".into()
+            }
+        }
         ProxyConfigField::Tun => on_off(config.tun.enable).into(),
         ProxyConfigField::Logs => "open".into(),
     }
@@ -10649,38 +10820,50 @@ const fn proxy_profile_field_help(field: ProfileConfigField) -> &'static str {
     }
 }
 
-fn proxy_config_field_help(
-    _config: &AppConfig,
-    app: &ConfigApp,
-    field: ProxyConfigField,
-) -> &'static str {
+fn proxy_config_field_help(config: &AppConfig, app: &ConfigApp, field: ProxyConfigField) -> String {
     match field {
         ProxyConfigField::ServiceStatus => {
-            "Read-only runtime process status for this Mihomo instance."
+            "Read-only runtime process status for this Mihomo instance.".into()
         }
         ProxyConfigField::TrafficStatus => {
-            "Read-only upload/download speeds and cumulative traffic."
+            "Read-only upload/download speeds and cumulative traffic.".into()
         }
-        ProxyConfigField::Connections => "Open a compact read-only list of active connections.",
+        ProxyConfigField::Connections => {
+            "Open a compact read-only list of active connections.".into()
+        }
         ProxyConfigField::Enabled if app.selected_main == 0 => {
-            "Main mihomo proxy is managed by runtime; use Sys Proxy for OS proxy settings."
+            "Main mihomo proxy is managed by runtime; use Sys Proxy for OS proxy settings.".into()
         }
-        ProxyConfigField::Enabled => "Enable or disable the selected port proxy.",
-        ProxyConfigField::Profile => "Choose and activate a saved proxy profile.",
-        ProxyConfigField::Subscription => "Choose the source from an inline dropdown.",
-        ProxyConfigField::Mode => "Choose rule, global, or direct behavior.",
+        ProxyConfigField::Enabled => "Enable or disable the selected port proxy.".into(),
+        ProxyConfigField::Profile => "Choose and activate a saved proxy profile.".into(),
+        ProxyConfigField::Subscription => "Choose the source from an inline dropdown.".into(),
+        ProxyConfigField::Mode => "Choose rule, global, or direct behavior.".into(),
         ProxyConfigField::ProxyGroups => {
-            "Choose the group and concrete server for the current mode."
+            "Choose the group and concrete server for the current mode.".into()
         }
-        ProxyConfigField::LocalPort => "Edit the local listener port for this proxy.",
-        ProxyConfigField::Delete => "Delete this port proxy after confirmation.",
-        ProxyConfigField::OsProxy => "Point the operating system proxy settings to the mixed port.",
-        ProxyConfigField::Pac => "PAC support is planned; it will live on Global Proxy.",
+        ProxyConfigField::LocalPort => "Edit the local listener port for this proxy.".into(),
+        ProxyConfigField::Delete => "Delete this port proxy after confirmation.".into(),
+        ProxyConfigField::OsProxy => {
+            "Enable OS system proxy using the selected HTTP/PAC mode.".into()
+        }
+        ProxyConfigField::Pac => pac_config_help(config),
         ProxyConfigField::Tun => {
-            "TUN is transparent system traffic and belongs only to Global Proxy."
+            "TUN is transparent system traffic and belongs only to Global Proxy.".into()
         }
-        ProxyConfigField::Logs => "Open the selected Mihomo runtime log tail.",
+        ProxyConfigField::Logs => "Open the selected Mihomo runtime log tail.".into(),
     }
+}
+
+fn pac_config_help(config: &AppConfig) -> String {
+    format!(
+        "Turn PAC mode on/off. Sys Proxy controls whether OS proxy is enabled.\nPAC: {}\nStrategy: {}\ngfwlist:\n  Runtime Update PAC writes gfwlist.txt\nURL:\n  {}\nSource:\n  {}\nCustom rules:\n  proxy: {}\n  direct: {}",
+        on_off(config.system_proxy_uses_pac()),
+        config.system_proxy_pac_strategy(),
+        config.system_proxy_pac_url(),
+        config.system_proxy.pac_rule_source_url,
+        config.system_proxy.pac_proxy_rules.len(),
+        config.system_proxy.pac_direct_rules.len()
+    )
 }
 
 fn runtime_item_value(
@@ -10712,6 +10895,14 @@ fn runtime_item_value(
         RuntimeItem::CorePath => core_source_value(config),
         RuntimeItem::CoreUpdate => config.mihomo.update.clone(),
         RuntimeItem::GeodataUpdate => "manual".into(),
+        RuntimeItem::PacSection => String::new(),
+        RuntimeItem::PacProxyRules => {
+            format!("{} rules", config.system_proxy.pac_proxy_rules.len())
+        }
+        RuntimeItem::PacDirectRules => {
+            format!("{} rules", config.system_proxy.pac_direct_rules.len())
+        }
+        RuntimeItem::PacUpdate => "manual".into(),
         RuntimeItem::Controller => config.controller.url.clone(),
         RuntimeItem::Refresh => app.runtime.error.as_deref().unwrap_or("online").to_string(),
         RuntimeItem::LlmSection => String::new(),
@@ -11532,6 +11723,31 @@ fn connection_compact_row(index: usize, connection: &ConnectionInfo) -> CompactR
         primary,
         secondary: Some(secondary),
     }
+}
+
+fn pac_proxy_rule_rows(config: &AppConfig) -> Vec<CompactRow> {
+    pac_custom_rule_rows(&config.system_proxy.pac_proxy_rules, "proxy")
+}
+
+fn pac_direct_rule_rows(config: &AppConfig) -> Vec<CompactRow> {
+    pac_custom_rule_rows(&config.system_proxy.pac_direct_rules, "direct")
+}
+
+fn pac_custom_rule_rows(rules: &[String], label: &str) -> Vec<CompactRow> {
+    if rules.is_empty() {
+        return vec![CompactRow {
+            primary: format!("  1  no PAC {label} rules"),
+            secondary: Some("     config.yaml list is empty".into()),
+        }];
+    }
+    rules
+        .iter()
+        .enumerate()
+        .map(|(index, rule)| CompactRow {
+            primary: format!("{:>3}  {}", index + 1, rule.trim()),
+            secondary: None,
+        })
+        .collect()
 }
 
 fn compact_rule_label(connection: &ConnectionInfo) -> String {
@@ -13372,6 +13588,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pac_row_toggles_system_proxy_mode() -> Result<()> {
+        let paths = test_paths("pac-mode-toggle")?;
+        let mut config = AppConfig::default();
+        let mut app = ConfigApp::new(&config);
+        app.page = Page::ProxyConfig;
+        app.selected_proxy_field = ProxyConfigField::SYSTEM_ALL
+            .iter()
+            .position(|field| *field == ProxyConfigField::Pac)
+            .context("pac field")?;
+
+        submit_proxy_config_item(&paths, &mut config, &mut app).await?;
+
+        assert_eq!(config.system_proxy_mode(), SYSTEM_PROXY_MODE_PAC);
+        assert_eq!(
+            proxy_config_field_value(&config, &app, ProxyConfigField::Pac),
+            "on"
+        );
+        let help = proxy_config_field_help(&config, &app, ProxyConfigField::Pac);
+        assert!(help.starts_with("Turn PAC mode on/off."));
+        assert!(help.contains("\nURL:\n  http://127.0.0.1:18080/commands/pac"));
+        assert!(app.dirty);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn main_global_proxy_enter_opens_config_screen() -> Result<()> {
         let paths = test_paths("main-global-config")?;
         let mut config = AppConfig::default();
@@ -14332,6 +14573,33 @@ mod tests {
             geodata.kind,
             RowKind::Action(ActionKind::UpdateGeodata)
         ));
+        let pac_section = rows
+            .iter()
+            .find(|row| row.label == "PAC")
+            .context("PAC section row")?;
+        assert!(matches!(pac_section.kind, RowKind::SoftSection));
+        let proxy_rules = rows
+            .iter()
+            .find(|row| row.label == "Proxy Rules")
+            .context("PAC proxy rules row")?;
+        assert!(matches!(
+            proxy_rules.kind,
+            RowKind::StatusSubmenu(Page::RuntimePacProxyRules)
+        ));
+        let direct_rules = rows
+            .iter()
+            .find(|row| row.label == "Direct Rules")
+            .context("PAC direct rules row")?;
+        assert!(matches!(
+            direct_rules.kind,
+            RowKind::StatusSubmenu(Page::RuntimePacDirectRules)
+        ));
+        let pac = rows
+            .iter()
+            .find(|row| row.label == "Update PAC")
+            .context("PAC update row")?;
+        assert_eq!(pac.value, "manual");
+        assert!(matches!(pac.kind, RowKind::Action(ActionKind::UpdatePac)));
         let llm_index = rows
             .iter()
             .position(|row| row.label == "LLM")
@@ -14344,7 +14612,13 @@ mod tests {
             .iter()
             .position(|row| row.label == "LLM Provider")
             .context("LLM Provider row")?;
+        let pac_index = rows
+            .iter()
+            .position(|row| row.label == "PAC")
+            .context("PAC section row")?;
 
+        assert!(refresh_index < pac_index);
+        assert!(pac_index < llm_index);
         assert!(refresh_index < llm_index);
         assert!(llm_index < provider_index);
         assert!(matches!(rows[llm_index].kind, RowKind::SoftSection));
@@ -14352,7 +14626,36 @@ mod tests {
     }
 
     #[test]
-    fn runtime_navigation_skips_llm_section_header() -> Result<()> {
+    fn pac_rule_pages_show_user_proxy_and_direct_rules() {
+        let config = AppConfig {
+            system_proxy: crate::config::SystemProxyConfig {
+                pac_strategy: crate::config::PAC_STRATEGY_RULES.into(),
+                pac_proxy_rules: vec!["||custom-proxy.example".into()],
+                pac_direct_rules: vec!["custom.local".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let proxy_rows = pac_proxy_rule_rows(&config);
+        let direct_rows = pac_direct_rule_rows(&config);
+
+        assert!(
+            proxy_rows
+                .iter()
+                .any(|row| row.primary.contains("||custom-proxy.example"))
+        );
+        assert!(
+            direct_rows
+                .iter()
+                .any(|row| row.primary.contains("custom.local"))
+        );
+        assert!(proxy_rows.iter().all(|row| row.secondary.is_none()));
+        assert!(direct_rows.iter().all(|row| row.secondary.is_none()));
+    }
+
+    #[test]
+    fn runtime_navigation_skips_runtime_section_headers() -> Result<()> {
         let paths = test_paths("runtime-skip-llm-section")?;
         let config = AppConfig::default();
         let mut app = ConfigApp::new(&config);
@@ -14363,11 +14666,21 @@ mod tests {
             .context("Refresh Runtime item")?;
 
         app.move_next(&paths, &config);
+        assert_eq!(app.selected_runtime_item(), RuntimeItem::PacProxyRules);
+        assert_ne!(app.selected_runtime_item(), RuntimeItem::PacSection);
+        app.move_prev(&paths, &config);
+        assert_eq!(app.selected_runtime_item(), RuntimeItem::Refresh);
+
+        app.selected_runtime = RuntimeItem::ALL
+            .iter()
+            .position(|item| *item == RuntimeItem::PacUpdate)
+            .context("Update PAC item")?;
+        app.move_next(&paths, &config);
         assert_eq!(app.selected_runtime_item(), RuntimeItem::LlmProvider);
         assert_ne!(app.selected_runtime_item(), RuntimeItem::LlmSection);
 
         app.move_prev(&paths, &config);
-        assert_eq!(app.selected_runtime_item(), RuntimeItem::Refresh);
+        assert_eq!(app.selected_runtime_item(), RuntimeItem::PacUpdate);
         Ok(())
     }
 
@@ -15213,6 +15526,7 @@ proxies:
             core_log_file: root.join("mihomo.log"),
             llm_api_key_file: root.join("llm-api-key"),
             llm_providers_file: root.join("llm-providers.yaml"),
+            pac_gfwlist_file: root.join("gfwlist.txt"),
             profiles_dir,
             cores_dir: root.join("cores"),
         })

@@ -53,6 +53,13 @@ clashtui restart
 首次启动会在配置目录准备 mihomo 运行所需的 GeoIP/GeoSite 数据文件。
 也可以在 `clashtui config` 的 Runtime 菜单里手工执行 `Update GeoIP DB` 更新。
 
+System Proxy 支持 HTTP 和 PAC 两种模式。HTTP 模式会把系统代理指向
+本地 mixed 端口，PAC 模式由 daemon 提供
+`http://127.0.0.1:18080/commands/pac`。PAC 可使用 `proxy-all`、
+`rules` 或 `custom` 策略；`rules` 适合 gfwlist 风格的域名分流。
+Runtime 菜单里的 `Update PAC` 会手工下载 gfwlist 到独立的
+`gfwlist.txt`，不会覆盖用户自定义 PAC rules。
+
 如需更多输出：
 
 ```bash

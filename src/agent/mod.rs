@@ -2,6 +2,7 @@ pub mod knowledge;
 pub mod patch;
 
 use std::env;
+use std::net::{SocketAddr, TcpStream};
 use std::sync::mpsc::Sender;
 
 use anyhow::{Context as _, Result};
@@ -18,6 +19,7 @@ use crate::llm::{
 };
 use crate::llm_providers;
 use crate::mihomo::MihomoClient;
+use crate::system_proxy;
 
 pub use patch::{ConfigPatch, apply_config_patch};
 
@@ -448,6 +450,23 @@ fn runtime_snapshot(paths: &Paths, config: &AppConfig) -> String {
         "controller_url": config.controller.url,
         "mixed": format!("{}:{}", config.proxy_host, config.mixed_port),
         "system_proxy_enabled": config.system_proxy.enabled,
+        "system_proxy": {
+            "enabled": config.system_proxy.enabled,
+            "mode": config.system_proxy_mode(),
+            "http_server": config.system_proxy_target().server(),
+            "pac_url": config.system_proxy_pac_url(),
+            "pac_port": config.system_proxy.pac_port,
+            "pac_strategy": config.system_proxy_pac_strategy(),
+            "pac_rule_source_url": config.system_proxy.pac_rule_source_url,
+            "pac_gfwlist_file": paths.pac_gfwlist_file.display().to_string(),
+            "pac_proxy_rule_count": config.system_proxy.pac_proxy_rules.len(),
+            "pac_direct_rule_count": config.system_proxy.pac_direct_rules.len(),
+            "pac_custom_proxy_rule_count": config.system_proxy.pac_proxy_rules.len(),
+            "pac_custom_direct_rule_count": config.system_proxy.pac_direct_rules.len(),
+            "use_default_bypass": config.system_proxy.use_default_bypass,
+            "custom_bypass": config.system_proxy.bypass,
+            "pac_content_chars": config.system_proxy.pac_content.chars().count(),
+        },
         "tun_enabled": config.tun.enable,
         "dns": {
             "enabled": config.dns.enable,
@@ -508,6 +527,15 @@ fn tool_specs() -> Vec<LlmToolSpec> {
         tool_spec(
             "get_mihomo_state",
             "Read mihomo controller status and proxy group summary.",
+            json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        ),
+        tool_spec(
+            "get_system_proxy_state",
+            "Read expected and actual OS system proxy/PAC state for diagnosis.",
             json!({
                 "type": "object",
                 "properties": {},
@@ -615,6 +643,7 @@ async fn execute_tool(paths: &Paths, config: &AppConfig, call: &LlmToolCall) -> 
         "read_runtime_files" => read_runtime_files_tool(paths, &args).await,
         "read_log_tail" => read_log_tail_tool(paths, &args).await,
         "get_mihomo_state" => get_mihomo_state_tool(config).await,
+        "get_system_proxy_state" => Ok(get_system_proxy_state_tool(config)),
         "http_probe" => http_probe_tool(&args).await,
         "run_command" => run_command_tool(&args).await,
         "propose_config_patch" => propose_config_patch_tool(config, args),
@@ -664,6 +693,7 @@ fn tool_command_display(name: &str, args: &Value) -> String {
             let kind = args.get("kind").and_then(Value::as_str).unwrap_or("both");
             format!("read_runtime_files --kind {}", shell_quote(kind))
         }
+        "get_system_proxy_state" => "get_system_proxy_state".into(),
         "http_probe" => {
             let method = args.get("method").and_then(Value::as_str).unwrap_or("HEAD");
             let url = args.get("url").and_then(Value::as_str).unwrap_or("-");
@@ -710,6 +740,15 @@ fn tool_output_display(name: &str, result: &Value) -> String {
                 .and_then(Value::as_u64)
                 .map_or_else(|| "-".into(), |duration| duration.to_string());
             format!("status={status} duration_ms={duration}")
+        }
+        "get_system_proxy_state" => {
+            let expected = result.get("expected").unwrap_or(&Value::Null);
+            let actual = result.get("actual").unwrap_or(&Value::Null);
+            format!(
+                "expected={}\nactual={}",
+                serde_json::to_string(expected).unwrap_or_else(|_| expected.to_string()),
+                serde_json::to_string(actual).unwrap_or_else(|_| actual.to_string())
+            )
         }
         _ => serde_json::to_string_pretty(result).unwrap_or_else(|_| result.to_string()),
     }
@@ -834,6 +873,41 @@ async fn get_mihomo_state_tool(config: &AppConfig) -> Result<Value> {
         "proxy_groups": group_summary,
         "proxy_group_error": groups.err(),
     }))
+}
+
+fn get_system_proxy_state_tool(config: &AppConfig) -> Value {
+    let actual = system_proxy::status().map(|status| {
+        json!({
+            "http_enabled": status.enabled,
+            "http_server": status.server,
+            "http_bypass": status.bypass,
+            "pac_enabled": status.pac_enabled,
+            "pac_url": status.pac_url,
+        })
+    });
+
+    json!({
+        "ok": actual.is_ok(),
+        "expected": {
+            "enabled": config.system_proxy.enabled,
+            "mode": config.system_proxy_mode(),
+            "http_server": config.system_proxy_target().server(),
+            "pac_url": config.system_proxy_pac_url(),
+            "pac_strategy": config.system_proxy_pac_strategy(),
+            "pac_rule_source_url": config.system_proxy.pac_rule_source_url,
+            "pac_proxy_rule_count": config.system_proxy.pac_proxy_rules.len(),
+            "pac_direct_rule_count": config.system_proxy.pac_direct_rules.len(),
+            "pac_custom_proxy_rule_count": config.system_proxy.pac_proxy_rules.len(),
+            "pac_custom_direct_rule_count": config.system_proxy.pac_direct_rules.len(),
+            "pac_server_reachable": pac_server_reachable(config),
+        },
+        "actual": result_value(actual.map_err(|err| err.to_string())),
+    })
+}
+
+fn pac_server_reachable(config: &AppConfig) -> bool {
+    let addr = SocketAddr::from(([127, 0, 0, 1], config.system_proxy.pac_port));
+    TcpStream::connect_timeout(&addr, Duration::from_millis(120)).is_ok()
 }
 
 async fn http_probe_tool(args: &Value) -> Result<Value> {
@@ -1274,6 +1348,23 @@ mod tests {
     }
 
     #[test]
+    fn runtime_snapshot_includes_system_proxy_mode_and_pac() -> Result<()> {
+        let mut config = AppConfig::default();
+        config.system_proxy.enabled = true;
+        config.system_proxy.mode = crate::config::SYSTEM_PROXY_MODE_PAC.into();
+        let paths = test_paths("runtime-snapshot-system-proxy");
+        let snapshot: Value = serde_json::from_str(&runtime_snapshot(&paths, &config))?;
+
+        assert_eq!(snapshot["system_proxy"]["enabled"], true);
+        assert_eq!(snapshot["system_proxy"]["mode"], "pac");
+        assert_eq!(
+            snapshot["system_proxy"]["pac_url"],
+            "http://127.0.0.1:18080/commands/pac"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn diagnostic_allowlist_includes_common_network_tools() -> Result<()> {
         for command in [
             "curl",
@@ -1321,5 +1412,24 @@ mod tests {
 
     fn strings(values: impl IntoIterator<Item = &'static str>) -> Vec<String> {
         values.into_iter().map(str::to_string).collect()
+    }
+
+    fn test_paths(name: &str) -> Paths {
+        let root = std::env::temp_dir().join(format!("clashtui-agent-test-{name}"));
+        Paths {
+            config_dir: root.clone(),
+            config_file: root.join("config.yaml"),
+            pid_file: root.join("clashtui.pid"),
+            core_pid_file: root.join("mihomo.pid"),
+            core_config_file: root.join("mihomo-run.yaml"),
+            active_config_file: root.join("mihomo-active.yaml"),
+            log_file: root.join("clashtui.log"),
+            core_log_file: root.join("mihomo.log"),
+            llm_api_key_file: root.join("llm-api-key"),
+            llm_providers_file: root.join("llm-providers.yaml"),
+            pac_gfwlist_file: root.join("gfwlist.txt"),
+            profiles_dir: root.join("profiles"),
+            cores_dir: root.join("cores"),
+        }
     }
 }

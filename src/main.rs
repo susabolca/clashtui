@@ -9,6 +9,7 @@ mod i18n;
 mod llm;
 mod llm_providers;
 mod mihomo;
+mod pac;
 mod platform;
 mod port_allocator;
 mod runtime_profile;
@@ -146,7 +147,11 @@ async fn main() -> Result<()> {
     let mut config = AppConfig::load_or_init(&paths).await?;
 
     let should_allocate_ports = cli.daemon_run || matches!(cli.command, Some(Command::Config));
+    let mut config_changed = false;
     if should_allocate_ports && port_allocator::ensure_allocated(&paths, &mut config).await? {
+        config_changed = true;
+    }
+    if config_changed {
         config.save(&paths).await?;
     }
 
