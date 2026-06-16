@@ -207,11 +207,14 @@ mixed_port: 7070
 runtime_mode: rule
 ```
 
-- `proxy_host`: default listen host for global generated listeners.
+- `proxy_host`: default listen host for global generated listeners. Non-loopback
+  values are written to mihomo as `bind-address`.
 - `mixed_port`: global mixed HTTP/SOCKS5 port.
 - `runtime_mode`: `rule`, `global`, or `direct`.
 
-Use `0.0.0.0` only when LAN access is intended.
+Use `0.0.0.0` only when LAN access is intended. Wildcard or non-loopback
+`proxy_host` values make the saved config and generated runtime enable mihomo
+`allow-lan`.
 
 ### Port Proxy Listeners
 

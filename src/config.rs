@@ -254,7 +254,8 @@ impl AppConfig {
         let allocation_changed = config.normalize_port_allocation_defaults();
         let legacy_changed = config.migrate_legacy_defaults();
         let profile_changed = config.normalize_proxy_profiles();
-        if allocation_changed || legacy_changed || profile_changed {
+        let proxy_listener_changed = config.normalize_proxy_listener_defaults();
+        if allocation_changed || legacy_changed || profile_changed || proxy_listener_changed {
             config.save(paths).await?;
         }
         Ok(config)
@@ -321,6 +322,22 @@ impl AppConfig {
 
     pub fn system_proxy_host(&self) -> String {
         local_proxy_host(&self.proxy_host).to_string()
+    }
+
+    pub fn proxy_bind_address(&self) -> String {
+        if self.proxy_ports.allow_lan && !self.proxy_host_requires_lan() {
+            "*".into()
+        } else {
+            bind_address(&self.proxy_host).to_string()
+        }
+    }
+
+    pub fn proxy_host_requires_lan(&self) -> bool {
+        host_requires_lan(&self.proxy_host)
+    }
+
+    pub fn effective_allow_lan(&self) -> bool {
+        self.proxy_ports.allow_lan || self.proxy_host_requires_lan()
     }
 
     pub fn system_proxy_pac_url(&self) -> String {
@@ -462,6 +479,15 @@ impl AppConfig {
             self.port_allocation.auto_dns = false;
         }
         changed || controller_changed || mixed_changed || dns_changed
+    }
+
+    fn normalize_proxy_listener_defaults(&mut self) -> bool {
+        if self.proxy_host_requires_lan() && !self.proxy_ports.allow_lan {
+            self.proxy_ports.allow_lan = true;
+            true
+        } else {
+            false
+        }
     }
 
     pub fn normalize_proxy_profiles(&mut self) -> bool {
@@ -959,6 +985,25 @@ fn local_proxy_host(host: &str) -> &str {
     }
 }
 
+fn bind_address(host: &str) -> &str {
+    let host = host.trim();
+    let host = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+    if host.is_empty() { "127.0.0.1" } else { host }
+}
+
+fn host_requires_lan(host: &str) -> bool {
+    let host = bind_address(host);
+    let lower = host.to_ascii_lowercase();
+    match lower.as_str() {
+        "" | "localhost" | "::1" => false,
+        "*" | "0.0.0.0" | "::" => true,
+        value => !value.starts_with("127."),
+    }
+}
+
 fn url_host(host: &str) -> String {
     if host.contains(':') && !host.starts_with('[') {
         format!("[{host}]")
@@ -1133,6 +1178,49 @@ mod tests {
             config.system_proxy_pac_url(),
             "http://127.0.0.1:18080/commands/pac"
         );
+    }
+
+    #[test]
+    fn wildcard_proxy_host_requires_lan_and_keeps_bind_address() {
+        let config = AppConfig {
+            proxy_host: "0.0.0.0".into(),
+            ..AppConfig::default()
+        };
+
+        assert!(config.proxy_host_requires_lan());
+        assert!(config.effective_allow_lan());
+        assert_eq!(config.proxy_bind_address(), "0.0.0.0");
+        assert_eq!(config.system_proxy_host(), "127.0.0.1");
+    }
+
+    #[test]
+    fn wildcard_proxy_host_migration_enables_allow_lan() {
+        let mut config = AppConfig {
+            proxy_host: "0.0.0.0".into(),
+            ..AppConfig::default()
+        };
+
+        assert!(config.normalize_proxy_listener_defaults());
+        assert!(config.proxy_ports.allow_lan);
+    }
+
+    #[test]
+    fn manual_allow_lan_keeps_wildcard_bind_for_compatibility() {
+        let mut config = AppConfig::default();
+        config.proxy_ports.allow_lan = true;
+
+        assert!(!config.proxy_host_requires_lan());
+        assert!(config.effective_allow_lan());
+        assert_eq!(config.proxy_bind_address(), "*");
+    }
+
+    #[test]
+    fn loopback_proxy_host_does_not_imply_lan() {
+        let config = AppConfig::default();
+
+        assert!(!config.proxy_host_requires_lan());
+        assert!(!config.effective_allow_lan());
+        assert_eq!(config.proxy_bind_address(), "127.0.0.1");
     }
 
     #[test]

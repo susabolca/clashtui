@@ -8,6 +8,7 @@ Important top-level fields:
 - `mixed-port`: local mixed HTTP/SOCKS listener.
 - `port`: local HTTP listener.
 - `socks-port`: local SOCKS listener.
+- `bind-address`: bind host for global local listeners.
 - `allow-lan`: whether local listeners accept LAN clients.
 - `mode`: `rule`, `global`, or `direct`.
 - `external-controller`: controller address used by clashtui.

@@ -4633,6 +4633,9 @@ async fn submit_input(paths: &Paths, config: &mut AppConfig, app: &mut ConfigApp
             };
             config.proxy_host = host;
             config.mixed_port = port;
+            if config.proxy_host_requires_lan() {
+                config.proxy_ports.allow_lan = true;
+            }
             config.port_allocation.auto_mixed = false;
             app.mark_dirty();
             app.status = format!(

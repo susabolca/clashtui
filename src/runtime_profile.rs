@@ -470,7 +470,8 @@ fn apply_overrides(value: &mut Value, config: &AppConfig) -> Result<()> {
     );
     mapping.insert("mode".into(), config.runtime_mode.clone().into());
     mapping.insert("log-level".into(), "info".into());
-    mapping.insert("allow-lan".into(), config.proxy_ports.allow_lan.into());
+    mapping.insert("allow-lan".into(), config.effective_allow_lan().into());
+    mapping.insert("bind-address".into(), config.proxy_bind_address().into());
     mapping.insert("ipv6".into(), true.into());
     mapping.insert("unified-delay".into(), true.into());
     if let Some(secret) = config
@@ -620,6 +621,7 @@ fn remove_unmanaged_inbounds(mapping: &mut Mapping) {
         "redir-port",
         "tproxy-port",
         "mixed-port",
+        "bind-address",
         "authentication",
         "listeners",
     ] {
@@ -722,6 +724,10 @@ listeners:
             mapping.get("allow-lan").and_then(Value::as_bool),
             Some(true)
         );
+        assert_eq!(
+            mapping.get("bind-address").and_then(Value::as_str),
+            Some("*")
+        );
         assert!(mapping.get("listeners").is_none());
         assert!(mapping.get("proxies").is_some());
         assert!(mapping.get("secret").is_none());
@@ -740,6 +746,38 @@ listeners:
                 .and_then(|dns| dns.get("enable"))
                 .and_then(Value::as_bool),
             Some(true)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn apply_overrides_enables_lan_for_wildcard_proxy_host() -> Result<()> {
+        let mut profile: Value = serde_yaml_ng::from_str(
+            r"
+proxies: []
+proxy-groups: []
+rules: []
+bind-address: 127.0.0.1
+",
+        )?;
+        let config = AppConfig {
+            proxy_host: "0.0.0.0".into(),
+            mixed_port: 7070,
+            ..AppConfig::default()
+        };
+
+        apply_overrides(&mut profile, &config)?;
+        let mapping = profile
+            .as_mapping()
+            .context("profile root is not a mapping")?;
+
+        assert_eq!(
+            mapping.get("allow-lan").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            mapping.get("bind-address").and_then(Value::as_str),
+            Some("0.0.0.0")
         );
         Ok(())
     }
