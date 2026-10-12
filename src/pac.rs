@@ -1,21 +1,16 @@
 use std::collections::BTreeSet;
-use std::env;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
-use reqwest::{
-    Client, Proxy,
-    header::{HeaderMap, HeaderValue, USER_AGENT},
-};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
 use crate::config::{AppConfig, DEFAULT_PAC_RULE_SOURCE_URL, Paths};
-use crate::system_proxy;
+use crate::download::{self, DownloadAttempt};
 
 const PAC_RULE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(90);
 const PAC_RULE_USER_AGENT: &str = concat!("clashtui/", env!("CARGO_PKG_VERSION"));
@@ -102,12 +97,6 @@ pub struct PacRuleUpdate {
     pub target_file: PathBuf,
 }
 
-#[derive(Debug, Clone)]
-struct RuleDownloadAttempt {
-    label: &'static str,
-    proxy_url: Option<String>,
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ParsedPacRules {
     proxy_rules: Vec<String>,
@@ -175,7 +164,7 @@ async fn save_gfwlist_content(paths: &Paths, content: &str) -> Result<()> {
 }
 
 async fn fetch_rule_source(url: &str, config: &AppConfig) -> Result<Vec<u8>> {
-    let attempts = rule_download_attempts(config);
+    let attempts = download::attempts(config);
     let mut errors = Vec::new();
     for attempt in attempts {
         match fetch_rule_source_once(url, &attempt).await {
@@ -189,8 +178,12 @@ async fn fetch_rule_source(url: &str, config: &AppConfig) -> Result<Vec<u8>> {
     )
 }
 
-async fn fetch_rule_source_once(url: &str, attempt: &RuleDownloadAttempt) -> Result<Vec<u8>> {
-    let client = rule_download_client(attempt.proxy_url.as_deref())?;
+async fn fetch_rule_source_once(url: &str, attempt: &DownloadAttempt) -> Result<Vec<u8>> {
+    let client = download::client(
+        PAC_RULE_USER_AGENT,
+        PAC_RULE_DOWNLOAD_TIMEOUT,
+        attempt.proxy_url.as_deref(),
+    )?;
     let response = client.get(url).send().await.context("request failed")?;
     let status = response.status();
     let body = response
@@ -201,96 +194,6 @@ async fn fetch_rule_source_once(url: &str, attempt: &RuleDownloadAttempt) -> Res
         anyhow::bail!("status {status}: {}", summarize_body(&body));
     }
     Ok(body.to_vec())
-}
-
-fn rule_download_client(proxy_url: Option<&str>) -> Result<Client> {
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        USER_AGENT,
-        HeaderValue::from_str(PAC_RULE_USER_AGENT).context("invalid PAC update user agent")?,
-    );
-
-    let mut builder = Client::builder()
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .tcp_keepalive(Duration::from_secs(60))
-        .pool_max_idle_per_host(0)
-        .pool_idle_timeout(None)
-        .timeout(PAC_RULE_DOWNLOAD_TIMEOUT)
-        .connect_timeout(PAC_RULE_DOWNLOAD_TIMEOUT)
-        .default_headers(headers);
-
-    if let Some(proxy_url) = proxy_url {
-        builder = builder.proxy(Proxy::all(proxy_url)?);
-    } else {
-        builder = builder.no_proxy();
-    }
-
-    Ok(builder.build()?)
-}
-
-fn rule_download_attempts(config: &AppConfig) -> Vec<RuleDownloadAttempt> {
-    let mut attempts = vec![RuleDownloadAttempt {
-        label: "direct",
-        proxy_url: None,
-    }];
-
-    if let Some(proxy) = local_proxy_from_env() {
-        attempts.push(RuleDownloadAttempt {
-            label: "environment proxy",
-            proxy_url: Some(proxy),
-        });
-    }
-
-    attempts.push(RuleDownloadAttempt {
-        label: "local mixed proxy",
-        proxy_url: Some(format!(
-            "http://{}:{}",
-            proxy_url_host(&config.system_proxy_host()),
-            config.mixed_port
-        )),
-    });
-
-    if let Ok(status) = system_proxy::status()
-        && status.enabled
-        && !status.server.trim().is_empty()
-    {
-        attempts.push(RuleDownloadAttempt {
-            label: "system proxy",
-            proxy_url: Some(format!("http://{}", status.server)),
-        });
-    }
-
-    let mut seen = BTreeSet::new();
-    attempts
-        .into_iter()
-        .filter(|attempt| seen.insert(attempt.proxy_url.clone().unwrap_or_default()))
-        .collect()
-}
-
-fn local_proxy_from_env() -> Option<String> {
-    [
-        "HTTPS_PROXY",
-        "https_proxy",
-        "HTTP_PROXY",
-        "http_proxy",
-        "ALL_PROXY",
-        "all_proxy",
-    ]
-    .into_iter()
-    .find_map(|key| {
-        env::var(key)
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-    })
-}
-
-fn proxy_url_host(host: &str) -> String {
-    if host.contains(':') && !host.starts_with('[') {
-        format!("[{host}]")
-    } else {
-        host.to_string()
-    }
 }
 
 fn decode_gfwlist_body(body: &[u8]) -> Result<String> {

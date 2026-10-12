@@ -7,20 +7,16 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use flate2::read::GzDecoder;
-use reqwest::{
-    Client, Proxy,
-    header::{HeaderMap, HeaderValue, USER_AGENT},
-};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tokio::time::sleep;
 
 use crate::config::{AppConfig, Paths, PortProxyService, RuntimePaths};
+use crate::download::{self, DownloadAttempt};
 use crate::mihomo::MihomoClient;
 use crate::port_allocator;
 use crate::runtime_profile;
 use crate::service;
-use crate::system_proxy;
 
 const CORE_NAMES: [&str; 4] = ["mihomo", "verge-mihomo", "verge-mihomo-alpha", "clash-meta"];
 const GEODATA_APP_DIRS: [&str; 6] = [
@@ -149,11 +145,6 @@ struct ManagedCoreMetadata {
     asset: String,
 }
 
-struct DownloadAttempt {
-    label: &'static str,
-    proxy_url: Option<String>,
-}
-
 #[derive(Debug, Clone, Copy)]
 struct GeodataResource {
     file_name: &'static str,
@@ -222,7 +213,7 @@ async fn ensure_legacy_global_runtime(paths: &Paths, config: &AppConfig) -> Resu
     remove_pid(&instance.pid_file).await?;
     let core_path = ensure_core_path(paths, config).await?;
 
-    ensure_geodata(paths, &instance.work_dir).await?;
+    ensure_geodata(paths, config, &instance.work_dir).await?;
     port_allocator::validate_required_ports_available(config)?;
 
     let mut bootstrap_config = config.clone();
@@ -259,7 +250,7 @@ async fn ensure_user_single_runtime(paths: &Paths, config: &AppConfig) -> Result
     remove_pid(&instance.pid_file).await?;
     let core_path = ensure_core_path(paths, config).await?;
 
-    ensure_geodata(paths, &paths.config_dir).await?;
+    ensure_geodata(paths, config, &paths.config_dir).await?;
     port_allocator::validate_required_ports_available(config)?;
     runtime_profile::write_single_runtime_config(paths, config).await?;
     start_instance(&instance, &core_path).await
@@ -275,7 +266,7 @@ async fn ensure_service_runtime(paths: &Paths, config: &AppConfig) -> Result<()>
 
     let core_path = ensure_core_path(paths, config).await?;
 
-    ensure_geodata(paths, &paths.config_dir).await?;
+    ensure_geodata(paths, config, &paths.config_dir).await?;
     port_allocator::validate_required_ports_available(config)?;
     let runtime_config = runtime_profile::write_single_runtime_config(paths, config).await?;
     service::start_core(&core_path, paths, &runtime_config)
@@ -299,7 +290,7 @@ pub async fn ensure_service_running(
         .await
         .with_context(|| format!("{} mihomo core is not available", instance.label))?;
 
-    ensure_geodata(paths, &instance.work_dir).await?;
+    ensure_geodata(paths, config, &instance.work_dir).await?;
     runtime_profile::write_service_config(paths, &instance, config, service).await?;
     start_instance(&instance, &core_path).await?;
     Ok(instance)
@@ -445,12 +436,16 @@ pub async fn ensure_core_path(paths: &Paths, config: &AppConfig) -> Result<PathB
                 paths.config_file.display()
             )
         }),
-        CoreSource::Release => Ok(ensure_managed_core(paths, ManagedCore::Release, false)
-            .await?
-            .path),
-        CoreSource::Alpha => Ok(ensure_managed_core(paths, ManagedCore::Alpha, false)
-            .await?
-            .path),
+        CoreSource::Release => Ok(
+            ensure_managed_core(paths, config, ManagedCore::Release, false)
+                .await?
+                .path,
+        ),
+        CoreSource::Alpha => Ok(
+            ensure_managed_core(paths, config, ManagedCore::Alpha, false)
+                .await?
+                .path,
+        ),
         CoreSource::Auto => ensure_auto_core_path(paths, config).await,
     }
 }
@@ -459,7 +454,7 @@ pub async fn update_managed_core(paths: &Paths, config: &AppConfig) -> Result<Ma
     let core = selected_core_source(config)
         .managed()
         .unwrap_or(ManagedCore::Release);
-    ensure_managed_core(paths, core, true).await
+    ensure_managed_core(paths, config, core, true).await
 }
 
 async fn ensure_auto_core_path(paths: &Paths, config: &AppConfig) -> Result<PathBuf> {
@@ -474,7 +469,7 @@ async fn ensure_auto_core_path(paths: &Paths, config: &AppConfig) -> Result<Path
         return Ok(path);
     }
 
-    match ensure_managed_core(paths, ManagedCore::Release, false).await {
+    match ensure_managed_core(paths, config, ManagedCore::Release, false).await {
         Ok(install) => Ok(install.path),
         Err(err) => {
             if let Some(path) = resolve_unmanaged_core_path() {
@@ -534,6 +529,7 @@ fn normalize_core_source(value: &str) -> String {
 
 async fn ensure_managed_core(
     paths: &Paths,
+    config: &AppConfig,
     core: ManagedCore,
     force_update: bool,
 ) -> Result<ManagedCoreInstall> {
@@ -552,12 +548,14 @@ async fn ensure_managed_core(
         });
     }
 
-    let version = fetch_text(core.version_url()).await.with_context(|| {
-        format!(
-            "failed to fetch mihomo {} version",
-            core.source().label().to_ascii_lowercase()
-        )
-    })?;
+    let version = fetch_text(core.version_url(), config)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to fetch mihomo {} version",
+                core.source().label().to_ascii_lowercase()
+            )
+        })?;
     let version = version.trim().to_string();
     if version.is_empty() {
         anyhow::bail!("mihomo version response is empty");
@@ -586,7 +584,7 @@ async fn ensure_managed_core(
         ManagedCore::Alpha => format!("{}/{}", core.url_prefix(), archive_name),
     };
 
-    let archive = fetch_bytes(&download_url).await.with_context(|| {
+    let archive = fetch_bytes(&download_url, config).await.with_context(|| {
         format!(
             "failed to download mihomo core {} from {download_url}",
             core.source().label()
@@ -660,13 +658,13 @@ async fn write_managed_core_metadata(
         .with_context(|| format!("failed to write {}", path.display()))
 }
 
-async fn fetch_text(url: &str) -> Result<String> {
-    let bytes = fetch_bytes(url).await?;
+async fn fetch_text(url: &str, config: &AppConfig) -> Result<String> {
+    let bytes = fetch_bytes(url, config).await?;
     String::from_utf8(bytes).context("response is not valid UTF-8")
 }
 
-async fn fetch_bytes(url: &str) -> Result<Vec<u8>> {
-    let attempts = core_download_attempts();
+async fn fetch_bytes(url: &str, config: &AppConfig) -> Result<Vec<u8>> {
+    let attempts = download::attempts(config);
     let mut errors = Vec::new();
     for attempt in attempts {
         match fetch_bytes_once(url, &attempt).await {
@@ -678,7 +676,11 @@ async fn fetch_bytes(url: &str) -> Result<Vec<u8>> {
 }
 
 async fn fetch_bytes_once(url: &str, attempt: &DownloadAttempt) -> Result<Vec<u8>> {
-    let client = core_download_client(attempt.proxy_url.as_deref())?;
+    let client = download::client(
+        CORE_DOWNLOAD_USER_AGENT,
+        CORE_DOWNLOAD_TIMEOUT,
+        attempt.proxy_url.as_deref(),
+    )?;
     let response = client.get(url).send().await.context("request failed")?;
     let status = response.status();
     let body = response
@@ -689,67 +691,6 @@ async fn fetch_bytes_once(url: &str, attempt: &DownloadAttempt) -> Result<Vec<u8
         anyhow::bail!("status {status}");
     }
     Ok(body.to_vec())
-}
-
-fn core_download_client(proxy_url: Option<&str>) -> Result<Client> {
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        USER_AGENT,
-        HeaderValue::from_str(CORE_DOWNLOAD_USER_AGENT)
-            .context("invalid core download user agent")?,
-    );
-
-    let mut builder = Client::builder()
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .tcp_keepalive(Duration::from_secs(60))
-        .pool_max_idle_per_host(0)
-        .pool_idle_timeout(None)
-        .timeout(CORE_DOWNLOAD_TIMEOUT)
-        .connect_timeout(CORE_DOWNLOAD_TIMEOUT)
-        .default_headers(headers);
-
-    if let Some(proxy_url) = proxy_url {
-        builder = builder.proxy(Proxy::all(proxy_url)?);
-    } else {
-        builder = builder.no_proxy();
-    }
-
-    Ok(builder.build()?)
-}
-
-fn core_download_attempts() -> Vec<DownloadAttempt> {
-    let mut attempts = vec![DownloadAttempt {
-        label: "direct",
-        proxy_url: None,
-    }];
-
-    if let Some(proxy) = local_proxy_from_env() {
-        attempts.push(DownloadAttempt {
-            label: "environment proxy",
-            proxy_url: Some(proxy),
-        });
-    }
-
-    if let Ok(status) = system_proxy::status()
-        && status.enabled
-        && !status.server.trim().is_empty()
-    {
-        attempts.push(DownloadAttempt {
-            label: "system proxy",
-            proxy_url: Some(format!("http://{}", status.server)),
-        });
-    }
-
-    attempts
-}
-
-fn local_proxy_from_env() -> Option<String> {
-    env::var("HTTPS_PROXY")
-        .or_else(|_| env::var("https_proxy"))
-        .or_else(|_| env::var("HTTP_PROXY"))
-        .or_else(|_| env::var("http_proxy"))
-        .ok()
-        .filter(|value| !value.trim().is_empty())
 }
 
 fn managed_core_asset(core: ManagedCore) -> Option<&'static str> {
@@ -861,13 +802,13 @@ async fn start_instance(instance: &RuntimePaths, core_path: &Path) -> Result<()>
     Ok(())
 }
 
-pub async fn update_geodata(paths: &Paths) -> Result<GeodataUpdateReport> {
+pub async fn update_geodata(paths: &Paths, config: &AppConfig) -> Result<GeodataUpdateReport> {
     paths.ensure().await?;
     let mut files = Vec::new();
 
     for resource in GEODATA_RESOURCES {
         let target = paths.config_dir.join(resource.file_name);
-        let bytes = download_geodata_resource(resource, &target)
+        let bytes = download_geodata_resource(resource, &target, config)
             .await
             .with_context(|| format!("failed to update {}", resource.file_name))?;
         files.push(GeodataFileUpdate {
@@ -882,7 +823,7 @@ pub async fn update_geodata(paths: &Paths) -> Result<GeodataUpdateReport> {
     })
 }
 
-async fn ensure_geodata(paths: &Paths, target_dir: &Path) -> Result<()> {
+async fn ensure_geodata(paths: &Paths, config: &AppConfig, target_dir: &Path) -> Result<()> {
     fs::create_dir_all(target_dir).await?;
     for resource in GEODATA_RESOURCES {
         let target = target_dir.join(resource.file_name);
@@ -905,7 +846,7 @@ async fn ensure_geodata(paths: &Paths, target_dir: &Path) -> Result<()> {
             );
             continue;
         }
-        let bytes = download_geodata_resource(resource, &target)
+        let bytes = download_geodata_resource(resource, &target, config)
             .await
             .with_context(|| format!("failed to download missing {}", resource.file_name))?;
         eprintln!(
@@ -966,14 +907,18 @@ async fn find_geodata_source(paths: &Paths, file_name: &str) -> Result<Option<Pa
     Ok(None)
 }
 
-async fn download_geodata_resource(resource: GeodataResource, target: &Path) -> Result<u64> {
+async fn download_geodata_resource(
+    resource: GeodataResource,
+    target: &Path,
+    config: &AppConfig,
+) -> Result<u64> {
     let Some(parent) = target.parent() else {
         anyhow::bail!("geodata target has no parent: {}", target.display());
     };
     fs::create_dir_all(parent).await?;
 
     let url = format!("{META_RULES_URL_PREFIX}/{}", resource.asset_name);
-    let bytes = fetch_bytes(&url)
+    let bytes = fetch_bytes(&url, config)
         .await
         .with_context(|| format!("failed to fetch {url}"))?;
     if bytes.is_empty() {

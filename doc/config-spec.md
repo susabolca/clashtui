@@ -187,6 +187,16 @@ core_path: null
   `system_proxy.pac_rule_source_url`. `system_proxy.pac_proxy_rules` and
   `system_proxy.pac_direct_rules` are preserved as user custom rules.
 
+Subscription, core, geodata, and PAC downloads try proxies before direct access:
+`HTTPS_PROXY`/`https_proxy`, `HTTP_PROXY`/`http_proxy`, `ALL_PROXY`/`all_proxy`,
+the configured local mixed port, the enabled system HTTP proxy, then direct.
+Empty environment values are skipped and duplicate proxy URLs are tried once.
+Wildcard listener addresses use `127.0.0.1` for local downloads. Connection
+establishment has a 5-second timeout and stalled reads a 20-second timeout;
+the overall deadline is 20 seconds for subscriptions and 90 seconds for other
+downloads. An already running external proxy can bootstrap the initial core
+and geodata downloads through the environment variables above.
+
 ### `controller`
 
 ```yaml

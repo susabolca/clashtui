@@ -60,6 +60,17 @@ System Proxy 支持 HTTP 和 PAC 两种模式。HTTP 模式会把系统代理指
 Runtime 菜单里的 `Update PAC` 会手工下载 gfwlist 到独立的
 `gfwlist.txt`，不会覆盖用户自定义 PAC rules。
 
+订阅、内核、GeoIP/GeoSite 和 PAC 下载会依次尝试环境变量代理、本地 mixed
+端口、系统 HTTP 代理，最后尝试直连。即使系统代理关闭，也会使用配置里的 mixed
+端口；`0.0.0.0` 等监听地址会转换成 `127.0.0.1`。
+环境变量支持 `HTTPS_PROXY`、`HTTP_PROXY`、`ALL_PROXY` 及其小写形式，例如：
+
+```bash
+HTTPS_PROXY=http://127.0.0.1:7070 clashtui config
+```
+
+首次启动时，如果本地代理尚未运行，可通过这些环境变量指定已运行的其他代理。
+
 如需更多输出：
 
 ```bash

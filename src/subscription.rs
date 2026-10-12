@@ -4,14 +4,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
 use reqwest::{
-    Client, Proxy, Url,
-    header::{AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT},
+    Url,
+    header::{AUTHORIZATION, HeaderMap, HeaderValue},
 };
 use serde_yaml_ng::Value;
 use tokio::fs;
 
 use crate::config::{AppConfig, Paths, Subscription, SubscriptionUserInfo};
-use crate::system_proxy;
+use crate::download::{self, DownloadAttempt};
 
 const SUBSCRIPTION_TIMEOUT: Duration = Duration::from_secs(20);
 const SUBSCRIPTION_USER_AGENT: &str = concat!("clash-verge/v", env!("CARGO_PKG_VERSION"));
@@ -19,11 +19,6 @@ const SUBSCRIPTION_USER_AGENT: &str = concat!("clash-verge/v", env!("CARGO_PKG_V
 struct SubscriptionResponse {
     body: String,
     user_info: Option<SubscriptionUserInfo>,
-}
-
-struct DownloadAttempt {
-    label: &'static str,
-    proxy_url: Option<String>,
 }
 
 pub async fn update(paths: &Paths, config: &mut AppConfig, index: usize) -> Result<PathBuf> {
@@ -76,7 +71,7 @@ pub async fn update_preserving_last_good(
 }
 
 async fn download_subscription(config: &AppConfig, url: &str) -> Result<SubscriptionResponse> {
-    let attempts = download_attempts(config);
+    let attempts = download::attempts(config);
     let mut errors = Vec::new();
 
     for attempt in attempts {
@@ -94,7 +89,11 @@ async fn download_subscription_once(
     attempt: &DownloadAttempt,
 ) -> Result<SubscriptionResponse> {
     let (url, auth) = subscription_request_url(url)?;
-    let client = subscription_client(attempt.proxy_url.as_deref())?;
+    let client = download::client(
+        SUBSCRIPTION_USER_AGENT,
+        SUBSCRIPTION_TIMEOUT,
+        attempt.proxy_url.as_deref(),
+    )?;
     let mut request = client.get(url);
     if let Some(auth) = auth {
         request = request.header(AUTHORIZATION, auth);
@@ -116,32 +115,6 @@ async fn download_subscription_once(
         user_info: parse_user_info_headers(&headers),
         body,
     })
-}
-
-fn subscription_client(proxy_url: Option<&str>) -> Result<Client> {
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        USER_AGENT,
-        HeaderValue::from_str(SUBSCRIPTION_USER_AGENT)
-            .context("invalid subscription user agent")?,
-    );
-
-    let mut builder = Client::builder()
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .tcp_keepalive(Duration::from_secs(60))
-        .pool_max_idle_per_host(0)
-        .pool_idle_timeout(None)
-        .timeout(SUBSCRIPTION_TIMEOUT)
-        .connect_timeout(SUBSCRIPTION_TIMEOUT)
-        .default_headers(headers);
-
-    if let Some(proxy_url) = proxy_url {
-        builder = builder.proxy(Proxy::all(proxy_url)?);
-    } else {
-        builder = builder.no_proxy();
-    }
-
-    Ok(builder.build()?)
 }
 
 fn validate_subscription_profile_body(name: &str, body: &str) -> Result<()> {
@@ -183,34 +156,6 @@ fn subscription_request_url(url: &str) -> Result<(Url, Option<HeaderValue>)> {
     let _ = url.set_username("");
     let _ = url.set_password(None);
     Ok((url, auth))
-}
-
-fn download_attempts(config: &AppConfig) -> Vec<DownloadAttempt> {
-    let mut attempts = vec![DownloadAttempt {
-        label: "direct",
-        proxy_url: None,
-    }];
-
-    let local_proxy = format!("http://{}:{}", config.proxy_host, config.mixed_port);
-    attempts.push(DownloadAttempt {
-        label: "local proxy",
-        proxy_url: Some(local_proxy.clone()),
-    });
-
-    if let Ok(status) = system_proxy::status()
-        && status.enabled
-        && !status.server.trim().is_empty()
-    {
-        let system_proxy = format!("http://{}", status.server);
-        if system_proxy != local_proxy {
-            attempts.push(DownloadAttempt {
-                label: "system proxy",
-                proxy_url: Some(system_proxy),
-            });
-        }
-    }
-
-    attempts
 }
 
 fn parse_user_info_headers(headers: &HeaderMap) -> Option<SubscriptionUserInfo> {

@@ -5643,7 +5643,7 @@ async fn run_runtime_command_task(
     }
 
     if matches!(command, RuntimeCommand::UpdateGeodata) {
-        return match core::update_geodata(&paths).await {
+        return match core::update_geodata(&paths, &config).await {
             Ok(report) => {
                 RuntimeCommandResult::success(Some(format_geodata_update_report(&report)))
             }

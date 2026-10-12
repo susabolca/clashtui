@@ -5,6 +5,7 @@ mod config_menu;
 mod core;
 mod daemon;
 mod dns;
+mod download;
 mod i18n;
 mod llm;
 mod llm_providers;
