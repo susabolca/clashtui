@@ -149,24 +149,32 @@ struct ManagedCoreMetadata {
 struct GeodataResource {
     file_name: &'static str,
     asset_name: &'static str,
+    /// Optional resources may be missing from every source and fail to
+    /// download; startup keeps going and mihomo falls back to the classic
+    /// `geoip.dat`/`Country.mmdb` data instead.
+    optional: bool,
 }
 
 const GEODATA_RESOURCES: [GeodataResource; 4] = [
     GeodataResource {
         file_name: "Country.mmdb",
         asset_name: "country.mmdb",
+        optional: false,
     },
     GeodataResource {
         file_name: "geoip.metadb",
         asset_name: "geoip.metadb",
+        optional: true,
     },
     GeodataResource {
         file_name: "geoip.dat",
         asset_name: "geoip.dat",
+        optional: false,
     },
     GeodataResource {
         file_name: "geosite.dat",
         asset_name: "geosite.dat",
+        optional: false,
     },
 ];
 
@@ -448,6 +456,18 @@ pub async fn ensure_core_path(paths: &Paths, config: &AppConfig) -> Result<PathB
         ),
         CoreSource::Auto => ensure_auto_core_path(paths, config).await,
     }
+}
+
+/// Idempotently prepare what mihomo needs to start: the GeoIP/GeoSite
+/// databases and a usable core binary.
+///
+/// Backs `clashtui init`. Downloads honour the usual proxy environment
+/// variables (`HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`), see
+/// `doc/config-spec.md`. It never starts mihomo; it only prepares files.
+pub async fn init(paths: &Paths, config: &AppConfig) -> Result<PathBuf> {
+    paths.ensure().await?;
+    ensure_geodata(paths, config, &paths.config_dir).await?;
+    ensure_core_path(paths, config).await
 }
 
 pub async fn update_managed_core(paths: &Paths, config: &AppConfig) -> Result<ManagedCoreInstall> {
@@ -846,15 +866,26 @@ async fn ensure_geodata(paths: &Paths, config: &AppConfig, target_dir: &Path) ->
             );
             continue;
         }
-        let bytes = download_geodata_resource(resource, &target, config)
-            .await
-            .with_context(|| format!("failed to download missing {}", resource.file_name))?;
-        eprintln!(
-            "geodata: downloaded {} bytes={} path={}",
-            resource.file_name,
-            bytes,
-            target.display()
-        );
+        match download_geodata_resource(resource, &target, config).await {
+            Ok(bytes) => {
+                eprintln!(
+                    "geodata: downloaded {} bytes={} path={}",
+                    resource.file_name,
+                    bytes,
+                    target.display()
+                );
+            }
+            Err(err) if resource.optional => {
+                eprintln!(
+                    "geodata: skipping optional {} (unavailable: {err:#})",
+                    resource.file_name
+                );
+            }
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("failed to download missing {}", resource.file_name));
+            }
+        }
     }
     Ok(())
 }

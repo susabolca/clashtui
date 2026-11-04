@@ -31,6 +31,7 @@ cargo run -- config
 ```bash
 clashtui service-install
 clashtui config
+clashtui init
 clashtui start
 clashtui status
 clashtui stop
@@ -40,9 +41,17 @@ clashtui stop
 
 - `service-install` 准备后台服务, 需管理员权限
 - `config` 打开配置界面
+- `init` 准备 mihomo core 和 GeoIP/GeoSite 数据（可重复执行）
 - `start` 启动后台部分
 - `status` 查看当前状态
 - `stop` 停止后台部分
+
+`init` 会先把已有的数据文件从本机其他 mihomo/clash 目录复制过来，缺失的再下载；
+下载会优先尝试 `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY`，因此首次可以用已有代理引导：
+
+```bash
+HTTPS_PROXY=http://127.0.0.1:7897 clashtui init
+```
 
 需要重新应用时：
 

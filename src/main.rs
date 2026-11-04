@@ -103,6 +103,11 @@ enum Command {
     Status,
     /// Open the interactive config menu.
     Config,
+    /// Prepare the mihomo core and GeoIP/GeoSite databases.
+    ///
+    /// Downloads use `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY` when set, so an
+    /// existing proxy can bootstrap the first run.
+    Init,
     /// Install the privileged clashtui service.
     ServiceInstall {
         /// Override the clashtui binary path to install.
@@ -192,6 +197,12 @@ async fn main() -> Result<()> {
         }
         Some(Command::Status) => daemon::status(&paths, &config, &client, cli.verbose).await,
         Some(Command::Config) => config_menu::run(&paths, &mut config, cli.language).await,
+        Some(Command::Init) => {
+            let core = core::init(&paths, &config).await?;
+            println!("core: {}", core.display());
+            println!("geodata: {}", paths.config_dir.display());
+            Ok(())
+        }
         Some(Command::WriteSingleRuntimeConfig) => {
             let path = runtime_profile::write_single_runtime_config(&paths, &config).await?;
             println!("{}", path.display());
