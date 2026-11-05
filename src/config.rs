@@ -874,17 +874,22 @@ impl Default for DnsConfig {
             lan_domains: vec!["+.lan".into(), "+.local".into(), "+.arpa".into()],
             lan_nameserver: Vec::new(),
             nameserver_policy: BTreeMap::new(),
-            default_nameserver: vec!["system".into(), "223.6.6.6".into(), "8.8.8.8".into()],
-            nameserver: vec![
-                "8.8.8.8".into(),
-                "https://doh.pub/dns-query".into(),
-                "https://dns.alidns.com/dns-query".into(),
+            default_nameserver: vec![
+                "system".into(),
+                "tls://223.5.5.5:853".into(),
+                "tls://1.12.12.12:853".into(),
             ],
-            fallback: Vec::new(),
+            nameserver: vec![
+                "https://223.5.5.5/dns-query".into(),
+                "https://1.12.12.12/dns-query".into(),
+            ],
+            fallback: vec![
+                "https://1.1.1.1/dns-query".into(),
+                "https://8.8.8.8/dns-query".into(),
+            ],
             proxy_server_nameserver: vec![
-                "https://doh.pub/dns-query".into(),
-                "https://dns.alidns.com/dns-query".into(),
-                "tls://223.5.5.5".into(),
+                "https://223.5.5.5/dns-query".into(),
+                "https://1.12.12.12/dns-query".into(),
             ],
             direct_nameserver: Vec::new(),
             fake_ip_filter: vec![
